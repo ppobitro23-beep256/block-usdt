@@ -373,6 +373,22 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// PUBLIC ROUTES
+// ══════════════════════════════════════════
+app.get('/api/plans', async (req, res) => {
+  try {
+    await db.run(`
+      UPDATE plans SET today_count=0, last_reset=NOW()
+      WHERE daily_limit > 0
+        AND last_reset IS NOT NULL
+        AND EXTRACT(EPOCH FROM (NOW() - last_reset))/3600 >= reset_hours
+    `);
+    const plans = await db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`);
+    res.json({plans});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ══════════════════════════════════════════
 // ADMIN ROUTES
 // ══════════════════════════════════════════
 app.get('/admin/stats', adminAuth, async (req, res) => {
