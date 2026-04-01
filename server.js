@@ -190,15 +190,34 @@ app.post('/api/auth', userAuth, async (req, res) => {
     if (await getSetting('maintenance') === '1') return res.status(503).json({error:'maintenance'});
 
     const refCode = 'REF'+u.id;
-    const ref = req.body.ref || null;
 
-    await db.run(`
-      INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-      ON CONFLICT (id) DO UPDATE SET
-        first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
-        username=EXCLUDED.username, language=EXCLUDED.language, is_premium=EXCLUDED.is_premium
-    `, [u.id, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, ref]);
+    // Get referral code from multiple sources
+    let ref = req.body.ref || null;
+    // Extract numeric ID from REF123456 format
+    let referredById = null;
+    if (ref && ref.startsWith('REF')) {
+      referredById = parseInt(ref.replace('REF','')) || null;
+    }
+
+    // Check if user already exists
+    const existingUser = await db.one(`SELECT id, referred_by FROM users WHERE id=$1`, [u.id]);
+
+    if (!existingUser) {
+      // New user - insert with referred_by
+      await db.run(`
+        INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      `, [u.id, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, referredById]);
+      console.log('New user:', u.id, 'referred by:', referredById);
+    } else {
+      // Existing user - update info but keep referred_by if already set
+      await db.run(`
+        UPDATE users SET
+          first_name=$1, last_name=$2, username=$3, language=$4, is_premium=$5,
+          referred_by = CASE WHEN referred_by IS NULL AND $6::BIGINT IS NOT NULL THEN $6::BIGINT ELSE referred_by END
+        WHERE id=$7
+      `, [u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, referredById, u.id]);
+    }
 
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
     if (user.is_banned) return res.status(403).json({error:'banned', reason: user.ban_reason||'Violated terms'});
