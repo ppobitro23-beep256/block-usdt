@@ -134,6 +134,15 @@ async function setupDB() {
     }
   }
 
+  // Pending referral table
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS pending_refs (
+      user_id    BIGINT PRIMARY KEY,
+      ref_code   TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
   // Migration: add daily_limit columns if not exists
   await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`);
   await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`);
@@ -191,33 +200,42 @@ app.post('/api/auth', userAuth, async (req, res) => {
 
     const refCode = 'REF'+u.id;
 
-    // Get referral code from multiple sources
+    // Get referral code - from request OR pending_refs table
     let ref = req.body.ref || null;
+
+    // Check pending_refs if no ref in request
+    if (!ref) {
+      const pending = await db.one(`SELECT ref_code FROM pending_refs WHERE user_id=$1`, [u.id]);
+      if (pending) ref = pending.ref_code;
+    }
+
     // Extract numeric ID from REF123456 format
     let referredById = null;
-    if (ref && ref.startsWith('REF')) {
-      referredById = parseInt(ref.replace('REF','')) || null;
+    if (ref && String(ref).startsWith('REF')) {
+      referredById = parseInt(String(ref).replace('REF','')) || null;
     }
+    // Don't refer yourself
+    if (referredById === u.id) referredById = null;
 
     // Check if user already exists
     const existingUser = await db.one(`SELECT id, referred_by FROM users WHERE id=$1`, [u.id]);
 
     if (!existingUser) {
-      // New user - insert with referred_by
       await db.run(`
         INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       `, [u.id, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, referredById]);
       console.log('New user:', u.id, 'referred by:', referredById);
     } else {
-      // Existing user - update info but keep referred_by if already set
       await db.run(`
-        UPDATE users SET
-          first_name=$1, last_name=$2, username=$3, language=$4, is_premium=$5,
+        UPDATE users SET first_name=$1, last_name=$2, username=$3, language=$4, is_premium=$5,
           referred_by = CASE WHEN referred_by IS NULL AND $6::BIGINT IS NOT NULL THEN $6::BIGINT ELSE referred_by END
         WHERE id=$7
       `, [u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, referredById, u.id]);
     }
+
+    // Clean up pending ref
+    await db.run(`DELETE FROM pending_refs WHERE user_id=$1`, [u.id]);
 
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
     if (user.is_banned) return res.status(403).json({error:'banned', reason: user.ban_reason||'Violated terms'});
@@ -394,6 +412,19 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
 // ══════════════════════════════════════════
 // PUBLIC ROUTES
 // ══════════════════════════════════════════
+
+// Bot calls this when user uses referral link
+app.post('/api/set-pending-ref', async (req, res) => {
+  try {
+    const {user_id, ref_code} = req.body;
+    if (!user_id || !ref_code) return res.json({success:false});
+    await db.run(`
+      INSERT INTO pending_refs (user_id, ref_code) VALUES ($1,$2)
+      ON CONFLICT (user_id) DO UPDATE SET ref_code=$2, created_at=NOW()
+    `, [user_id, ref_code]);
+    res.json({success:true});
+  } catch(e) { res.json({success:false}); }
+});
 app.get('/api/plans', async (req, res) => {
   try {
     await db.run(`
