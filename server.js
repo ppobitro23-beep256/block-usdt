@@ -50,12 +50,13 @@ async function setupDB() {
 
   await db.run(`
     CREATE TABLE IF NOT EXISTS plans (
-      id         SERIAL PRIMARY KEY,
-      name       TEXT, emoji TEXT,
-      daily_pct  REAL, min_amt REAL, max_amt REAL,
-      duration   INTEGER DEFAULT 50,
-      is_active  INTEGER DEFAULT 1,
-      created_at TIMESTAMP DEFAULT NOW()
+      id          SERIAL PRIMARY KEY,
+      name        TEXT, emoji TEXT,
+      daily_pct   REAL, min_amt REAL, max_amt REAL,
+      duration    INTEGER DEFAULT 50,
+      daily_limit INTEGER DEFAULT 0,
+      is_active   INTEGER DEFAULT 1,
+      created_at  TIMESTAMP DEFAULT NOW()
     )
   `);
 
@@ -133,6 +134,12 @@ async function setupDB() {
     }
   }
 
+  // Migration: add daily_limit columns if not exists
+  await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`);
+  await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`);
+  await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`);
+  await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`);
+
   console.log('✅ Database ready (Neon PostgreSQL)');
 }
 
@@ -209,6 +216,13 @@ app.get('/api/user/:id', async (req, res) => {
     const taskRows     = await db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [req.params.id]);
     const tasks        = taskRows.map(t => t.task_key);
     const referrals    = await db.all(`SELECT id,first_name,username,created_at FROM users WHERE referred_by=$1`, [req.params.id]);
+    // Reset today_count based on reset_hours
+    await db.run(`
+      UPDATE plans SET today_count=0, last_reset=NOW()
+      WHERE daily_limit > 0
+        AND last_reset IS NOT NULL
+        AND EXTRACT(EPOCH FROM (NOW() - last_reset))/3600 >= reset_hours
+    `);
     const plans        = await db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`);
     const settingRows  = await db.all(`SELECT * FROM settings`);
     const settings     = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
@@ -231,12 +245,35 @@ app.post('/api/invest', userAuth, async (req, res) => {
     if (amount > plan.max_amt) return res.status(400).json({error:`Max $${plan.max_amt}`});
     if (user.balance < amount) return res.status(400).json({error:'Insufficient balance'});
 
+    // Check daily limit
+    if (plan.daily_limit > 0) {
+      const resetHours = parseFloat(plan.reset_hours || 24);
+      const lastReset  = plan.last_reset ? new Date(plan.last_reset) : null;
+      const now        = new Date();
+      const hoursPassed = lastReset ? (now - lastReset) / (1000 * 60 * 60) : resetHours + 1;
+
+      if (hoursPassed >= resetHours) {
+        await db.run(`UPDATE plans SET today_count=0, last_reset=NOW() WHERE id=$1`, [plan_id]);
+        plan.today_count = 0;
+      }
+      const remaining = plan.daily_limit - (plan.today_count || 0);
+      if (remaining <= 0) {
+        const nextReset = lastReset ? new Date(lastReset.getTime() + resetHours * 60 * 60 * 1000) : null;
+        const hoursLeft = nextReset ? Math.ceil((nextReset - now) / (1000 * 60 * 60)) : resetHours;
+        return res.status(400).json({error:`Limit reached! Resets in ${hoursLeft}h.`, limitReached: true, hoursLeft});
+      }
+    }
+
     const daily = +(amount * plan.daily_pct / 100).toFixed(4);
     await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [amount, u.id]);
     await db.run(
       `INSERT INTO investments (user_id,plan_name,amount,daily_pct,daily_earn,days_total) VALUES ($1,$2,$3,$4,$5,$6)`,
       [u.id, plan.emoji+' '+plan.name, amount, plan.daily_pct, daily, plan.duration]
     );
+    // Increment daily count
+    if (plan.daily_limit > 0) {
+      await db.run(`UPDATE plans SET today_count=today_count+1 WHERE id=$1`, [plan_id]);
+    }
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
       [u.id,'invest',amount,'completed',`Invested in ${plan.name}`]
@@ -463,10 +500,10 @@ app.get('/admin/plans', adminAuth, async (req, res) => {
 
 app.post('/admin/plans/add', adminAuth, async (req, res) => {
   try {
-    const {name,emoji,daily_pct,min_amt,max_amt,duration} = req.body;
+    const {name,emoji,daily_pct,min_amt,max_amt,duration,daily_limit=0,reset_hours=24} = req.body;
     await db.run(
-      `INSERT INTO plans (name,emoji,daily_pct,min_amt,max_amt,duration) VALUES ($1,$2,$3,$4,$5,$6)`,
-      [name,emoji,daily_pct,min_amt,max_amt,duration]
+      `INSERT INTO plans (name,emoji,daily_pct,min_amt,max_amt,duration,daily_limit,reset_hours) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [name,emoji,daily_pct,min_amt,max_amt,duration,daily_limit,reset_hours]
     );
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -474,10 +511,10 @@ app.post('/admin/plans/add', adminAuth, async (req, res) => {
 
 app.post('/admin/plans/edit', adminAuth, async (req, res) => {
   try {
-    const {id,name,emoji,daily_pct,min_amt,max_amt,duration,is_active} = req.body;
+    const {id,name,emoji,daily_pct,min_amt,max_amt,duration,is_active,daily_limit=0,reset_hours=24} = req.body;
     await db.run(
-      `UPDATE plans SET name=$1,emoji=$2,daily_pct=$3,min_amt=$4,max_amt=$5,duration=$6,is_active=$7 WHERE id=$8`,
-      [name,emoji,daily_pct,min_amt,max_amt,duration,is_active,id]
+      `UPDATE plans SET name=$1,emoji=$2,daily_pct=$3,min_amt=$4,max_amt=$5,duration=$6,is_active=$7,daily_limit=$8,reset_hours=$9 WHERE id=$10`,
+      [name,emoji,daily_pct,min_amt,max_amt,duration,is_active,daily_limit,reset_hours,id]
     );
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -485,7 +522,8 @@ app.post('/admin/plans/edit', adminAuth, async (req, res) => {
 
 app.post('/admin/plans/delete', adminAuth, async (req, res) => {
   try {
-    await db.run(`UPDATE plans SET is_active=0 WHERE id=$1`, [req.body.id]);
+    // Permanently delete the plan
+    await db.run(`DELETE FROM plans WHERE id=$1`, [req.body.id]);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
