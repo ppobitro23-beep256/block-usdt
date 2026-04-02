@@ -32,182 +32,117 @@ const db = {
 // DATABASE SETUP
 // ══════════════════════════════════════════
 async function setupDB() {
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      id           BIGINT PRIMARY KEY,
-      first_name   TEXT, last_name TEXT, username TEXT, language TEXT,
-      is_premium   INTEGER DEFAULT 0,
-      balance      REAL DEFAULT 0,
-      total_earned REAL DEFAULT 0,
-      today_earned REAL DEFAULT 0,
-      ref_code     TEXT UNIQUE,
-      referred_by  BIGINT,
-      is_banned    INTEGER DEFAULT 0,
-      ban_reason   TEXT,
-      created_at   TIMESTAMP DEFAULT NOW()
-    )
-  `);
+  const safe = async (fn) => { try { await fn(); } catch(e) { console.log('Setup warning:', e.message); } };
 
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS plans (
-      id          SERIAL PRIMARY KEY,
-      name        TEXT, emoji TEXT,
-      daily_pct   REAL, min_amt REAL, max_amt REAL,
-      duration    INTEGER DEFAULT 50,
-      daily_limit INTEGER DEFAULT 0,
-      is_active   INTEGER DEFAULT 1,
-      created_at  TIMESTAMP DEFAULT NOW()
-    )
-  `);
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS users (
+    id BIGINT PRIMARY KEY, first_name TEXT, last_name TEXT, username TEXT, language TEXT,
+    is_premium INTEGER DEFAULT 0, balance REAL DEFAULT 0, total_earned REAL DEFAULT 0,
+    today_earned REAL DEFAULT 0, ref_code TEXT UNIQUE, referred_by BIGINT,
+    is_banned INTEGER DEFAULT 0, ban_reason TEXT,
+    pending_commission REAL DEFAULT 0, total_commission REAL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW()
+  )`));
 
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS investments (
-      id           SERIAL PRIMARY KEY,
-      user_id      BIGINT, plan_name TEXT,
-      amount       REAL, daily_pct REAL, daily_earn REAL,
-      days_total   INTEGER DEFAULT 50,
-      days_done    INTEGER DEFAULT 0,
-      pending_earn REAL DEFAULT 0,
-      last_collect TIMESTAMP,
-      status       TEXT DEFAULT 'active',
-      started_at   TIMESTAMP DEFAULT NOW()
-    )
-  `);
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS plans (
+    id SERIAL PRIMARY KEY, name TEXT, emoji TEXT, daily_pct REAL,
+    min_amt REAL, max_amt REAL, duration INTEGER DEFAULT 50,
+    daily_limit INTEGER DEFAULT 0, today_count INTEGER DEFAULT 0,
+    last_reset TIMESTAMP DEFAULT NOW(), reset_hours REAL DEFAULT 24,
+    is_active INTEGER DEFAULT 1, created_at TIMESTAMP DEFAULT NOW()
+  )`));
 
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS transactions (
-      id         SERIAL PRIMARY KEY,
-      user_id    BIGINT, type TEXT, amount REAL,
-      status     TEXT DEFAULT 'pending',
-      network    TEXT, address TEXT, txid TEXT,
-      fee        REAL DEFAULT 0, note TEXT,
-      admin_note TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS investments (
+    id SERIAL PRIMARY KEY, user_id BIGINT, plan_name TEXT,
+    amount REAL, daily_pct REAL, daily_earn REAL,
+    days_total INTEGER DEFAULT 50, days_done INTEGER DEFAULT 0,
+    pending_earn REAL DEFAULT 0, last_collect TIMESTAMP,
+    status TEXT DEFAULT 'active', started_at TIMESTAMP DEFAULT NOW()
+  )`));
 
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS tasks (
-      id           SERIAL PRIMARY KEY,
-      user_id      BIGINT, task_key TEXT,
-      completed    INTEGER DEFAULT 0,
-      completed_at TIMESTAMP,
-      UNIQUE(user_id, task_key)
-    )
-  `);
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS transactions (
+    id SERIAL PRIMARY KEY, user_id BIGINT, type TEXT, amount REAL,
+    status TEXT DEFAULT 'pending', network TEXT, address TEXT, txid TEXT,
+    fee REAL DEFAULT 0, note TEXT, admin_note TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+  )`));
 
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS settings (
-      key   TEXT PRIMARY KEY,
-      value TEXT
-    )
-  `);
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS tasks (
+    id SERIAL PRIMARY KEY, user_id BIGINT, task_key TEXT,
+    completed INTEGER DEFAULT 0, completed_at TIMESTAMP,
+    UNIQUE(user_id, task_key)
+  )`));
+
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)`));
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS pending_refs (user_id BIGINT PRIMARY KEY, ref_code TEXT, created_at TIMESTAMP DEFAULT NOW())`));
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS commissions (
+    id SERIAL PRIMARY KEY, user_id BIGINT, from_user_id BIGINT,
+    level INTEGER, amount REAL, status TEXT DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT NOW()
+  )`));
+  await safe(() => db.run(`CREATE TABLE IF NOT EXISTS tasks_config (
+    id SERIAL PRIMARY KEY, task_key TEXT UNIQUE, icon TEXT DEFAULT '⚡',
+    name TEXT, reward REAL DEFAULT 1, is_active INTEGER DEFAULT 1,
+    sort_order INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT NOW()
+  )`));
+
+  // Add columns if missing
+  await safe(() => db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`));
+  await safe(() => db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS total_commission REAL DEFAULT 0`));
+  await safe(() => db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`));
+  await safe(() => db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`));
+  await safe(() => db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`));
+  await safe(() => db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`));
 
   // Default settings
   const defaults = {
-    withdraw_fee_pct: '2', withdraw_min: '10', withdraw_max: '10000',
-    deposit_min: '5',
-    trc20_address: 'TGnuvLYAHJn2sxvi7MqVqHUkMQ66DiKgSJ',
-    erc20_address: '0x4878d34e544b79801249d36303b321ca8e634bdd',
-    bep20_address: '0x4878d34e544b79801249d36303b321ca8e634bdd',
-    ref_lvl1_pct: '8', ref_lvl2_pct: '3', ref_lvl3_pct: '1',
-    maintenance: '0',
+    withdraw_fee_pct:'2', withdraw_min:'10', withdraw_max:'10000', deposit_min:'5',
+    trc20_address:'TGnuvLYAHJn2sxvi7MqVqHUkMQ66DiKgSJ',
+    erc20_address:'0x4878d34e544b79801249d36303b321ca8e634bdd',
+    bep20_address:'0x4878d34e544b79801249d36303b321ca8e634bdd',
+    ref_lvl1_pct:'8', ref_lvl2_pct:'3', ref_lvl3_pct:'1', maintenance:'0',
   };
-  await Promise.all(Object.entries(defaults).map(([k,v]) =>
-    db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING`, [k,v])
-  ));
+  for (const [k,v] of Object.entries(defaults)) {
+    await safe(() => db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING`, [k,v]));
+  }
 
   // Default plans
-  const planCount = await db.one(`SELECT COUNT(*) as c FROM plans`);
-  if (parseInt(planCount.c) === 0) {
-    const defaultPlans = [
-      {name:'Bronze Plan', emoji:'🥉', daily_pct:2.5, min_amt:10,  max_amt:20,   duration:50},
-      {name:'Silver Plan', emoji:'🥈', daily_pct:2.8, min_amt:20,  max_amt:50,   duration:50},
-      {name:'Golden Plan', emoji:'🥇', daily_pct:3.0, min_amt:50,  max_amt:100,  duration:50},
-      {name:'Diamond Plan',emoji:'💎', daily_pct:4.0, min_amt:100, max_amt:1000, duration:50},
-    ];
-    for (const p of defaultPlans) {
-      await db.run(
+  const pc = await db.one(`SELECT COUNT(*) as c FROM plans`).catch(()=>({c:1}));
+  if (parseInt(pc.c) === 0) {
+    for (const p of [
+      {name:'Bronze Plan',emoji:'🥉',daily_pct:2.5,min_amt:10, max_amt:20,  duration:50},
+      {name:'Silver Plan',emoji:'🥈',daily_pct:2.8,min_amt:20, max_amt:50,  duration:50},
+      {name:'Golden Plan',emoji:'🥇',daily_pct:3.0,min_amt:50, max_amt:100, duration:50},
+      {name:'Diamond Plan',emoji:'💎',daily_pct:4.0,min_amt:100,max_amt:1000,duration:50},
+    ]) {
+      await safe(() => db.run(
         `INSERT INTO plans (name,emoji,daily_pct,min_amt,max_amt,duration) VALUES ($1,$2,$3,$4,$5,$6)`,
         [p.name,p.emoji,p.daily_pct,p.min_amt,p.max_amt,p.duration]
-      );
+      ));
     }
   }
 
-  // Pending referral table
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS pending_refs (
-      user_id    BIGINT PRIMARY KEY,
-      ref_code   TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
-
-  // Admin-managed tasks config
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS tasks_config (
-      id         SERIAL PRIMARY KEY,
-      task_key   TEXT UNIQUE,
-      icon       TEXT DEFAULT '⚡',
-      name       TEXT,
-      reward     REAL DEFAULT 1,
-      is_active  INTEGER DEFAULT 1,
-      sort_order INTEGER DEFAULT 0,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
-
-  // Default tasks if empty
-  const taskCount = await db.one('SELECT COUNT(*) as c FROM tasks_config');
-  if (parseInt(taskCount.c) === 0) {
-    const defaultTasks = [
-      {key:'join_channel',   icon:'📢', name:'Join our Telegram Channel',  reward:2,   sort:1},
-      {key:'join_group',     icon:'👥', name:'Join our Telegram Group',     reward:2,   sort:2},
-      {key:'follow_twitter', icon:'🐦', name:'Follow us on Twitter',         reward:2,   sort:3},
-      {key:'first_deposit',  icon:'💰', name:'Make your first deposit',     reward:3,   sort:4},
-      {key:'first_invest',   icon:'📊', name:'Purchase any plan',           reward:5,   sort:5},
-      {key:'invite_friend',  icon:'🤝', name:'Invite 1 friend',             reward:5,   sort:6},
-      {key:'daily_checkin',  icon:'🔄', name:'Daily check-in',              reward:0.5, sort:7},
-    ];
-    for (const t of defaultTasks) {
-      await db.run(
-        'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (task_key) DO NOTHING',
-        [t.key, t.icon, t.name, t.reward, t.sort]
-      );
+  // Default tasks
+  const tc = await db.one(`SELECT COUNT(*) as c FROM tasks_config`).catch(()=>({c:1}));
+  if (parseInt(tc.c) === 0) {
+    for (const t of [
+      {key:'join_channel',  icon:'📢',name:'Join our Telegram Channel',reward:2,  sort:1},
+      {key:'join_group',    icon:'👥',name:'Join our Telegram Group',   reward:2,  sort:2},
+      {key:'follow_twitter',icon:'🐦',name:'Follow us on Twitter',      reward:2,  sort:3},
+      {key:'first_deposit', icon:'💰',name:'Make your first deposit',   reward:3,  sort:4},
+      {key:'first_invest',  icon:'📊',name:'Purchase any plan',         reward:5,  sort:5},
+      {key:'invite_friend', icon:'🤝',name:'Invite 1 friend',           reward:5,  sort:6},
+      {key:'daily_checkin', icon:'🔄',name:'Daily check-in',            reward:0.5,sort:7},
+    ]) {
+      await safe(() => db.run(
+        `INSERT INTO tasks_config (task_key,icon,name,reward,sort_order) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (task_key) DO NOTHING`,
+        [t.key,t.icon,t.name,t.reward,t.sort]
+      ));
     }
   }
 
-  // Commission table
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS commissions (
-      id           SERIAL PRIMARY KEY,
-      user_id      BIGINT,   -- who earns the commission
-      from_user_id BIGINT,   -- who invested
-      level        INTEGER,  -- 1, 2, or 3
-      amount       REAL,
-      status       TEXT DEFAULT 'pending',
-      investment_id INTEGER,
-      created_at   TIMESTAMP DEFAULT NOW()
-    )
-  `);
-
-  // Run all migrations in parallel
-  await Promise.all([
-    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`),
-    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS total_commission REAL DEFAULT 0`),
-    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`),
-    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`),
-    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`),
-    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`),
-  ]);
-
-  console.log('✅ Database ready (Neon PostgreSQL)');
+  console.log('✅ DB ready');
 }
 
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection:', err.message);
-});
 
 async function getSetting(key) {
   const r = await db.one(`SELECT value FROM settings WHERE key=$1`, [key]);
