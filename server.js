@@ -10,7 +10,13 @@ const BOT_TOKEN    = process.env.BOT_TOKEN    || "YOUR_BOT_TOKEN";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin123";
 const DATABASE_URL = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_4IVJ1PZzcjnW@ep-long-art-anucops0-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
 
-app.use(cors());
+app.use(cors({
+  origin: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-telegram-init-data', 'x-admin-secret', 'Accept'],
+  credentials: false,
+}));
+app.options('*', cors());
 app.use(express.json());
 
 // ══════════════════════════════════════════
