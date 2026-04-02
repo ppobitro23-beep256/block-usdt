@@ -250,68 +250,60 @@ function adminAuth(req, res, next) {
 // ══════════════════════════════════════════
 app.post('/api/auth', async (req, res) => {
   try {
-    let u = null;
-    const initData = req.headers['x-telegram-init-data'] || req.body?.initData;
-    
-    // Method 1: from initData
-    if (initData && initData !== 'tgWebAppData') {
-      try {
-        const p = new URLSearchParams(initData);
-        const userStr = p.get('user');
-        if (userStr) u = JSON.parse(userStr);
-      } catch(e) {}
+    // Get user from any source
+    let u = req.body?.tgUser || req.body?.user || null;
+    if (!u) {
+      const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
+      if (raw && raw.length > 10) {
+        try {
+          const p = new URLSearchParams(raw);
+          const us = p.get('user');
+          if (us) u = JSON.parse(us);
+        } catch(e) {}
+      }
     }
-    // Method 2: from body directly
-    if (!u && req.body?.tgUser) u = req.body.tgUser;
-    if (!u && req.body?.user) u = req.body.user;
+    if (!u || !u.id) return res.status(400).json({error:'No user data'});
 
-    console.log('Auth attempt - user found:', !!u, 'id:', u?.id);
-    if (!u || !u.id) return res.status(400).json({error:'No user', debug: 'no_user_data'});
-    if (await getSetting('maintenance') === '1') return res.status(503).json({error:'maintenance'});
+    const uid      = u.id;
+    const refCode  = 'REF' + uid;
+    const ref      = req.body?.ref || null;
+    const refById  = ref && String(ref).startsWith('REF') ? parseInt(String(ref).replace('REF','')) || null : null;
+    const finalRef = (refById && refById !== uid) ? refById : null;
 
-    const refCode = 'REF'+u.id;
-
-    // Get referral code - from request OR pending_refs table
-    let ref = req.body.ref || null;
-
-    // Check pending_refs if no ref in request
-    if (!ref) {
-      const pending = await db.one(`SELECT ref_code FROM pending_refs WHERE user_id=$1`, [u.id]);
-      if (pending) ref = pending.ref_code;
-    }
-
-    // Extract numeric ID from REF123456 format
-    let referredById = null;
-    if (ref && String(ref).startsWith('REF')) {
-      referredById = parseInt(String(ref).replace('REF','')) || null;
-    }
-    // Don't refer yourself
-    if (referredById === u.id) referredById = null;
-
-    // Check if user already exists
-    const existingUser = await db.one(`SELECT id, referred_by FROM users WHERE id=$1`, [u.id]);
-
-    if (!existingUser) {
-      await db.run(`
-        INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-      `, [u.id, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, referredById]);
-      console.log('New user:', u.id, 'referred by:', referredById);
-    } else {
-      await db.run(`
-        UPDATE users SET first_name=$1, last_name=$2, username=$3, language=$4, is_premium=$5,
-          referred_by = CASE WHEN referred_by IS NULL AND $6::BIGINT IS NOT NULL THEN $6::BIGINT ELSE referred_by END
-        WHERE id=$7
-      `, [u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, referredById, u.id]);
+    // Check pending ref
+    let pendingRef = finalRef;
+    if (!pendingRef) {
+      const pr = await db.one('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
+      if (pr) {
+        const prid = parseInt(String(pr.ref_code).replace('REF',''));
+        if (prid && prid !== uid) pendingRef = prid;
+      }
     }
 
-    // Clean up pending ref
-    await db.run(`DELETE FROM pending_refs WHERE user_id=$1`, [u.id]);
+    // Upsert user
+    await db.run(`
+      INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (id) DO UPDATE SET
+        first_name=EXCLUDED.first_name,
+        last_name=EXCLUDED.last_name,
+        username=EXCLUDED.username,
+        language=EXCLUDED.language,
+        is_premium=EXCLUDED.is_premium,
+        referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
+    `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
 
-    const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
-    if (user.is_banned) return res.status(403).json({error:'banned', reason: user.ban_reason||'Violated terms'});
-    res.json({success:true, user});
-  } catch(e) { res.status(500).json({error:e.message}); }
+    // Clean pending ref
+    await db.run('DELETE FROM pending_refs WHERE user_id=$1', [uid]).catch(()=>{});
+
+    const user = await db.one('SELECT * FROM users WHERE id=$1', [uid]);
+    if (user && user.is_banned) return res.status(403).json({error:'banned', reason: user.ban_reason||''});
+
+    res.json({success: true});
+  } catch(e) {
+    console.error('Auth error:', e.message);
+    res.status(500).json({error: e.message});
+  }
 });
 
 app.get('/api/user/:id', async (req, res) => {
