@@ -143,6 +143,40 @@ async function setupDB() {
     )
   `);
 
+  // Admin-managed tasks config
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS tasks_config (
+      id         SERIAL PRIMARY KEY,
+      task_key   TEXT UNIQUE,
+      icon       TEXT DEFAULT '⚡',
+      name       TEXT,
+      reward     REAL DEFAULT 1,
+      is_active  INTEGER DEFAULT 1,
+      sort_order INTEGER DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  // Default tasks if empty
+  const taskCount = await db.one('SELECT COUNT(*) as c FROM tasks_config');
+  if (parseInt(taskCount.c) === 0) {
+    const defaultTasks = [
+      {key:'join_channel',   icon:'📢', name:'Join our Telegram Channel',  reward:2,   sort:1},
+      {key:'join_group',     icon:'👥', name:'Join our Telegram Group',     reward:2,   sort:2},
+      {key:'follow_twitter', icon:'🐦', name:'Follow us on Twitter',         reward:2,   sort:3},
+      {key:'first_deposit',  icon:'💰', name:'Make your first deposit',     reward:3,   sort:4},
+      {key:'first_invest',   icon:'📊', name:'Purchase any plan',           reward:5,   sort:5},
+      {key:'invite_friend',  icon:'🤝', name:'Invite 1 friend',             reward:5,   sort:6},
+      {key:'daily_checkin',  icon:'🔄', name:'Daily check-in',              reward:0.5, sort:7},
+    ];
+    for (const t of defaultTasks) {
+      await db.run(
+        'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order) VALUES ($1,$2,$3,$4,$5)',
+        [t.key, t.icon, t.name, t.reward, t.sort]
+      );
+    }
+  }
+
   // Commission table
   await db.run(`
     CREATE TABLE IF NOT EXISTS commissions (
@@ -266,7 +300,7 @@ app.get('/api/user/:id', async (req, res) => {
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
     if (!user) return res.status(404).json({error:'Not found'});
 
-    const investments  = await db.all(`SELECT * FROM investments WHERE user_id=$1 AND status='active'`, [req.params.id]);
+    const investments  = await db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect FROM investments WHERE user_id=$1 AND status='active'`, [req.params.id]);
     const transactions = await db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [req.params.id]);
     const taskRows     = await db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [req.params.id]);
     const tasks        = taskRows.map(t => t.task_key);
@@ -417,7 +451,12 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
     const now = new Date();
     if (inv.last_collect) {
       const diff = now - new Date(inv.last_collect);
-      if (diff < 24*60*60*1000) return res.status(400).json({error:'Already collected today'});
+      const hoursLeft = Math.ceil((24*60*60*1000 - diff) / (1000*60*60));
+      const secsLeft  = Math.ceil((24*60*60*1000 - diff) / 1000);
+      if (diff < 24*60*60*1000) return res.status(400).json({
+        error: 'Already collected. Next collect in ' + hoursLeft + 'h',
+        secondsLeft: secsLeft
+      });
     }
 
     const earn = parseFloat(inv.daily_earn);
@@ -462,6 +501,14 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
 // ══════════════════════════════════════════
 // PUBLIC ROUTES
 // ══════════════════════════════════════════
+
+// Public tasks endpoint
+app.get('/api/tasks', async (req, res) => {
+  try {
+    const tasks = await db.all('SELECT * FROM tasks_config WHERE is_active=1 ORDER BY sort_order');
+    res.json({tasks});
+  } catch(e) { res.json({tasks:[]}); }
+});
 
 // Bot calls this when user uses referral link
 app.post('/api/set-pending-ref', async (req, res) => {
@@ -603,6 +650,43 @@ app.post('/admin/withdraw/reject', adminAuth, async (req, res) => {
     if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
     await db.run(`UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2`, [admin_note||'', tx_id]);
     await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── Admin Tasks ──
+app.get('/admin/tasks', adminAuth, async (req, res) => {
+  try {
+    const tasks = await db.all('SELECT * FROM tasks_config ORDER BY sort_order');
+    res.json({tasks});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.post('/admin/tasks/add', adminAuth, async (req, res) => {
+  try {
+    const {task_key, icon, name, reward, sort_order} = req.body;
+    await db.run(
+      'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order) VALUES ($1,$2,$3,$4,$5)',
+      [task_key, icon||'⚡', name, reward||1, sort_order||99]
+    );
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.post('/admin/tasks/edit', adminAuth, async (req, res) => {
+  try {
+    const {id, icon, name, reward, is_active, sort_order} = req.body;
+    await db.run(
+      'UPDATE tasks_config SET icon=$1,name=$2,reward=$3,is_active=$4,sort_order=$5 WHERE id=$6',
+      [icon, name, reward, is_active, sort_order, id]
+    );
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.post('/admin/tasks/delete', adminAuth, async (req, res) => {
+  try {
+    await db.run('DELETE FROM tasks_config WHERE id=$1', [req.body.id]);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
