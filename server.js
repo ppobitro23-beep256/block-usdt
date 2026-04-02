@@ -113,9 +113,9 @@ async function setupDB() {
     ref_lvl1_pct: '8', ref_lvl2_pct: '3', ref_lvl3_pct: '1',
     maintenance: '0',
   };
-  for (const [k,v] of Object.entries(defaults)) {
-    await db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING`, [k,v]);
-  }
+  await Promise.all(Object.entries(defaults).map(([k,v]) =>
+    db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING`, [k,v])
+  ));
 
   // Default plans
   const planCount = await db.one(`SELECT COUNT(*) as c FROM plans`);
@@ -191,15 +191,15 @@ async function setupDB() {
     )
   `);
 
-  // Add commission columns to users
-  await db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`);
-  await db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS total_commission REAL DEFAULT 0`);
-
-  // Migration: add daily_limit columns if not exists
-  await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`);
-  await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`);
-  await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`);
-  await db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`);
+  // Run all migrations in parallel
+  await Promise.all([
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS total_commission REAL DEFAULT 0`),
+    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`),
+    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`),
+    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`),
+    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`),
+  ]);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
 }
@@ -300,21 +300,26 @@ app.get('/api/user/:id', async (req, res) => {
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
     if (!user) return res.status(404).json({error:'Not found'});
 
-    const investments  = await db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect FROM investments WHERE user_id=$1 AND status='active'`, [req.params.id]);
-    const transactions = await db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [req.params.id]);
-    const taskRows     = await db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [req.params.id]);
-    const tasks        = taskRows.map(t => t.task_key);
-    const referrals    = await db.all(`SELECT id,first_name,username,created_at FROM users WHERE referred_by=$1`, [req.params.id]);
-    // Reset today_count based on reset_hours
-    await db.run(`
-      UPDATE plans SET today_count=0, last_reset=NOW()
-      WHERE daily_limit > 0
-        AND last_reset IS NOT NULL
-        AND EXTRACT(EPOCH FROM (NOW() - last_reset))/3600 >= reset_hours
-    `);
-    const plans        = await db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`);
-    const settingRows  = await db.all(`SELECT * FROM settings`);
-    const settings     = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
+    // Run all queries in parallel for speed
+    const [investments, transactions, taskRows, referrals, plans, settingRows] = await Promise.all([
+      db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect FROM investments WHERE user_id=$1 AND status='active'`, [req.params.id]),
+      db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [req.params.id]),
+      db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [req.params.id]),
+      db.all(`SELECT id,first_name,username,created_at FROM users WHERE referred_by=$1`, [req.params.id]),
+      db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`),
+      db.all(`SELECT * FROM settings`),
+    ]);
+    const tasks    = taskRows.map(t => t.task_key);
+    const settings = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
+
+    // Reset today_count display if past reset_hours
+    const nowTime = new Date();
+    plans.forEach(function(p) {
+      if (p.daily_limit > 0 && p.last_reset) {
+        const hoursPassed = (nowTime - new Date(p.last_reset)) / (1000*60*60);
+        if (hoursPassed >= (p.reset_hours || 24)) p.today_count = 0;
+      }
+    });
 
     // Add commission data to user
     const userWithComm = {
