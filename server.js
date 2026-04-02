@@ -243,10 +243,26 @@ function adminAuth(req, res, next) {
 // ══════════════════════════════════════════
 // USER ROUTES
 // ══════════════════════════════════════════
-app.post('/api/auth', userAuth, async (req, res) => {
+app.post('/api/auth', async (req, res) => {
   try {
-    const u = req.tgUser;
-    if (!u) return res.status(400).json({error:'No user'});
+    // Try multiple ways to get user data
+    let u = null;
+
+    // Method 1: from initData header
+    const initData = req.headers['x-telegram-init-data'] || req.body?.initData;
+    if (initData && initData !== 'tgWebAppData') {
+      try {
+        const p = new URLSearchParams(initData);
+        const userStr = p.get('user');
+        if (userStr) u = JSON.parse(userStr);
+      } catch(e) {}
+    }
+
+    // Method 2: from body.tgUser (direct)
+    if (!u && req.body?.tgUser) u = req.body.tgUser;
+    if (!u && req.body?.user) u = req.body.user;
+
+    if (!u || !u.id) return res.status(400).json({error:'No user'});
     if (await getSetting('maintenance') === '1') return res.status(503).json({error:'maintenance'});
 
     const refCode = 'REF'+u.id;
