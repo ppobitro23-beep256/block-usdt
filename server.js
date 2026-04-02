@@ -171,7 +171,7 @@ async function setupDB() {
     ];
     for (const t of defaultTasks) {
       await db.run(
-        'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order) VALUES ($1,$2,$3,$4,$5)',
+        'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (task_key) DO NOTHING',
         [t.key, t.icon, t.name, t.reward, t.sort]
       );
     }
@@ -203,6 +203,11 @@ async function setupDB() {
 
   console.log('✅ Database ready (Neon PostgreSQL)');
 }
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err.message);
+});
 
 async function getSetting(key) {
   const r = await db.one(`SELECT value FROM settings WHERE key=$1`, [key]);
@@ -245,11 +250,10 @@ function adminAuth(req, res, next) {
 // ══════════════════════════════════════════
 app.post('/api/auth', async (req, res) => {
   try {
-    // Try multiple ways to get user data
     let u = null;
-
-    // Method 1: from initData header
     const initData = req.headers['x-telegram-init-data'] || req.body?.initData;
+    
+    // Method 1: from initData
     if (initData && initData !== 'tgWebAppData') {
       try {
         const p = new URLSearchParams(initData);
@@ -257,12 +261,12 @@ app.post('/api/auth', async (req, res) => {
         if (userStr) u = JSON.parse(userStr);
       } catch(e) {}
     }
-
-    // Method 2: from body.tgUser (direct)
+    // Method 2: from body directly
     if (!u && req.body?.tgUser) u = req.body.tgUser;
     if (!u && req.body?.user) u = req.body.user;
 
-    if (!u || !u.id) return res.status(400).json({error:'No user'});
+    console.log('Auth attempt - user found:', !!u, 'id:', u?.id);
+    if (!u || !u.id) return res.status(400).json({error:'No user', debug: 'no_user_data'});
     if (await getSetting('maintenance') === '1') return res.status(503).json({error:'maintenance'});
 
     const refCode = 'REF'+u.id;
@@ -312,6 +316,7 @@ app.post('/api/auth', async (req, res) => {
 
 app.get('/api/user/:id', async (req, res) => {
   try {
+    console.log('Fetching user:', req.params.id);
     let user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
     // Auto-create user if not exists (handles race condition)
     if (!user) {
@@ -531,6 +536,11 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
 // ══════════════════════════════════════════
 // PUBLIC ROUTES
 // ══════════════════════════════════════════
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({status: 'ok', time: new Date().toISOString()});
+});
 
 // Public tasks endpoint
 app.get('/api/tasks', async (req, res) => {
