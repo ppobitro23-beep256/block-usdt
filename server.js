@@ -450,7 +450,11 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
       `INSERT INTO tasks (user_id,task_key,completed,completed_at) VALUES ($1,$2,1,NOW()) ON CONFLICT (user_id,task_key) DO UPDATE SET completed=1`,
       [u.id, task_key]
     );
-    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [reward, u.id]);
+    await db.run(`UPDATE users SET balance=balance+$1, total_earned=total_earned+$1 WHERE id=$2`, [reward, u.id]);
+    await db.run(
+      `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
+      [u.id, 'task_reward', reward, 'completed', 'Task: ' + task_key]
+    );
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
