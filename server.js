@@ -296,8 +296,18 @@ app.post('/api/auth', userAuth, async (req, res) => {
 
 app.get('/api/user/:id', async (req, res) => {
   try {
-    const user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
-    if (!user) return res.status(404).json({error:'Not found'});
+    let user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
+    // Auto-create user if not exists (handles race condition)
+    if (!user) {
+      const uid = req.params.id;
+      const refCode = 'REF' + uid;
+      await db.run(`
+        INSERT INTO users (id,first_name,ref_code) VALUES ($1,$2,$3)
+        ON CONFLICT (id) DO NOTHING
+      `, [uid, 'User'+uid, refCode]).catch(()=>{});
+      user = await db.one(`SELECT * FROM users WHERE id=$1`, [uid]);
+      if (!user) return res.status(404).json({error:'Not found'});
+    }
 
     // Run all queries in parallel for speed
     const [investments, transactions, taskRows, referrals, plans, settingRows] = await Promise.all([
