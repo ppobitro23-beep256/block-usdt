@@ -207,6 +207,7 @@ async function setupDB() {
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS link TEXT DEFAULT ''`),
+    db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS chat_id TEXT DEFAULT ''`),
   ]);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
@@ -334,16 +335,18 @@ app.get('/api/user/:id', async (req, res) => {
     }
 
     // Run all queries in parallel for speed
-    const [investments, transactions, taskRows, referrals, plans, settingRows] = await Promise.all([
+    const [investments, transactions, taskRows, referrals, plans, settingRows, activeRefRow] = await Promise.all([
       db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect FROM investments WHERE user_id=$1 AND status='active'`, [req.params.id]),
       db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [req.params.id]),
       db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [req.params.id]),
       db.all(`SELECT id,first_name,username,created_at FROM users WHERE referred_by=$1`, [req.params.id]),
       db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`),
       db.all(`SELECT * FROM settings`),
+      db.one(`SELECT COUNT(DISTINCT i.user_id) as cnt FROM investments i JOIN users us ON us.id=i.user_id WHERE us.referred_by=$1 AND i.status='active'`, [req.params.id]),
     ]);
     const tasks    = taskRows.map(t => t.task_key);
     const settings = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
+    const activeReferrals = parseInt(activeRefRow.cnt) || 0;
 
     // Reset today_count display if past reset_hours
     const nowTime = new Date();
@@ -360,7 +363,7 @@ app.get('/api/user/:id', async (req, res) => {
       pending_commission: parseFloat(user.pending_commission || 0),
       total_commission:   parseFloat(user.total_commission   || 0)
     };
-    res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings});
+    res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
@@ -432,61 +435,6 @@ app.post('/api/invest', userAuth, async (req, res) => {
         currentId = referrerId;
       }
     } catch(e) { console.log('Commission error:', e.message); }
-
-    // Auto-complete invite_* tasks for direct referrer when downline invests
-    try {
-      const investorRow = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [u.id]);
-      if (investorRow && investorRow.referred_by) {
-        const referrerId = investorRow.referred_by;
-
-        // Count how many active referrals (people who invested) this referrer has
-        const activeRefCount = await db.one(
-          `SELECT COUNT(DISTINCT i.user_id) as cnt
-           FROM investments i
-           JOIN users us ON us.id = i.user_id
-           WHERE us.referred_by = $1 AND i.status = 'active'`,
-          [referrerId]
-        );
-        const activeCount = parseInt(activeRefCount.cnt) || 0;
-
-        // Get all invite tasks from config
-        const inviteTasks = await db.all(
-          `SELECT * FROM tasks_config WHERE task_key LIKE 'invite%' AND is_active=1`
-        );
-
-        for (const taskCfg of inviteTasks) {
-          // Extract required count from task_key e.g. invite_friend=1, invite_10=10
-          let required = 1;
-          const match = taskCfg.task_key.match(/(\d+)/);
-          if (match) required = parseInt(match[1]);
-
-          if (activeCount >= required) {
-            // Check if already completed
-            const alreadyDone = await db.one(
-              `SELECT id FROM tasks WHERE user_id=$1 AND task_key=$2 AND completed=1`,
-              [referrerId, taskCfg.task_key]
-            );
-            if (!alreadyDone) {
-              const reward = parseFloat(taskCfg.reward) || 1;
-              await db.run(
-                `INSERT INTO tasks (user_id,task_key,completed,completed_at) VALUES ($1,$2,1,NOW())
-                 ON CONFLICT (user_id,task_key) DO UPDATE SET completed=1, completed_at=NOW()`,
-                [referrerId, taskCfg.task_key]
-              );
-              await db.run(
-                `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1 WHERE id=$2`,
-                [reward, referrerId]
-              );
-              await db.run(
-                `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,'task_reward',$2,'completed',$3)`,
-                [referrerId, reward, 'Task: ' + taskCfg.task_key + ' (auto)']
-              );
-              console.log(`✅ ${taskCfg.task_key} auto-completed for user ${referrerId} — reward $${reward}`);
-            }
-          }
-        }
-      }
-    } catch(e) { console.log('invite task error:', e.message); }
 
     res.json({success:true, daily_earn:daily});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -578,6 +526,23 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
     const {task_key, reward} = req.body;
     const ex = await db.one(`SELECT * FROM tasks WHERE user_id=$1 AND task_key=$2`, [u.id, task_key]);
     if (ex?.completed) return res.status(400).json({error:'Already done'});
+
+    // For invite tasks — verify actual active referral count
+    if (task_key && task_key.indexOf('invite') !== -1) {
+      const numMatch = task_key.match(/(\d+)/);
+      const required = numMatch ? parseInt(numMatch[1]) : 1;
+      const countRow = await db.one(
+        `SELECT COUNT(DISTINCT i.user_id) as cnt FROM investments i
+         JOIN users us ON us.id=i.user_id
+         WHERE us.referred_by=$1 AND i.status='active'`,
+        [u.id]
+      );
+      const activeCount = parseInt(countRow.cnt) || 0;
+      if (activeCount < required) {
+        return res.status(400).json({error:`Need ${required} active referral(s). You have ${activeCount}.`});
+      }
+    }
+
     await db.run(
       `INSERT INTO tasks (user_id,task_key,completed,completed_at) VALUES ($1,$2,1,NOW()) ON CONFLICT (user_id,task_key) DO UPDATE SET completed=1`,
       [u.id, task_key]
@@ -588,6 +553,35 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
       [u.id, 'task_reward', reward, 'completed', 'Task: ' + task_key]
     );
     res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// Verify task (checks Telegram membership for channel/group tasks)
+app.post('/api/verify-task', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    if (!u || !u.id) return res.status(400).json({error:'No user'});
+    const { task_key } = req.body;
+    const taskCfg = await db.one('SELECT * FROM tasks_config WHERE task_key=$1 AND is_active=1', [task_key]);
+    if (!taskCfg) return res.status(404).json({error:'Task not found'});
+
+    // If task has a chat_id, verify via Telegram Bot API
+    if (taskCfg.chat_id && taskCfg.chat_id.trim()) {
+      try {
+        const tgRes = await fetch(
+          `https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(taskCfg.chat_id.trim())}&user_id=${u.id}`
+        );
+        const tgData = await tgRes.json();
+        if (tgData.ok) {
+          const status = tgData.result.status;
+          const isMember = ['member','administrator','creator'].includes(status);
+          return res.json({ verified: isMember });
+        }
+      } catch(e) { console.log('TG verify error:', e.message); }
+    }
+
+    // No chat_id set — just trust the user
+    res.json({ verified: true });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
@@ -762,10 +756,10 @@ app.get('/admin/tasks', adminAuth, async (req, res) => {
 
 app.post('/admin/tasks/add', adminAuth, async (req, res) => {
   try {
-    const {task_key, icon, name, reward, sort_order, link} = req.body;
+    const {task_key, icon, name, reward, sort_order, link, chat_id} = req.body;
     await db.run(
-      'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order,link) VALUES ($1,$2,$3,$4,$5,$6)',
-      [task_key, icon||'⚡', name, reward||1, sort_order||99, link||'']
+      'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order,link,chat_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [task_key, icon||'⚡', name, reward||1, sort_order||99, link||'', chat_id||'']
     );
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -773,10 +767,10 @@ app.post('/admin/tasks/add', adminAuth, async (req, res) => {
 
 app.post('/admin/tasks/edit', adminAuth, async (req, res) => {
   try {
-    const {id, icon, name, reward, is_active, sort_order, link} = req.body;
+    const {id, icon, name, reward, is_active, sort_order, link, chat_id} = req.body;
     await db.run(
-      'UPDATE tasks_config SET icon=$1,name=$2,reward=$3,is_active=$4,sort_order=$5,link=$6 WHERE id=$7',
-      [icon, name, reward, is_active, sort_order, link||'', id]
+      'UPDATE tasks_config SET icon=$1,name=$2,reward=$3,is_active=$4,sort_order=$5,link=$6,chat_id=$7 WHERE id=$8',
+      [icon, name, reward, is_active, sort_order, link||'', chat_id||'', id]
     );
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
