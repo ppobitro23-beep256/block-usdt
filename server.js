@@ -206,6 +206,7 @@ async function setupDB() {
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`),
+    db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS link TEXT DEFAULT ''`),
   ]);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
@@ -431,6 +432,40 @@ app.post('/api/invest', userAuth, async (req, res) => {
         currentId = referrerId;
       }
     } catch(e) { console.log('Commission error:', e.message); }
+
+    // Auto-complete 'invite_friend' task for direct referrer when downline invests
+    try {
+      const investorRow = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [u.id]);
+      if (investorRow && investorRow.referred_by) {
+        const referrerId = investorRow.referred_by;
+        // Check if referrer already completed this task
+        const alreadyDone = await db.one(
+          `SELECT id FROM tasks WHERE user_id=$1 AND task_key='invite_friend' AND completed=1`,
+          [referrerId]
+        );
+        if (!alreadyDone) {
+          // Get reward amount from tasks_config
+          const taskCfg = await db.one(`SELECT reward FROM tasks_config WHERE task_key='invite_friend'`);
+          const reward = taskCfg ? parseFloat(taskCfg.reward) : 5;
+          // Mark task complete
+          await db.run(
+            `INSERT INTO tasks (user_id,task_key,completed,completed_at) VALUES ($1,'invite_friend',1,NOW())
+             ON CONFLICT (user_id,task_key) DO UPDATE SET completed=1, completed_at=NOW()`,
+            [referrerId]
+          );
+          // Give reward
+          await db.run(
+            `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1 WHERE id=$2`,
+            [reward, referrerId]
+          );
+          await db.run(
+            `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,'task_reward',$2,'completed','Task: invite_friend (auto)')`,
+            [referrerId, reward]
+          );
+          console.log(`✅ invite_friend task auto-completed for user ${referrerId} — reward $${reward}`);
+        }
+      }
+    } catch(e) { console.log('invite_friend task error:', e.message); }
 
     res.json({success:true, daily_earn:daily});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -706,10 +741,10 @@ app.get('/admin/tasks', adminAuth, async (req, res) => {
 
 app.post('/admin/tasks/add', adminAuth, async (req, res) => {
   try {
-    const {task_key, icon, name, reward, sort_order} = req.body;
+    const {task_key, icon, name, reward, sort_order, link} = req.body;
     await db.run(
-      'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order) VALUES ($1,$2,$3,$4,$5)',
-      [task_key, icon||'⚡', name, reward||1, sort_order||99]
+      'INSERT INTO tasks_config (task_key,icon,name,reward,sort_order,link) VALUES ($1,$2,$3,$4,$5,$6)',
+      [task_key, icon||'⚡', name, reward||1, sort_order||99, link||'']
     );
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -717,10 +752,10 @@ app.post('/admin/tasks/add', adminAuth, async (req, res) => {
 
 app.post('/admin/tasks/edit', adminAuth, async (req, res) => {
   try {
-    const {id, icon, name, reward, is_active, sort_order} = req.body;
+    const {id, icon, name, reward, is_active, sort_order, link} = req.body;
     await db.run(
-      'UPDATE tasks_config SET icon=$1,name=$2,reward=$3,is_active=$4,sort_order=$5 WHERE id=$6',
-      [icon, name, reward, is_active, sort_order, id]
+      'UPDATE tasks_config SET icon=$1,name=$2,reward=$3,is_active=$4,sort_order=$5,link=$6 WHERE id=$7',
+      [icon, name, reward, is_active, sort_order, link||'', id]
     );
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
