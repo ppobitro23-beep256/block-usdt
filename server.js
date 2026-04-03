@@ -433,39 +433,60 @@ app.post('/api/invest', userAuth, async (req, res) => {
       }
     } catch(e) { console.log('Commission error:', e.message); }
 
-    // Auto-complete 'invite_friend' task for direct referrer when downline invests
+    // Auto-complete invite_* tasks for direct referrer when downline invests
     try {
       const investorRow = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [u.id]);
       if (investorRow && investorRow.referred_by) {
         const referrerId = investorRow.referred_by;
-        // Check if referrer already completed this task
-        const alreadyDone = await db.one(
-          `SELECT id FROM tasks WHERE user_id=$1 AND task_key='invite_friend' AND completed=1`,
+
+        // Count how many active referrals (people who invested) this referrer has
+        const activeRefCount = await db.one(
+          `SELECT COUNT(DISTINCT i.user_id) as cnt
+           FROM investments i
+           JOIN users us ON us.id = i.user_id
+           WHERE us.referred_by = $1 AND i.status = 'active'`,
           [referrerId]
         );
-        if (!alreadyDone) {
-          // Get reward amount from tasks_config
-          const taskCfg = await db.one(`SELECT reward FROM tasks_config WHERE task_key='invite_friend'`);
-          const reward = taskCfg ? parseFloat(taskCfg.reward) : 5;
-          // Mark task complete
-          await db.run(
-            `INSERT INTO tasks (user_id,task_key,completed,completed_at) VALUES ($1,'invite_friend',1,NOW())
-             ON CONFLICT (user_id,task_key) DO UPDATE SET completed=1, completed_at=NOW()`,
-            [referrerId]
-          );
-          // Give reward
-          await db.run(
-            `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1 WHERE id=$2`,
-            [reward, referrerId]
-          );
-          await db.run(
-            `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,'task_reward',$2,'completed','Task: invite_friend (auto)')`,
-            [referrerId, reward]
-          );
-          console.log(`✅ invite_friend task auto-completed for user ${referrerId} — reward $${reward}`);
+        const activeCount = parseInt(activeRefCount.cnt) || 0;
+
+        // Get all invite tasks from config
+        const inviteTasks = await db.all(
+          `SELECT * FROM tasks_config WHERE task_key LIKE 'invite%' AND is_active=1`
+        );
+
+        for (const taskCfg of inviteTasks) {
+          // Extract required count from task_key e.g. invite_friend=1, invite_10=10
+          let required = 1;
+          const match = taskCfg.task_key.match(/(\d+)/);
+          if (match) required = parseInt(match[1]);
+
+          if (activeCount >= required) {
+            // Check if already completed
+            const alreadyDone = await db.one(
+              `SELECT id FROM tasks WHERE user_id=$1 AND task_key=$2 AND completed=1`,
+              [referrerId, taskCfg.task_key]
+            );
+            if (!alreadyDone) {
+              const reward = parseFloat(taskCfg.reward) || 1;
+              await db.run(
+                `INSERT INTO tasks (user_id,task_key,completed,completed_at) VALUES ($1,$2,1,NOW())
+                 ON CONFLICT (user_id,task_key) DO UPDATE SET completed=1, completed_at=NOW()`,
+                [referrerId, taskCfg.task_key]
+              );
+              await db.run(
+                `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1 WHERE id=$2`,
+                [reward, referrerId]
+              );
+              await db.run(
+                `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,'task_reward',$2,'completed',$3)`,
+                [referrerId, reward, 'Task: ' + taskCfg.task_key + ' (auto)']
+              );
+              console.log(`✅ ${taskCfg.task_key} auto-completed for user ${referrerId} — reward $${reward}`);
+            }
+          }
         }
       }
-    } catch(e) { console.log('invite_friend task error:', e.message); }
+    } catch(e) { console.log('invite task error:', e.message); }
 
     res.json({success:true, daily_earn:daily});
   } catch(e) { res.status(500).json({error:e.message}); }
