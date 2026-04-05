@@ -845,6 +845,57 @@ app.post('/admin/maintenance', adminAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// REFERRAL STATS (per-level breakdown)
+// ══════════════════════════════════════════
+app.get('/api/referral-stats/:id', async (req, res) => {
+  try {
+    const uid = parseInt(req.params.id);
+
+    // Level 1 — direct referrals
+    const lvl1rows = await db.all(`SELECT id FROM users WHERE referred_by=$1`, [uid]);
+    const lvl1ids  = lvl1rows.map(r => r.id);
+
+    // Level 2
+    let lvl2ids = [];
+    if (lvl1ids.length > 0) {
+      const lvl2rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl1ids]);
+      lvl2ids = lvl2rows.map(r => r.id);
+    }
+
+    // Level 3
+    let lvl3ids = [];
+    if (lvl2ids.length > 0) {
+      const lvl3rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl2ids]);
+      lvl3ids = lvl3rows.map(r => r.id);
+    }
+
+    // Active = has at least one approved deposit
+    const countActive = async (ids) => {
+      if (!ids.length) return 0;
+      const r = await db.one(
+        `SELECT COUNT(DISTINCT user_id) as cnt FROM transactions WHERE user_id = ANY($1::bigint[]) AND type='deposit' AND status='approved'`,
+        [ids]
+      );
+      return parseInt(r.cnt) || 0;
+    };
+
+    const [act1, act2, act3] = await Promise.all([
+      countActive(lvl1ids),
+      countActive(lvl2ids),
+      countActive(lvl3ids),
+    ]);
+
+    res.json({
+      total: lvl1ids.length + lvl2ids.length + lvl3ids.length,
+      total_active: act1 + act2 + act3,
+      lvl1: { total: lvl1ids.length, active: act1 },
+      lvl2: { total: lvl2ids.length, active: act2 },
+      lvl3: { total: lvl3ids.length, active: act3 },
+    });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// ══════════════════════════════════════════
 // START
 // ══════════════════════════════════════════
 setupDB().then(() => {
