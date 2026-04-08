@@ -155,7 +155,7 @@ async function setupDB() {
       status     TEXT DEFAULT 'pending',
       tx_hash    TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
-      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '20 minutes')
+      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '15 minutes')
     )
   `);
   await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_dep_txhash ON auto_deposits (tx_hash) WHERE tx_hash IS NOT NULL`);
@@ -950,7 +950,7 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
   for (let i = 0; i < 99; i++) {
-    const dec = (Math.floor(Math.random() * 99) + 1) / 100; // 0.01–0.99
+    const dec = (Math.floor(Math.random() * 15) + 1) / 100; // 0.01–0.15
     const uAmt = +(parseFloat(base) + dec).toFixed(2);
     const ex = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
