@@ -1,7 +1,42 @@
 const express  = require('express');
 const cors     = require('cors');
 const crypto   = require('crypto');
+const https    = require('https');
 const { Pool } = require('pg');
+
+// ══════════════════════════════════════════
+// AUTO DEPOSIT SCANNER CONFIG
+// ══════════════════════════════════════════
+const BSCSCAN_KEY         = process.env.BSCSCAN_KEY     || '9Q81C5TFY3S7Q12MTENPJRMZTYIACES5CB';
+const BEP20_WALLET        = process.env.BEP20_WALLET    || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148';
+const BEP20_USDT_CONTRACT = '0x55d398326f99059fF775485246999027B3197955'; // BSC USDT (18 decimals)
+
+const TRONGRID_KEY        = process.env.TRONGRID_KEY    || 'c7880f4e-6687-4df9-9c4c-f4588b645f51';
+const TRC20_WALLET        = process.env.TRC20_WALLET    || 'TVo9famfMAmvN9DnbtQ2fNLh6DwYJ698cZ';
+const TRC20_USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'; // TRC20 USDT (6 decimals)
+
+// Simple HTTPS GET helper
+function httpsGet(url, headers) {
+  return new Promise((resolve) => {
+    const opts = new URL(url);
+    const options = {
+      hostname: opts.hostname,
+      path: opts.pathname + opts.search,
+      method: 'GET',
+      headers: Object.assign({ 'User-Agent': 'BlockUSDT/1.0' }, headers || {}),
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch(_) { resolve({}); }
+      });
+    });
+    req.on('error', () => resolve({}));
+    req.setTimeout(10000, () => { req.destroy(); resolve({}); });
+    req.end();
+  });
+}
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -110,13 +145,28 @@ async function setupDB() {
     )
   `);
 
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS auto_deposits (
+      id         SERIAL PRIMARY KEY,
+      user_id    BIGINT NOT NULL,
+      amount     REAL NOT NULL,
+      unique_amt REAL NOT NULL,
+      network    TEXT NOT NULL,
+      status     TEXT DEFAULT 'pending',
+      tx_hash    TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '20 minutes')
+    )
+  `);
+  await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_dep_txhash ON auto_deposits (tx_hash) WHERE tx_hash IS NOT NULL`);
+
   // Default settings
   const defaults = {
     withdraw_fee_pct: '2', withdraw_min: '10', withdraw_max: '10000',
     deposit_min: '5',
-    trc20_address: 'TGnuvLYAHJn2sxvi7MqVqHUkMQ66DiKgSJ',
+    trc20_address: 'TVo9famfMAmvN9DnbtQ2fNLh6DwYJ698cZ',
     erc20_address: '0x4878d34e544b79801249d36303b321ca8e634bdd',
-    bep20_address: '0x4878d34e544b79801249d36303b321ca8e634bdd',
+    bep20_address: '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148',
     ref_lvl1_pct: '8', ref_lvl2_pct: '3', ref_lvl3_pct: '1',
     maintenance: '0',
   };
@@ -896,9 +946,184 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// AUTO DEPOSIT — Generate unique amount
+// ══════════════════════════════════════════
+async function generateUniqueAmt(base) {
+  for (let i = 0; i < 99; i++) {
+    const dec = (Math.floor(Math.random() * 99) + 1) / 100; // 0.01–0.99
+    const uAmt = +(parseFloat(base) + dec).toFixed(2);
+    const ex = await db.one(
+      `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
+      [uAmt]
+    );
+    if (!ex) return uAmt;
+  }
+  throw new Error('Cannot generate unique amount — try again');
+}
+
+// ── POST /api/deposit/create ──────────────
+app.post('/api/deposit/create', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { amount, network } = req.body;
+    const minDep = parseFloat(await getSetting('deposit_min') || 5);
+    const amt = parseFloat(amount);
+    if (!amt || amt < minDep)           return res.status(400).json({error:`Minimum deposit: $${minDep}`});
+    if (!['TRC20','BEP20'].includes(network))
+      return res.status(400).json({error:'Invalid network. Use TRC20 or BEP20'});
+
+    const uAmt    = await generateUniqueAmt(amt);
+    const address = network === 'TRC20' ? TRC20_WALLET : BEP20_WALLET;
+
+    const dep = await db.one(
+      `INSERT INTO auto_deposits (user_id, amount, unique_amt, network)
+       VALUES ($1,$2,$3,$4) RETURNING id, unique_amt, expires_at`,
+      [u.id, amt, uAmt, network]
+    );
+
+    res.json({ id: dep.id, unique_amount: dep.unique_amt, address, expires_at: dep.expires_at });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// ── GET /api/deposit/status/:id ───────────
+app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
+  try {
+    const u   = req.tgUser;
+    const dep = await db.one(
+      `SELECT * FROM auto_deposits WHERE id=$1 AND user_id=$2`,
+      [req.params.id, u.id]
+    );
+    if (!dep) return res.status(404).json({error:'Not found'});
+
+    if (dep.status === 'pending' && new Date() > new Date(dep.expires_at)) {
+      await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
+      return res.json({ status: 'expired' });
+    }
+    res.json({ status: dep.status, tx_hash: dep.tx_hash, amount: dep.unique_amt });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// ══════════════════════════════════════════
+// AUTO DEPOSIT — Credit helper
+// ══════════════════════════════════════════
+async function creditAutoDeposit(dep, txHash) {
+  try {
+    // Mark deposit complete (UNIQUE index prevents double-credit)
+    await db.run(
+      `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
+      [txHash, dep.id]
+    );
+    // Credit balance
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.unique_amt, dep.user_id]);
+    // Transaction log
+    await db.run(
+      `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [dep.user_id,'deposit',dep.unique_amt,dep.network,txHash,'approved','Auto-detected']
+    );
+    // First deposit task reward
+    const taskDone = await db.one(
+      `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
+    );
+    if (!taskDone) {
+      await db.run(
+        `INSERT INTO tasks (user_id, task_key, completed, completed_at)
+         VALUES ($1,'first_deposit',1,NOW()) ON CONFLICT DO NOTHING`,
+        [dep.user_id]
+      );
+      await db.run(`UPDATE users SET balance=balance+3 WHERE id=$1`, [dep.user_id]);
+    }
+    console.log(`✅ Auto deposit: user=${dep.user_id} amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
+  } catch(e) {
+    // Ignore unique constraint violation (double-credit prevention)
+    if (!e.message.includes('unique') && !e.message.includes('duplicate')) {
+      console.error('creditAutoDeposit error:', e.message);
+    }
+  }
+}
+
+// ══════════════════════════════════════════
+// BEP20 SCANNER (BscScan / Etherscan V2)
+// ══════════════════════════════════════════
+async function scanBEP20() {
+  try {
+    const pending = await db.all(
+      `SELECT * FROM auto_deposits WHERE network='BEP20' AND status='pending' AND expires_at > NOW()`
+    );
+    if (!pending.length) return;
+
+    const url = `https://api.bscscan.com/api?module=account&action=tokentx`
+      + `&contractaddress=${BEP20_USDT_CONTRACT}`
+      + `&address=${BEP20_WALLET}`
+      + `&sort=desc&apikey=${BSCSCAN_KEY}`;
+
+    const data = await httpsGet(url);
+    if (data.status !== '1' || !Array.isArray(data.result)) return;
+
+    const txs = data.result;
+    for (const dep of pending) {
+      const depTs = Math.floor(new Date(dep.created_at).getTime() / 1000) - 60;
+      for (const tx of txs) {
+        const txAmt = parseFloat(tx.value) / 1e18; // 18 decimals
+        const diff  = Math.abs(txAmt - dep.unique_amt);
+        if (diff <= 0.011 && parseInt(tx.timeStamp) >= depTs
+            && tx.to.toLowerCase() === BEP20_WALLET.toLowerCase()) {
+          await creditAutoDeposit(dep, tx.hash);
+          break;
+        }
+      }
+    }
+  } catch(e) { console.error('BEP20 scanner error:', e.message); }
+}
+
+// ══════════════════════════════════════════
+// TRC20 SCANNER (TronGrid)
+// ══════════════════════════════════════════
+async function scanTRC20() {
+  try {
+    const pending = await db.all(
+      `SELECT * FROM auto_deposits WHERE network='TRC20' AND status='pending' AND expires_at > NOW()`
+    );
+    if (!pending.length) return;
+
+    const url = `https://api.trongrid.io/v1/accounts/${TRC20_WALLET}/transactions/trc20`
+      + `?limit=50&contract_address=${TRC20_USDT_CONTRACT}`;
+
+    const data = await httpsGet(url, { 'TRON-PRO-API-KEY': TRONGRID_KEY });
+    if (!Array.isArray(data.data)) return;
+
+    const txs = data.data;
+    for (const dep of pending) {
+      const depTs = new Date(dep.created_at).getTime() - 60000;
+      for (const tx of txs) {
+        if (!tx.token_info || tx.to !== TRC20_WALLET) continue;
+        const txAmt = parseFloat(tx.value) / 1e6; // 6 decimals
+        const diff  = Math.abs(txAmt - dep.unique_amt);
+        if (diff <= 0.011 && tx.block_timestamp >= depTs) {
+          await creditAutoDeposit(dep, tx.transaction_id);
+          break;
+        }
+      }
+    }
+  } catch(e) { console.error('TRC20 scanner error:', e.message); }
+}
+
+// ══════════════════════════════════════════
+// START SCANNERS
+// ══════════════════════════════════════════
+function startScanners() {
+  console.log('🔍 Auto deposit scanners started (30s interval)');
+  setTimeout(scanBEP20, 8000);
+  setTimeout(scanTRC20, 10000);
+  setInterval(scanBEP20, 30000);
+  setInterval(scanTRC20, 30000);
+}
+
+// ══════════════════════════════════════════
 // START
 // ══════════════════════════════════════════
 setupDB().then(() => {
+  startScanners();
   app.listen(PORT, () => console.log(`✅ Server on port ${PORT} — Neon PostgreSQL connected`));
 }).catch(e => {
   console.error('DB setup failed:', e);
