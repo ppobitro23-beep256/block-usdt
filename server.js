@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 // ══════════════════════════════════════════
 // AUTO DEPOSIT SCANNER CONFIG
 // ══════════════════════════════════════════
-const BSCSCAN_KEY         = process.env.BSCSCAN_KEY     || '9Q81C5TFY3S7Q12MTENPJRMZTYIACES5CB';
+const BSCSCAN_KEY         = process.env.ETHERSCAN_KEY   || '';
 const BEP20_WALLET        = process.env.BEP20_WALLET    || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148';
 const BEP20_USDT_CONTRACT = '0x55d398326f99059fF775485246999027B3197955'; // BSC USDT (18 decimals)
 
@@ -1052,7 +1052,7 @@ async function scanBEP20() {
     );
     if (!pending.length) return;
 
-    const url = `https://api.bscscan.com/v2/api?chainid=56&module=account&action=tokentx`
+    const url = `https://api.etherscan.io/v2/api?chainid=56&module=account&action=tokentx`
       + `&contractaddress=${BEP20_USDT_CONTRACT}`
       + `&address=${BEP20_WALLET}`
       + `&sort=desc&apikey=${BSCSCAN_KEY}`;
