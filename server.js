@@ -1052,7 +1052,7 @@ async function scanBEP20() {
     );
     if (!pending.length) return;
 
-    const url = `https://api.bscscan.com/api?module=account&action=tokentx`
+    const url = `https://api.bscscan.com/v2/api?chainid=56&module=account&action=tokentx`
       + `&contractaddress=${BEP20_USDT_CONTRACT}`
       + `&address=${BEP20_WALLET}`
       + `&sort=desc&apikey=${BSCSCAN_KEY}`;
