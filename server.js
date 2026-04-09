@@ -1043,7 +1043,7 @@ async function creditAutoDeposit(dep, txHash) {
 }
 
 // ══════════════════════════════════════════
-// BEP20 SCANNER (BscScan / Etherscan V2)
+// BEP20 SCANNER (BscScan)
 // ══════════════════════════════════════════
 async function scanBEP20() {
   try {
@@ -1058,22 +1058,60 @@ async function scanBEP20() {
       + `&sort=desc&apikey=${BSCSCAN_KEY}`;
 
     const data = await httpsGet(url);
-    if (data.status !== '1' || !Array.isArray(data.result)) return;
+    if (data.status !== '1' || !Array.isArray(data.result)) {
+      console.log('[BEP20] API error or no results:', JSON.stringify(data).slice(0, 200));
+      return;
+    }
 
     const txs = data.result;
+    console.log(`[BEP20] Fetched ${txs.length} txs, pending deposits: ${pending.length}`);
+
     for (const dep of pending) {
       const depTs = Math.floor(new Date(dep.created_at).getTime() / 1000) - 60;
+      let matched = false;
+
       for (const tx of txs) {
-        const txAmt = parseFloat(tx.value) / 1e18; // 18 decimals
+        // Debug log every tx
+        console.log(`[BEP20] tx: contract=${tx.contractAddress} to=${tx.to} value=${tx.value} ts=${tx.timeStamp}`);
+
+        // Contract address check
+        if (tx.contractAddress.toLowerCase() !== BEP20_USDT_CONTRACT.toLowerCase()) {
+          console.log(`[BEP20] SKIP: wrong contract ${tx.contractAddress}`);
+          continue;
+        }
+
+        // Wallet check
+        if (tx.to.toLowerCase() !== BEP20_WALLET.toLowerCase()) {
+          console.log(`[BEP20] SKIP: wrong recipient ${tx.to}`);
+          continue;
+        }
+
+        // Time check
+        if (parseInt(tx.timeStamp) < depTs) {
+          console.log(`[BEP20] SKIP: tx too old ts=${tx.timeStamp} depTs=${depTs}`);
+          continue;
+        }
+
+        const txAmt = parseFloat(tx.value) / 1e18;
         const diff  = Math.abs(txAmt - dep.unique_amt);
-        if (diff <= 0.011 && parseInt(tx.timeStamp) >= depTs
-            && tx.to.toLowerCase() === BEP20_WALLET.toLowerCase()) {
+
+        console.log(`[BEP20] amount check: txAmt=${txAmt} expected=${dep.unique_amt} diff=${diff}`);
+
+        if (diff <= 0.01) {
+          console.log(`[BEP20] ✅ MATCH: dep=${dep.id} user=${dep.user_id} tx=${tx.hash}`);
           await creditAutoDeposit(dep, tx.hash);
+          matched = true;
           break;
+        } else {
+          console.log(`[BEP20] SKIP: amount mismatch diff=${diff}`);
         }
       }
+
+      if (!matched) {
+        console.log(`[BEP20] No match for dep=${dep.id} unique_amt=${dep.unique_amt}`);
+      }
     }
-  } catch(e) { console.error('BEP20 scanner error:', e.message); }
+  } catch(e) { console.error('[BEP20] scanner error:', e.message); }
 }
 
 // ══════════════════════════════════════════
@@ -1087,36 +1125,74 @@ async function scanTRC20() {
     if (!pending.length) return;
 
     const url = `https://api.trongrid.io/v1/accounts/${TRC20_WALLET}/transactions/trc20`
-      + `?limit=50&contract_address=${TRC20_USDT_CONTRACT}`;
+      + `?limit=50&contract_address=${TRC20_USDT_CONTRACT}&only_to=true`;
 
     const data = await httpsGet(url, { 'TRON-PRO-API-KEY': TRONGRID_KEY });
-    if (!Array.isArray(data.data)) return;
+    if (!Array.isArray(data.data)) {
+      console.log('[TRC20] API error:', JSON.stringify(data).slice(0, 200));
+      return;
+    }
 
     const txs = data.data;
+    console.log(`[TRC20] Fetched ${txs.length} txs, pending deposits: ${pending.length}`);
+
     for (const dep of pending) {
       const depTs = new Date(dep.created_at).getTime() - 60000;
+      let matched = false;
+
       for (const tx of txs) {
-        if (!tx.token_info || tx.to !== TRC20_WALLET) continue;
-        const txAmt = parseFloat(tx.value) / 1e6; // 6 decimals
+        // Debug log every tx
+        console.log(`[TRC20] tx: contract=${tx.token_info?.address} to=${tx.to} value=${tx.value} ts=${tx.block_timestamp}`);
+
+        // Contract address check
+        if (!tx.token_info || tx.token_info.address !== TRC20_USDT_CONTRACT) {
+          console.log(`[TRC20] SKIP: wrong contract`);
+          continue;
+        }
+
+        // Wallet check (Tron addresses are case-sensitive base58)
+        if (tx.to !== TRC20_WALLET) {
+          console.log(`[TRC20] SKIP: wrong recipient ${tx.to}`);
+          continue;
+        }
+
+        // Time check
+        if (tx.block_timestamp < depTs) {
+          console.log(`[TRC20] SKIP: tx too old ts=${tx.block_timestamp} depTs=${depTs}`);
+          continue;
+        }
+
+        const txAmt = parseFloat(tx.value) / 1e6;
         const diff  = Math.abs(txAmt - dep.unique_amt);
-        if (diff <= 0.011 && tx.block_timestamp >= depTs) {
+
+        console.log(`[TRC20] amount check: txAmt=${txAmt} expected=${dep.unique_amt} diff=${diff}`);
+
+        if (diff <= 0.01) {
+          console.log(`[TRC20] ✅ MATCH: dep=${dep.id} user=${dep.user_id} tx=${tx.transaction_id}`);
           await creditAutoDeposit(dep, tx.transaction_id);
+          matched = true;
           break;
+        } else {
+          console.log(`[TRC20] SKIP: amount mismatch diff=${diff}`);
         }
       }
+
+      if (!matched) {
+        console.log(`[TRC20] No match for dep=${dep.id} unique_amt=${dep.unique_amt}`);
+      }
     }
-  } catch(e) { console.error('TRC20 scanner error:', e.message); }
+  } catch(e) { console.error('[TRC20] scanner error:', e.message); }
 }
 
 // ══════════════════════════════════════════
 // START SCANNERS
 // ══════════════════════════════════════════
 function startScanners() {
-  console.log('🔍 Auto deposit scanners started (30s interval)');
-  setTimeout(scanBEP20, 8000);
-  setTimeout(scanTRC20, 10000);
-  setInterval(scanBEP20, 30000);
-  setInterval(scanTRC20, 30000);
+  console.log('🔍 Auto deposit scanners started (15s interval)');
+  setTimeout(scanBEP20, 5000);
+  setTimeout(scanTRC20, 8000);
+  setInterval(scanBEP20, 15000);
+  setInterval(scanTRC20, 15000);
 }
 
 // ══════════════════════════════════════════
