@@ -1,3 +1,4 @@
+Content is user-generated and unverified.
 const express  = require('express');
 const cors     = require('cors');
 const crypto   = require('crypto');
@@ -29,11 +30,16 @@ function httpsGet(url, headers) {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch(_) { resolve({}); }
+        try {
+          resolve(JSON.parse(data));
+        } catch(_) {
+          console.log('[httpsGet] Parse error, raw:', data.slice(0, 300));
+          resolve({});
+        }
       });
     });
-    req.on('error', () => resolve({}));
-    req.setTimeout(10000, () => { req.destroy(); resolve({}); });
+    req.on('error', (e) => { console.log('[httpsGet] Error:', e.message); resolve({}); });
+    req.setTimeout(10000, () => { console.log('[httpsGet] Timeout:', opts.hostname); req.destroy(); resolve({}); });
     req.end();
   });
 }
