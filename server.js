@@ -1013,39 +1013,34 @@ app.post('/api/deposit/verify', userAuth, async (req, res) => {
     );
     if (!dep) return res.status(404).json({error:'Deposit not found or already processed'});
 
-    // Verify via Moralis
-    const url  = `https://deep-index.moralis.io/api/v2.2/transaction/${tx_hash}/verbose?chain=bsc`;
+    // Verify via Moralis ERC20 transfers endpoint
+    const url  = `https://deep-index.moralis.io/api/v2.2/erc20/transfers?chain=bsc&transaction_hash=${tx_hash}`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
-    if (!data || data.message) {
-      return res.status(400).json({error:'Transaction not found on blockchain. Wait for confirmation.'});
+    console.log(`[SEMI] Moralis response:`, JSON.stringify(data).slice(0, 300));
+
+    if (!data || data.message || !Array.isArray(data.result) || !data.result.length) {
+      return res.status(400).json({error:'Transaction not found. Wait for blockchain confirmation and try again.'});
     }
 
-    // Check ERC20 transfers in the tx
-    const transfers = (data.logs || []).filter(log =>
-      log.address && log.address.toLowerCase() === USDT_CONTRACT
-    );
-
-    if (!transfers.length) return res.status(400).json({error:'No USDT transfer found in this transaction'});
-
-    // Find transfer to our wallet
+    // Find USDT transfer to our wallet
     let txAmt = 0;
-    for (const log of transfers) {
-      if (log.decoded_event && log.decoded_event.params) {
-        const toParam  = log.decoded_event.params.find(p => p.name === 'to');
-        const valParam = log.decoded_event.params.find(p => p.name === 'value');
-        if (toParam && toParam.value.toLowerCase() === DEPOSIT_WALLET) {
-          txAmt = parseFloat(valParam.value) / 1e18;
-          break;
-        }
+    for (const transfer of data.result) {
+      if (
+        transfer.address && transfer.address.toLowerCase() === USDT_CONTRACT &&
+        transfer.to_address && transfer.to_address.toLowerCase() === DEPOSIT_WALLET
+      ) {
+        txAmt = parseFloat(transfer.value_decimal || 0);
+        console.log(`[SEMI] Found transfer: to=${transfer.to_address} amt=${txAmt}`);
+        break;
       }
     }
 
     console.log(`[SEMI] tx=${tx_hash.slice(0,16)} txAmt=${txAmt} expected=${dep.unique_amt}`);
 
-    if (txAmt === 0) return res.status(400).json({error:'USDT not sent to our wallet'});
+    if (txAmt === 0) return res.status(400).json({error:'USDT transfer to our wallet not found in this TX'});
     if (Math.abs(txAmt - dep.unique_amt) > 0.01) {
-      return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt}, got $${txAmt.toFixed(4)}`});
+      return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt}, got $${txAmt.toFixed(2)}`});
     }
 
     await creditAutoDeposit(dep, tx_hash);
