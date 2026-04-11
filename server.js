@@ -964,8 +964,8 @@ app.post('/api/deposit/semi', userAuth, async (req, res) => {
   try {
     const u   = req.tgUser;
     const amt = parseFloat(req.body.amount);
-    const allowed = [10, 20, 50, 100, 200, 500];
-    if (!allowed.includes(amt)) return res.status(400).json({error:'Invalid amount. Choose: ' + allowed.join(', ')});
+    const minDep = parseFloat(await getSetting('deposit_min') || 5);
+    if (!amt || amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
 
     const dep = await db.one(
       `INSERT INTO auto_deposits (user_id, amount, unique_amt, network, dep_type, expires_at)
