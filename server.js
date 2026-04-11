@@ -158,7 +158,7 @@ async function setupDB() {
       status     TEXT DEFAULT 'pending',
       tx_hash    TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
-      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '10 minutes')
+      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '15 minutes')
     )
   `);
   await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_dep_txhash ON auto_deposits (tx_hash) WHERE tx_hash IS NOT NULL`);
@@ -245,6 +245,7 @@ async function setupDB() {
 
   await Promise.all([
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`),
+    db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS dep_type TEXT DEFAULT 'auto'`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS total_commission REAL DEFAULT 0`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`),
@@ -915,10 +916,13 @@ app.post('/admin/maintenance', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════
 // AUTO DEPOSIT — BEP20 ONLY
 // ══════════════════════════════════════════
+// ══════════════════════════════════════════
+// AUTO DEPOSIT — Unique amount (4 decimals)
+// ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
-  for (let i = 0; i < 15; i++) {
-    const dec  = (Math.floor(Math.random() * 15) + 1) / 100; // 0.01–0.15
-    const uAmt = +(parseFloat(base) + dec).toFixed(2);
+  for (let i = 0; i < 50; i++) {
+    const dec  = (Math.floor(Math.random() * 9000) + 1000); // 1000-9999
+    const uAmt = +(parseFloat(base) + dec / 10000).toFixed(4); // e.g. 10.3847
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
       [uAmt]
@@ -928,6 +932,7 @@ async function generateUniqueAmt(base) {
   throw new Error('Cannot generate unique amount — try again');
 }
 
+// ── POST /api/deposit/create (AUTO) ──────────────
 app.post('/api/deposit/create', userAuth, async (req, res) => {
   try {
     const u      = req.tgUser;
@@ -939,18 +944,88 @@ app.post('/api/deposit/create', userAuth, async (req, res) => {
     const uAmt = await generateUniqueAmt(amt);
 
     const dep = await db.one(
-      `INSERT INTO auto_deposits (user_id, amount, unique_amt, network)
-       VALUES ($1,$2,$3,'BEP20') RETURNING id, unique_amt, expires_at`,
+      `INSERT INTO auto_deposits (user_id, amount, unique_amt, network, dep_type)
+       VALUES ($1,$2,$3,'BEP20','auto') RETURNING id, unique_amt, expires_at`,
       [u.id, amt, uAmt]
     );
 
     res.json({
       id:            dep.id,
       unique_amount: dep.unique_amt,
-      address:       BEP20_WALLET,
+      address:       DEPOSIT_WALLET,
       network:       'BEP20',
       expires_at:    dep.expires_at
     });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// ── POST /api/deposit/semi (SEMI-AUTO) ────────────
+app.post('/api/deposit/semi', userAuth, async (req, res) => {
+  try {
+    const u   = req.tgUser;
+    const amt = parseFloat(req.body.amount);
+    const allowed = [10, 20, 50, 100, 200, 500];
+    if (!allowed.includes(amt)) return res.status(400).json({error:'Invalid amount. Choose: ' + allowed.join(', ')});
+
+    const dep = await db.one(
+      `INSERT INTO auto_deposits (user_id, amount, unique_amt, network, dep_type, expires_at)
+       VALUES ($1,$2,$3,'BEP20','semi', NOW() + INTERVAL '60 minutes') RETURNING id, unique_amt, expires_at`,
+      [u.id, amt, amt]
+    );
+
+    res.json({
+      id:      dep.id,
+      amount:  dep.unique_amt,
+      address: DEPOSIT_WALLET,
+      network: 'BEP20'
+    });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// ── POST /api/deposit/verify (SEMI-AUTO TXID verify) ──
+app.post('/api/deposit/verify', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { deposit_id, tx_hash } = req.body;
+    if (!deposit_id || !tx_hash) return res.status(400).json({error:'deposit_id and tx_hash required'});
+
+    // Check duplicate tx
+    const dup = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [tx_hash]);
+    if (dup) return res.status(400).json({error:'TX already used'});
+
+    const dep = await db.one(
+      `SELECT * FROM auto_deposits WHERE id=$1 AND user_id=$2 AND status='pending'`,
+      [deposit_id, u.id]
+    );
+    if (!dep) return res.status(404).json({error:'Deposit not found or already processed'});
+
+    // Fetch TX from Moralis
+    const url = `https://deep-index.moralis.io/api/v2.2/erc20/transfers?chain=bsc&transaction_hash=${tx_hash}`;
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
+
+    if (!data.result || !data.result.length) {
+      return res.status(400).json({error:'Transaction not found. Wait for blockchain confirmation and try again.'});
+    }
+
+    const tx = data.result[0];
+    console.log(`[SEMI] verify tx=${tx_hash} to=${tx.to_address} contract=${tx.address} val=${tx.value_decimal}`);
+
+    // Validate recipient
+    if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) {
+      return res.status(400).json({error:'Wrong recipient address'});
+    }
+    // Validate token contract
+    if (tx.address.toLowerCase() !== USDT_CONTRACT) {
+      return res.status(400).json({error:'Wrong token. Must be USDT (BEP20)'});
+    }
+    // Validate amount
+    const txAmt = parseFloat(tx.value_decimal);
+    if (Math.abs(txAmt - dep.unique_amt) > 0.01) {
+      return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt}, got $${txAmt}`});
+    }
+
+    await creditAutoDeposit(dep, tx_hash);
+    res.json({success: true, amount: dep.unique_amt});
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
@@ -978,10 +1053,11 @@ async function creditAutoDeposit(dep, txHash) {
       [txHash, dep.id]
     );
     await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.unique_amt, dep.user_id]);
+    const depNote = (dep.dep_type === 'semi') ? 'Semi-auto verified' : 'Auto-detected';
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id,'deposit',dep.unique_amt,'BEP20',txHash,'approved','Auto-detected']
+      [dep.user_id,'deposit',dep.unique_amt,'BEP20',txHash,'approved', depNote]
     );
     const taskDone = await db.one(
       `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
@@ -1003,54 +1079,51 @@ async function creditAutoDeposit(dep, txHash) {
 }
 
 // ══════════════════════════════════════════
-// BEP20 SCANNER (Etherscan V2 — BSC)
+// BEP20 AUTO SCANNER (Moralis)
 // ══════════════════════════════════════════
 async function scanBEP20() {
   try {
+    // Only scan auto deposits
     const pending = await db.all(
-      `SELECT * FROM auto_deposits WHERE network='BEP20' AND status='pending' AND expires_at > NOW()`
+      `SELECT * FROM auto_deposits WHERE network='BEP20' AND dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
     if (!pending.length) return;
 
-    const url = `https://api.bscscan.com/api?module=account&action=tokentx`
-      + `&contractaddress=${BEP20_USDT_CONTRACT}`
-      + `&address=${BEP20_WALLET}`
-      + `&sort=desc&apikey=${BSCSCAN_KEY}`;
+    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers`
+      + `?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
 
-    const data = await httpsGet(url);
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
-    if (data.status !== '1' || !Array.isArray(data.result)) {
-      console.log('[BEP20] API error:', JSON.stringify(data).slice(0, 200));
+    if (!data.result || !Array.isArray(data.result)) {
+      console.log('[BEP20] Moralis error:', JSON.stringify(data).slice(0, 200));
       return;
     }
 
     const txs = data.result;
-    console.log(`[BEP20] Fetched ${txs.length} txs | pending: ${pending.length}`);
+    console.log(`[BEP20] Moralis: ${txs.length} txs | pending auto: ${pending.length}`);
 
     for (const dep of pending) {
-      const depTs = Math.floor(new Date(dep.created_at).getTime() / 1000) - 60;
+      const depTs = new Date(dep.created_at).getTime() - 60000;
       let matched = false;
 
       for (const tx of txs) {
-        console.log(`[BEP20] tx: contract=${tx.contractAddress} to=${tx.to} value=${tx.value} ts=${tx.timeStamp}`);
+        // Only incoming to deposit wallet
+        if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
+        // Time check
+        if (new Date(tx.block_timestamp).getTime() < depTs) continue;
 
-        if (tx.contractAddress.toLowerCase() !== BEP20_USDT_CONTRACT.toLowerCase()) continue;
-        if (tx.to.toLowerCase() !== BEP20_WALLET.toLowerCase()) continue;
-        if (parseInt(tx.timeStamp) < depTs) continue;
-
-        const txAmt = parseFloat(tx.value) / 1e18;
+        const txAmt = parseFloat(tx.value_decimal);
         const diff  = Math.abs(txAmt - dep.unique_amt);
-        console.log(`[BEP20] amt check: got=${txAmt} expected=${dep.unique_amt} diff=${diff}`);
+        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,16)} amt=${txAmt} expected=${dep.unique_amt} diff=${diff}`);
 
-        if (diff <= 0.01) {
-          console.log(`[BEP20] ✅ MATCH dep=${dep.id} user=${dep.user_id} tx=${tx.hash}`);
-          await creditAutoDeposit(dep, tx.hash);
+        if (diff < 0.0001) { // exact match (4 decimal)
+          console.log(`[BEP20] ✅ MATCH dep=${dep.id} user=${dep.user_id}`);
+          await creditAutoDeposit(dep, tx.transaction_hash);
           matched = true;
           break;
         }
       }
-
-      if (!matched) console.log(`[BEP20] No match for dep=${dep.id} unique_amt=${dep.unique_amt}`);
+      if (!matched) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt}`);
     }
   } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
 }
@@ -1059,9 +1132,9 @@ async function scanBEP20() {
 // START SCANNERS
 // ══════════════════════════════════════════
 function startScanners() {
-  console.log('🔍 BEP20 scanner started (15s interval)');
+  console.log('🔍 BEP20 Moralis scanner started (10s interval)');
   setTimeout(scanBEP20, 5000);
-  setInterval(scanBEP20, 15000);
+  setInterval(scanBEP20, 10000);
 }
 
 // ══════════════════════════════════════════
