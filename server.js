@@ -5,15 +5,15 @@ const https    = require('https');
 const { Pool } = require('pg');
 
 // ══════════════════════════════════════════
-// CONFIG
+// AUTO DEPOSIT SCANNER CONFIG
 // ══════════════════════════════════════════
-const BSCSCAN_KEY         = process.env.ETHERSCAN_KEY  || '';
-const BEP20_WALLET        = process.env.BEP20_WALLET   || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148';
-const BEP20_USDT_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
+const MORALIS_KEY         = process.env.MORALIS_API_KEY || '';
+const DEPOSIT_WALLET      = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148').toLowerCase();
+const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF775485246999027B3197955').toLowerCase();
+const BEP20_WALLET        = DEPOSIT_WALLET;
+const BEP20_USDT_CONTRACT = USDT_CONTRACT;
 
-// ══════════════════════════════════════════
-// HTTPS HELPER
-// ══════════════════════════════════════════
+// Simple HTTPS GET helper
 function httpsGet(url, headers) {
   return new Promise((resolve) => {
     const opts = new URL(url);
@@ -27,16 +27,11 @@ function httpsGet(url, headers) {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch(_) {
-          console.log('[httpsGet] Parse error, raw:', data.slice(0, 300));
-          resolve({});
-        }
+        try { resolve(JSON.parse(data)); } catch(_) { resolve({}); }
       });
     });
-    req.on('error', (e) => { console.log('[httpsGet] Error:', e.message); resolve({}); });
-    req.setTimeout(10000, () => { console.log('[httpsGet] Timeout:', opts.hostname); req.destroy(); resolve({}); });
+    req.on('error', () => resolve({}));
+    req.setTimeout(10000, () => { req.destroy(); resolve({}); });
     req.end();
   });
 }
@@ -44,9 +39,9 @@ function httpsGet(url, headers) {
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const BOT_TOKEN    = process.env.BOT_TOKEN    || 'YOUR_BOT_TOKEN';
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'admin123';
-const DATABASE_URL = process.env.DATABASE_URL || '';
+const BOT_TOKEN    = process.env.BOT_TOKEN    || "YOUR_BOT_TOKEN";
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin123";
+const DATABASE_URL = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_4IVJ1PZzcjnW@ep-long-art-anucops0-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
 
 const corsConfig = {
   origin: true,
@@ -59,7 +54,7 @@ app.options('*', cors(corsConfig));
 app.use(express.json());
 
 // ══════════════════════════════════════════
-// PostgreSQL
+// PostgreSQL CONNECTION
 // ══════════════════════════════════════════
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -163,9 +158,12 @@ async function setupDB() {
   `);
   await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_dep_txhash ON auto_deposits (tx_hash) WHERE tx_hash IS NOT NULL`);
 
+  // Default settings
   const defaults = {
     withdraw_fee_pct: '2', withdraw_min: '10', withdraw_max: '10000',
     deposit_min: '5',
+    trc20_address: 'TVo9famfMAmvN9DnbtQ2fNLh6DwYJ698cZ',
+    erc20_address: '0x4878d34e544b79801249d36303b321ca8e634bdd',
     bep20_address: '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148',
     ref_lvl1_pct: '8', ref_lvl2_pct: '3', ref_lvl3_pct: '1',
     maintenance: '0',
@@ -174,6 +172,7 @@ async function setupDB() {
     db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING`, [k,v])
   ));
 
+  // Default plans
   const planCount = await db.one(`SELECT COUNT(*) as c FROM plans`);
   if (parseInt(planCount.c) === 0) {
     const defaultPlans = [
@@ -190,6 +189,7 @@ async function setupDB() {
     }
   }
 
+  // Pending referral table
   await db.run(`
     CREATE TABLE IF NOT EXISTS pending_refs (
       user_id    BIGINT PRIMARY KEY,
@@ -198,6 +198,7 @@ async function setupDB() {
     )
   `);
 
+  // Admin-managed tasks config
   await db.run(`
     CREATE TABLE IF NOT EXISTS tasks_config (
       id         SERIAL PRIMARY KEY,
@@ -211,6 +212,7 @@ async function setupDB() {
     )
   `);
 
+  // Default tasks if empty
   const taskCount = await db.one('SELECT COUNT(*) as c FROM tasks_config');
   if (parseInt(taskCount.c) === 0) {
     const defaultTasks = [
@@ -230,19 +232,21 @@ async function setupDB() {
     }
   }
 
+  // Commission table
   await db.run(`
     CREATE TABLE IF NOT EXISTS commissions (
-      id            SERIAL PRIMARY KEY,
-      user_id       BIGINT,
-      from_user_id  BIGINT,
-      level         INTEGER,
-      amount        REAL,
-      status        TEXT DEFAULT 'pending',
+      id           SERIAL PRIMARY KEY,
+      user_id      BIGINT,   -- who earns the commission
+      from_user_id BIGINT,   -- who invested
+      level        INTEGER,  -- 1, 2, or 3
+      amount       REAL,
+      status       TEXT DEFAULT 'pending',
       investment_id INTEGER,
-      created_at    TIMESTAMP DEFAULT NOW()
+      created_at   TIMESTAMP DEFAULT NOW()
     )
   `);
 
+  // Run all migrations in parallel
   await Promise.all([
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS dep_type TEXT DEFAULT 'auto'`),
@@ -258,6 +262,7 @@ async function setupDB() {
   console.log('✅ Database ready (Neon PostgreSQL)');
 }
 
+// Handle unhandled promise rejections
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err.message);
 });
@@ -282,10 +287,11 @@ function verifyTg(initData) {
 
 function userAuth(req, res, next) {
   const initData = req.headers['x-telegram-init-data'] || req.body?.initData;
-  if (!initData) {
-    req.tgUser = { id: req.body.user_id || 123456 };
-    return next();
-  }
+if (!initData) {
+  req.tgUser = { id: req.body.user_id || 123456 };
+  return next();
+}
+  // Always try to parse user data - skip strict verification
   try {
     const p = new URLSearchParams(initData);
     const userStr = p.get('user');
@@ -305,6 +311,7 @@ function adminAuth(req, res, next) {
 // ══════════════════════════════════════════
 app.post('/api/auth', async (req, res) => {
   try {
+    // Get user from any source
     let u = req.body?.tgUser || req.body?.user || null;
     if (!u) {
       const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
@@ -324,6 +331,7 @@ app.post('/api/auth', async (req, res) => {
     const refById  = ref && String(ref).startsWith('REF') ? parseInt(String(ref).replace('REF','')) || null : null;
     const finalRef = (refById && refById !== uid) ? refById : null;
 
+    // Check pending ref
     let pendingRef = finalRef;
     if (!pendingRef) {
       const pr = await db.one('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
@@ -333,6 +341,7 @@ app.post('/api/auth', async (req, res) => {
       }
     }
 
+    // Upsert user
     await db.run(`
       INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
@@ -345,6 +354,7 @@ app.post('/api/auth', async (req, res) => {
         referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
     `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
 
+    // Clean pending ref
     await db.run('DELETE FROM pending_refs WHERE user_id=$1', [uid]).catch(()=>{});
 
     const user = await db.one('SELECT * FROM users WHERE id=$1', [uid]);
@@ -361,6 +371,7 @@ app.get('/api/user/:id', async (req, res) => {
   try {
     console.log('Fetching user:', req.params.id);
     let user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
+    // Auto-create user if not exists (handles race condition)
     if (!user) {
       const uid = req.params.id;
       const refCode = 'REF' + uid;
@@ -372,6 +383,7 @@ app.get('/api/user/:id', async (req, res) => {
       if (!user) return res.status(404).json({error:'Not found'});
     }
 
+    // Run all queries in parallel for speed
     const [investments, transactions, taskRows, referrals, plans, settingRows, activeRefRow] = await Promise.all([
       db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect FROM investments WHERE user_id=$1 AND status='active'`, [req.params.id]),
       db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [req.params.id]),
@@ -385,6 +397,7 @@ app.get('/api/user/:id', async (req, res) => {
     const settings = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
     const activeReferrals = parseInt(activeRefRow.cnt) || 0;
 
+    // Reset today_count display if past reset_hours
     const nowTime = new Date();
     plans.forEach(function(p) {
       if (p.daily_limit > 0 && p.last_reset) {
@@ -393,6 +406,7 @@ app.get('/api/user/:id', async (req, res) => {
       }
     });
 
+    // Add commission data to user
     const userWithComm = {
       ...user,
       pending_commission: parseFloat(user.pending_commission || 0),
@@ -416,11 +430,13 @@ app.post('/api/invest', userAuth, async (req, res) => {
     if (amount > plan.max_amt) return res.status(400).json({error:`Max $${plan.max_amt}`});
     if (user.balance < amount) return res.status(400).json({error:'Insufficient balance'});
 
+    // Check daily limit
     if (plan.daily_limit > 0) {
-      const resetHours  = parseFloat(plan.reset_hours || 24);
-      const lastReset   = plan.last_reset ? new Date(plan.last_reset) : null;
-      const now         = new Date();
+      const resetHours = parseFloat(plan.reset_hours || 24);
+      const lastReset  = plan.last_reset ? new Date(plan.last_reset) : null;
+      const now        = new Date();
       const hoursPassed = lastReset ? (now - lastReset) / (1000 * 60 * 60) : resetHours + 1;
+
       if (hoursPassed >= resetHours) {
         await db.run(`UPDATE plans SET today_count=0, last_reset=NOW() WHERE id=$1`, [plan_id]);
         plan.today_count = 0;
@@ -439,6 +455,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
       `INSERT INTO investments (user_id,plan_name,amount,daily_pct,daily_earn,days_total) VALUES ($1,$2,$3,$4,$5,$6)`,
       [u.id, plan.emoji+' '+plan.name, amount, plan.daily_pct, daily, plan.duration]
     );
+    // Increment daily count
     if (plan.daily_limit > 0) {
       await db.run(`UPDATE plans SET today_count=today_count+1 WHERE id=$1`, [plan_id]);
     }
@@ -447,6 +464,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
       [u.id,'invest',amount,'completed',`Invested in ${plan.name}`]
     );
 
+    // Distribute referral commissions (3 levels)
     try {
       const settingRows = await db.all(`SELECT * FROM settings`);
       const sMap = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
@@ -558,6 +576,7 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
     const ex = await db.one(`SELECT * FROM tasks WHERE user_id=$1 AND task_key=$2`, [u.id, task_key]);
     if (ex?.completed) return res.status(400).json({error:'Already done'});
 
+    // For invite tasks — verify actual active referral count
     if (task_key && task_key.indexOf('invite') !== -1) {
       const numMatch = task_key.match(/(\d+)/);
       const required = numMatch ? parseInt(numMatch[1]) : 1;
@@ -586,6 +605,7 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
+// Verify task (checks Telegram membership for channel/group tasks)
 app.post('/api/verify-task', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
@@ -594,6 +614,7 @@ app.post('/api/verify-task', userAuth, async (req, res) => {
     const taskCfg = await db.one('SELECT * FROM tasks_config WHERE task_key=$1 AND is_active=1', [task_key]);
     if (!taskCfg) return res.status(404).json({error:'Task not found'});
 
+    // If task has a chat_id, verify via Telegram Bot API
     if (taskCfg.chat_id && taskCfg.chat_id.trim()) {
       try {
         const tgRes = await fetch(
@@ -607,31 +628,22 @@ app.post('/api/verify-task', userAuth, async (req, res) => {
         }
       } catch(e) { console.log('TG verify error:', e.message); }
     }
-    res.json({ verified: true });
-  } catch(e) { res.status(500).json({error:e.message}); }
-});
 
-app.post('/api/collect-commission', userAuth, async (req, res) => {
-  try {
-    const u = req.tgUser;
-    const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
-    if (!user) return res.status(404).json({error:'Not found'});
-    const pending = parseFloat(user.pending_commission || 0);
-    if (pending <= 0) return res.status(400).json({error:'No pending commission'});
-    await db.run(`UPDATE users SET balance=balance+$1, pending_commission=0 WHERE id=$2`, [pending, u.id]);
-    await db.run(`UPDATE commissions SET status='collected' WHERE user_id=$1 AND status='pending'`, [u.id]);
-    await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',pending,'completed','Referral commission collected']);
-    res.json({success:true, collected:pending});
+    // No chat_id set — just trust the user
+    res.json({ verified: true });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ══════════════════════════════════════════
 // PUBLIC ROUTES
 // ══════════════════════════════════════════
+
+// Health check
 app.get('/health', (req, res) => {
   res.json({status: 'ok', time: new Date().toISOString()});
 });
 
+// Public tasks endpoint
 app.get('/api/tasks', async (req, res) => {
   try {
     const tasks = await db.all('SELECT * FROM tasks_config WHERE is_active=1 ORDER BY sort_order');
@@ -639,6 +651,7 @@ app.get('/api/tasks', async (req, res) => {
   } catch(e) { res.json({tasks:[]}); }
 });
 
+// Bot calls this when user uses referral link
 app.post('/api/set-pending-ref', async (req, res) => {
   try {
     const {user_id, ref_code} = req.body;
@@ -650,7 +663,6 @@ app.post('/api/set-pending-ref', async (req, res) => {
     res.json({success:true});
   } catch(e) { res.json({success:false}); }
 });
-
 app.get('/api/plans', async (req, res) => {
   try {
     await db.run(`
@@ -662,40 +674,6 @@ app.get('/api/plans', async (req, res) => {
     const plans = await db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`);
     res.json({plans});
   } catch(e) { res.status(500).json({error:e.message}); }
-});
-
-app.get('/api/referral-stats/:id', async (req, res) => {
-  try {
-    const uid = parseInt(req.params.id);
-    const lvl1rows = await db.all(`SELECT id FROM users WHERE referred_by=$1`, [uid]);
-    const lvl1ids  = lvl1rows.map(r => r.id);
-    let lvl2ids = [];
-    if (lvl1ids.length > 0) {
-      const lvl2rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl1ids]);
-      lvl2ids = lvl2rows.map(r => r.id);
-    }
-    let lvl3ids = [];
-    if (lvl2ids.length > 0) {
-      const lvl3rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl2ids]);
-      lvl3ids = lvl3rows.map(r => r.id);
-    }
-    const countActive = async (ids) => {
-      if (!ids.length) return 0;
-      const r = await db.one(
-        `SELECT COUNT(DISTINCT user_id) as cnt FROM transactions WHERE user_id = ANY($1::bigint[]) AND type='deposit' AND status='approved'`,
-        [ids]
-      );
-      return parseInt(r.cnt) || 0;
-    };
-    const [act1, act2, act3] = await Promise.all([countActive(lvl1ids), countActive(lvl2ids), countActive(lvl3ids)]);
-    res.json({
-      total: lvl1ids.length + lvl2ids.length + lvl3ids.length,
-      total_active: act1 + act2 + act3,
-      lvl1: { total: lvl1ids.length, active: act1 },
-      lvl2: { total: lvl2ids.length, active: act2 },
-      lvl3: { total: lvl3ids.length, active: act3 },
-    });
-  } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // ══════════════════════════════════════════
@@ -817,6 +795,7 @@ app.post('/admin/withdraw/reject', adminAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
+// ── Admin Tasks ──
 app.get('/admin/tasks', adminAuth, async (req, res) => {
   try {
     const tasks = await db.all('SELECT * FROM tasks_config ORDER BY sort_order');
@@ -884,6 +863,7 @@ app.post('/admin/plans/edit', adminAuth, async (req, res) => {
 
 app.post('/admin/plans/delete', adminAuth, async (req, res) => {
   try {
+    // Permanently delete the plan
     await db.run(`DELETE FROM plans WHERE id=$1`, [req.body.id]);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -914,14 +894,62 @@ app.post('/admin/maintenance', adminAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// AUTO DEPOSIT — BEP20 ONLY
+// REFERRAL STATS (per-level breakdown)
 // ══════════════════════════════════════════
+app.get('/api/referral-stats/:id', async (req, res) => {
+  try {
+    const uid = parseInt(req.params.id);
+
+    // Level 1 — direct referrals
+    const lvl1rows = await db.all(`SELECT id FROM users WHERE referred_by=$1`, [uid]);
+    const lvl1ids  = lvl1rows.map(r => r.id);
+
+    // Level 2
+    let lvl2ids = [];
+    if (lvl1ids.length > 0) {
+      const lvl2rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl1ids]);
+      lvl2ids = lvl2rows.map(r => r.id);
+    }
+
+    // Level 3
+    let lvl3ids = [];
+    if (lvl2ids.length > 0) {
+      const lvl3rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl2ids]);
+      lvl3ids = lvl3rows.map(r => r.id);
+    }
+
+    // Active = has at least one approved deposit
+    const countActive = async (ids) => {
+      if (!ids.length) return 0;
+      const r = await db.one(
+        `SELECT COUNT(DISTINCT user_id) as cnt FROM transactions WHERE user_id = ANY($1::bigint[]) AND type='deposit' AND status='approved'`,
+        [ids]
+      );
+      return parseInt(r.cnt) || 0;
+    };
+
+    const [act1, act2, act3] = await Promise.all([
+      countActive(lvl1ids),
+      countActive(lvl2ids),
+      countActive(lvl3ids),
+    ]);
+
+    res.json({
+      total: lvl1ids.length + lvl2ids.length + lvl3ids.length,
+      total_active: act1 + act2 + act3,
+      lvl1: { total: lvl1ids.length, active: act1 },
+      lvl2: { total: lvl2ids.length, active: act2 },
+      lvl3: { total: lvl3ids.length, active: act3 },
+    });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
 // ══════════════════════════════════════════
-// AUTO DEPOSIT — Unique amount (4 decimals)
+// AUTO DEPOSIT — Generate unique amount
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
   for (let i = 0; i < 50; i++) {
-    const dec  = (Math.floor(Math.random() * 9000) + 1000); // 1000-9999
+    const dec  = (Math.floor(Math.random() * 9000) + 1000);
     const uAmt = +(parseFloat(base) + dec / 10000).toFixed(4); // e.g. 10.3847
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
@@ -932,7 +960,7 @@ async function generateUniqueAmt(base) {
   throw new Error('Cannot generate unique amount — try again');
 }
 
-// ── POST /api/deposit/create (AUTO) ──────────────
+// ── POST /api/deposit/create ──────────────
 app.post('/api/deposit/create', userAuth, async (req, res) => {
   try {
     const u      = req.tgUser;
@@ -942,28 +970,21 @@ app.post('/api/deposit/create', userAuth, async (req, res) => {
     if (!amt || amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
 
     const uAmt = await generateUniqueAmt(amt);
-
-    const dep = await db.one(
+    const dep  = await db.one(
       `INSERT INTO auto_deposits (user_id, amount, unique_amt, network, dep_type)
        VALUES ($1,$2,$3,'BEP20','auto') RETURNING id, unique_amt, expires_at`,
       [u.id, amt, uAmt]
     );
 
-    res.json({
-      id:            dep.id,
-      unique_amount: dep.unique_amt,
-      address:       DEPOSIT_WALLET,
-      network:       'BEP20',
-      expires_at:    dep.expires_at
-    });
+    res.json({ id: dep.id, unique_amount: dep.unique_amt, address: DEPOSIT_WALLET, network: 'BEP20', expires_at: dep.expires_at });
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // ── POST /api/deposit/semi (SEMI-AUTO) ────────────
 app.post('/api/deposit/semi', userAuth, async (req, res) => {
   try {
-    const u   = req.tgUser;
-    const amt = parseFloat(req.body.amount);
+    const u      = req.tgUser;
+    const amt    = parseFloat(req.body.amount);
     const minDep = parseFloat(await getSetting('deposit_min') || 5);
     if (!amt || amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
 
@@ -972,56 +993,59 @@ app.post('/api/deposit/semi', userAuth, async (req, res) => {
        VALUES ($1,$2,$3,'BEP20','semi', NOW() + INTERVAL '60 minutes') RETURNING id, unique_amt, expires_at`,
       [u.id, amt, amt]
     );
-
-    res.json({
-      id:      dep.id,
-      amount:  dep.unique_amt,
-      address: DEPOSIT_WALLET,
-      network: 'BEP20'
-    });
+    res.json({ id: dep.id, amount: dep.unique_amt, address: DEPOSIT_WALLET, network: 'BEP20' });
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
-// ── POST /api/deposit/verify (SEMI-AUTO TXID verify) ──
+// ── POST /api/deposit/verify (SEMI-AUTO TXID) ─────
 app.post('/api/deposit/verify', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     const { deposit_id, tx_hash } = req.body;
     if (!deposit_id || !tx_hash) return res.status(400).json({error:'deposit_id and tx_hash required'});
 
-    // Check duplicate tx
     const dup = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [tx_hash]);
     if (dup) return res.status(400).json({error:'TX already used'});
 
     const dep = await db.one(
-      `SELECT * FROM auto_deposits WHERE id=$1 AND user_id=$2 AND status='pending'`,
+      `SELECT * FROM auto_deposits WHERE id=$1 AND user_id=$2 AND dep_type='semi' AND status='pending'`,
       [deposit_id, u.id]
     );
     if (!dep) return res.status(404).json({error:'Deposit not found or already processed'});
 
-    // Fetch TX from Moralis
-    const url = `https://deep-index.moralis.io/api/v2.2/erc20/transfers?chain=bsc&transaction_hash=${tx_hash}`;
+    // Verify via Moralis
+    const url  = `https://deep-index.moralis.io/api/v2.2/transaction/${tx_hash}/verbose?chain=bsc`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
-    if (!data.result || !data.result.length) {
-      return res.status(400).json({error:'Transaction not found. Wait for blockchain confirmation and try again.'});
+    if (!data || data.message) {
+      return res.status(400).json({error:'Transaction not found on blockchain. Wait for confirmation.'});
     }
 
-    const tx = data.result[0];
-    console.log(`[SEMI] verify tx=${tx_hash} to=${tx.to_address} contract=${tx.address} val=${tx.value_decimal}`);
+    // Check ERC20 transfers in the tx
+    const transfers = (data.logs || []).filter(log =>
+      log.address && log.address.toLowerCase() === USDT_CONTRACT
+    );
 
-    // Validate recipient
-    if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) {
-      return res.status(400).json({error:'Wrong recipient address'});
+    if (!transfers.length) return res.status(400).json({error:'No USDT transfer found in this transaction'});
+
+    // Find transfer to our wallet
+    let txAmt = 0;
+    for (const log of transfers) {
+      if (log.decoded_event && log.decoded_event.params) {
+        const toParam  = log.decoded_event.params.find(p => p.name === 'to');
+        const valParam = log.decoded_event.params.find(p => p.name === 'value');
+        if (toParam && toParam.value.toLowerCase() === DEPOSIT_WALLET) {
+          txAmt = parseFloat(valParam.value) / 1e18;
+          break;
+        }
+      }
     }
-    // Validate token contract
-    if (tx.address.toLowerCase() !== USDT_CONTRACT) {
-      return res.status(400).json({error:'Wrong token. Must be USDT (BEP20)'});
-    }
-    // Validate amount
-    const txAmt = parseFloat(tx.value_decimal);
+
+    console.log(`[SEMI] tx=${tx_hash.slice(0,16)} txAmt=${txAmt} expected=${dep.unique_amt}`);
+
+    if (txAmt === 0) return res.status(400).json({error:'USDT not sent to our wallet'});
     if (Math.abs(txAmt - dep.unique_amt) > 0.01) {
-      return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt}, got $${txAmt}`});
+      return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt}, got $${txAmt.toFixed(4)}`});
     }
 
     await creditAutoDeposit(dep, tx_hash);
@@ -1029,6 +1053,7 @@ app.post('/api/deposit/verify', userAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
+// ── GET /api/deposit/status/:id ───────────
 app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
   try {
     const u   = req.tgUser;
@@ -1037,7 +1062,6 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
       [req.params.id, u.id]
     );
     if (!dep) return res.status(404).json({error:'Not found'});
-
     if (dep.status === 'pending' && new Date() > new Date(dep.expires_at)) {
       await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
       return res.json({ status: 'expired' });
@@ -1046,19 +1070,25 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
+// ══════════════════════════════════════════
+// AUTO DEPOSIT — Credit helper
+// ══════════════════════════════════════════
 async function creditAutoDeposit(dep, txHash) {
   try {
+    // Mark deposit complete (UNIQUE index prevents double-credit)
     await db.run(
       `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
       [txHash, dep.id]
     );
+    // Credit balance
     await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.unique_amt, dep.user_id]);
-    const depNote = (dep.dep_type === 'semi') ? 'Semi-auto verified' : 'Auto-detected';
+    // Transaction log
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id,'deposit',dep.unique_amt,'BEP20',txHash,'approved', depNote]
+      [dep.user_id,'deposit',dep.unique_amt,'BEP20',txHash,'approved',(dep.dep_type==='semi'?'Semi-auto verified':'Auto-detected')]
     );
+    // First deposit task reward
     const taskDone = await db.one(
       `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
     );
@@ -1070,8 +1100,9 @@ async function creditAutoDeposit(dep, txHash) {
       );
       await db.run(`UPDATE users SET balance=balance+3 WHERE id=$1`, [dep.user_id]);
     }
-    console.log(`✅ Auto deposit: user=${dep.user_id} amt=${dep.unique_amt} BEP20 tx=${txHash}`);
+    console.log(`✅ Auto deposit: user=${dep.user_id} amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
   } catch(e) {
+    // Ignore unique constraint violation (double-credit prevention)
     if (!e.message.includes('unique') && !e.message.includes('duplicate')) {
       console.error('creditAutoDeposit error:', e.message);
     }
@@ -1083,15 +1114,12 @@ async function creditAutoDeposit(dep, txHash) {
 // ══════════════════════════════════════════
 async function scanBEP20() {
   try {
-    // Only scan auto deposits
     const pending = await db.all(
-      `SELECT * FROM auto_deposits WHERE network='BEP20' AND dep_type='auto' AND status='pending' AND expires_at > NOW()`
+      `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
     if (!pending.length) return;
 
-    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers`
-      + `?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
-
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data.result || !Array.isArray(data.result)) {
@@ -1107,16 +1135,14 @@ async function scanBEP20() {
       let matched = false;
 
       for (const tx of txs) {
-        // Only incoming to deposit wallet
         if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
-        // Time check
         if (new Date(tx.block_timestamp).getTime() < depTs) continue;
 
         const txAmt = parseFloat(tx.value_decimal);
         const diff  = Math.abs(txAmt - dep.unique_amt);
-        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,16)} amt=${txAmt} expected=${dep.unique_amt} diff=${diff}`);
+        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
 
-        if (diff < 0.0001) { // exact match (4 decimal)
+        if (diff < 0.0001) {
           console.log(`[BEP20] ✅ MATCH dep=${dep.id} user=${dep.user_id}`);
           await creditAutoDeposit(dep, tx.transaction_hash);
           matched = true;
@@ -1146,4 +1172,16 @@ setupDB().then(() => {
 }).catch(e => {
   console.error('DB setup failed:', e);
   process.exit(1);
+});app.post('/api/collect-commission', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
+    if (!user) return res.status(404).json({error:'Not found'});
+    const pending = parseFloat(user.pending_commission || 0);
+    if (pending <= 0) return res.status(400).json({error:'No pending commission'});
+    await db.run(`UPDATE users SET balance=balance+$1, pending_commission=0 WHERE id=$2`, [pending, u.id]);
+    await db.run(`UPDATE commissions SET status='collected' WHERE user_id=$1 AND status='pending'`, [u.id]);
+    await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',pending,'completed','Referral commission collected']);
+    res.json({success:true, collected:pending});
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
