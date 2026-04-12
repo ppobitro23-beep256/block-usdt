@@ -228,7 +228,7 @@ async function setupDB() {
 
   // Default settings
   const defaults = {
-    withdraw_fee_pct: '2', withdraw_min: '10', withdraw_max: '10000',
+    withdraw_fee_pct: '0', withdraw_min: '2', withdraw_max: '10000',
     deposit_min: '5',
     trc20_address: 'TVo9famfMAmvN9DnbtQ2fNLh6DwYJ698cZ',
     erc20_address: '0x4878d34e544b79801249d36303b321ca8e634bdd',
@@ -592,14 +592,14 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
     if (blockMsg) return res.status(429).json({error: blockMsg});
 
     // [IMPROVED] Validations
-    const MIN_W  = 2; // minimum 2 USDT
+    const minW   = parseFloat(await getSetting('withdraw_min') || 2);
     const maxW   = parseFloat(await getSetting('withdraw_max') || 10000);
-    const feePct = parseFloat(await getSetting('withdraw_fee_pct') || 2);
+    const feePct = parseFloat(await getSetting('withdraw_fee_pct') || 0);
     const amt    = parseFloat(amount);
 
-    if (!amt || amt < MIN_W) {
+    if (!amt || amt < minW) {
       log('WITHDRAW', `User ${u.id} rejected: amount too low (${amt})`);
-      return res.status(400).json({error:'Minimum withdrawal is 2 USDT'});
+      return res.status(400).json({error:`Minimum withdrawal is $${minW} USDT`});
     }
     if (amt > maxW) return res.status(400).json({error:`Maximum withdrawal is $${maxW}`});
     if (!address || address.trim().length < 10) {
