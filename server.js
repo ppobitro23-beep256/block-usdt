@@ -307,6 +307,7 @@ async function setupDB() {
   await Promise.all([
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS dep_type TEXT DEFAULT 'auto'`),
+    db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS fraud_flag INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_attempts INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fraud_attempts TEXT DEFAULT '[]'`),
@@ -568,25 +569,54 @@ app.post('/api/deposit', userAuth, async (req, res) => {
 app.post('/api/withdraw', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
-    const {amount, network, address} = req.body;
+    const { amount, address } = req.body;
+    const network = 'BEP20';
+
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
     if (!user) return res.status(404).json({error:'Not found'});
     if (user.is_banned) return res.status(403).json({error:'banned'});
 
-    const minW   = parseFloat(await getSetting('withdraw_min') || 10);
+    // [NEW] Block check
+    const blockMsg = await checkBlocked(u.id);
+    if (blockMsg) return res.status(429).json({error: blockMsg});
+
+    // [IMPROVED] Validations
+    const MIN_W  = 2; // minimum 2 USDT
     const maxW   = parseFloat(await getSetting('withdraw_max') || 10000);
     const feePct = parseFloat(await getSetting('withdraw_fee_pct') || 2);
-    if (amount < minW) return res.status(400).json({error:`Min $${minW}`});
-    if (amount > maxW) return res.status(400).json({error:`Max $${maxW}`});
-    if (user.balance < amount) return res.status(400).json({error:'Insufficient balance'});
+    const amt    = parseFloat(amount);
 
-    const fee = +(amount * feePct / 100).toFixed(2);
-    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [amount, u.id]);
-    await db.run(
-      `INSERT INTO transactions (user_id,type,amount,network,address,fee) VALUES ($1,$2,$3,$4,$5,$6)`,
-      [u.id,'withdraw',amount,network,address,fee]
+    if (!amt || amt < MIN_W) {
+      log('WITHDRAW', `User ${u.id} rejected: amount too low (${amt})`);
+      return res.status(400).json({error:'Minimum withdrawal is 2 USDT'});
+    }
+    if (amt > maxW) return res.status(400).json({error:`Maximum withdrawal is $${maxW}`});
+    if (!address || address.trim().length < 10) {
+      log('WITHDRAW', `User ${u.id} rejected: invalid address`);
+      return res.status(400).json({error:'Please enter a valid wallet address'});
+    }
+    if (user.balance < amt) {
+      log('WITHDRAW', `User ${u.id} rejected: insufficient balance (bal=${user.balance} req=${amt})`);
+      return res.status(400).json({error:'Insufficient balance'});
+    }
+
+    // [NEW] One pending withdrawal per user
+    const existing = await db.one(
+      `SELECT id FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='pending'`,
+      [u.id]
     );
-    res.json({success:true, fee});
+    if (existing) {
+      return res.status(400).json({error:'You already have a pending withdrawal request'});
+    }
+
+    const fee = +(amt * feePct / 100).toFixed(2);
+    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [amt, u.id]);
+    await db.run(
+      `INSERT INTO transactions (user_id,type,amount,network,address,fee,note) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [u.id,'withdraw',amt,network,address.trim(),fee,'Processing time: 0–24 hours']
+    );
+    log('WITHDRAW', `User ${u.id} requested $${amt} to ${address.trim().slice(0,16)}... fee=$${fee}`);
+    res.json({success:true, fee, message:'Withdrawal submitted. Processing time: 0–24 hours.'});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
@@ -915,7 +945,11 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
     const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='withdraw'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
     if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
-    await db.run(`UPDATE transactions SET status='approved', admin_note=$1 WHERE id=$2`, [admin_note||'', tx_id]);
+    await db.run(
+      `UPDATE transactions SET status='approved', admin_note=$1, approved_at=NOW() WHERE id=$2`,
+      [admin_note||'', tx_id]
+    );
+    log('WITHDRAW', `APPROVED tx=${tx_id} user=${tx.user_id} amt=$${tx.amount} addr=${(tx.address||'').slice(0,16)}`);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -926,8 +960,13 @@ app.post('/admin/withdraw/reject', adminAuth, async (req, res) => {
     const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='withdraw'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
     if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
-    await db.run(`UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2`, [admin_note||'', tx_id]);
+    await db.run(
+      `UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2`,
+      [admin_note||'Rejected by admin', tx_id]
+    );
+    // Refund balance
     await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
+    log('WITHDRAW', `REJECTED tx=${tx_id} user=${tx.user_id} amt=$${tx.amount} — refunded`);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
