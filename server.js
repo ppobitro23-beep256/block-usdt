@@ -38,6 +38,63 @@ function httpsGet(url, headers) {
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+const fs   = require('fs');
+const path = require('path');
+
+// ── Simple File Logger ──────────────────────────────
+const LOG_FILE = path.join('/tmp', 'blockusdt.log');
+function log(tag, msg) {
+  const line = `[${new Date().toISOString()}] [${tag}] ${msg}\n`;
+  console.log(line.trim());
+  try { fs.appendFileSync(LOG_FILE, line); } catch(_) {}
+}
+
+// ── Fraud Block Helpers ─────────────────────────────
+const FRAUD_WINDOW_MS  = 2 * 60 * 60 * 1000; // 2 hours
+const FRAUD_MAX        = 15;                   // max failed attempts
+const BLOCK_DURATION   = 25 * 60 * 1000;       // 25 min block
+
+async function getFraudState(userId) {
+  const row = await db.one(`SELECT fraud_attempts, blocked_until FROM users WHERE id=$1`, [userId]);
+  if (!row) return { attempts: [], blockedUntil: null };
+  let attempts = [];
+  try { attempts = JSON.parse(row.fraud_attempts || '[]'); } catch(_) {}
+  // Remove attempts older than window
+  const now = Date.now();
+  attempts = attempts.filter(t => now - t < FRAUD_WINDOW_MS);
+  return { attempts, blockedUntil: row.blocked_until ? new Date(row.blocked_until) : null };
+}
+
+async function checkBlocked(userId) {
+  const { blockedUntil } = await getFraudState(userId);
+  if (blockedUntil && new Date() < blockedUntil) {
+    const mins = Math.ceil((blockedUntil - new Date()) / 60000);
+    return `Too many failed attempts. Try again in ${mins} minute(s).`;
+  }
+  return null;
+}
+
+async function recordFraud(userId, reason) {
+  const { attempts } = await getFraudState(userId);
+  attempts.push(Date.now());
+  let blockedUntil = null;
+  if (attempts.length >= FRAUD_MAX) {
+    blockedUntil = new Date(Date.now() + BLOCK_DURATION);
+    log('FRAUD', `User ${userId} BLOCKED until ${blockedUntil.toISOString()} — ${reason}`);
+  } else {
+    log('FRAUD', `User ${userId} attempt ${attempts.length}/${FRAUD_MAX} — ${reason}`);
+  }
+  await db.run(
+    `UPDATE users SET fraud_attempts=$1, blocked_until=$2 WHERE id=$3`,
+    [JSON.stringify(attempts), blockedUntil, userId]
+  );
+  return attempts.length >= FRAUD_MAX;
+}
+
+async function clearFraud(userId) {
+  await db.run(`UPDATE users SET fraud_attempts='[]', blocked_until=NULL WHERE id=$1`, [userId]);
+  log('FRAUD', `User ${userId} fraud state cleared`);
+}
 
 const BOT_TOKEN    = process.env.BOT_TOKEN    || "YOUR_BOT_TOKEN";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin123";
@@ -250,6 +307,10 @@ async function setupDB() {
   await Promise.all([
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS dep_type TEXT DEFAULT 'auto'`),
+    db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS fraud_flag INTEGER DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_attempts INTEGER DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fraud_attempts TEXT DEFAULT '[]'`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMP`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS total_commission REAL DEFAULT 0`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS daily_limit INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`),
@@ -410,7 +471,8 @@ app.get('/api/user/:id', async (req, res) => {
     const userWithComm = {
       ...user,
       pending_commission: parseFloat(user.pending_commission || 0),
-      total_commission:   parseFloat(user.total_commission   || 0)
+      total_commission:   parseFloat(user.total_commission   || 0),
+      is_deposit_blocked: user.blocked_until && new Date() < new Date(user.blocked_until) ? 1 : 0,
     };
     res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -681,15 +743,58 @@ app.get('/api/plans', async (req, res) => {
 // ══════════════════════════════════════════
 app.get('/admin/stats', adminAuth, async (req, res) => {
   try {
-    const totalUsers    = (await db.one(`SELECT COUNT(*) as c FROM users`)).c;
-    const activeInvests = (await db.one(`SELECT COUNT(*) as c FROM investments WHERE status='active'`)).c;
-    const totalDeposit  = (await db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='deposit' AND status='approved'`)).s;
-    const totalWithdraw = (await db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='approved'`)).s;
-    const pendingDep    = (await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='deposit' AND status='pending'`)).c;
-    const pendingWith   = (await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='withdraw' AND status='pending'`)).c;
-    const bannedUsers   = (await db.one(`SELECT COUNT(*) as c FROM users WHERE is_banned=1`)).c;
-    const totalBalance  = (await db.one(`SELECT COALESCE(SUM(balance),0) as s FROM users`)).s;
-    res.json({totalUsers,activeInvests,totalDeposit,totalWithdraw,pendingDep,pendingWith,bannedUsers,totalBalance});
+    const [
+      totalUsersRow, activeInvestsRow, totalDepositRow, totalWithdrawRow,
+      pendingDepRow, pendingWithRow, bannedUsersRow, totalBalanceRow,
+      todayDepRow, autoDepRow, semiDepRow, fraudRow
+    ] = await Promise.all([
+      db.one(`SELECT COUNT(*) as c FROM users`),
+      db.one(`SELECT COUNT(*) as c FROM investments WHERE status='active'`),
+      db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='deposit' AND status='approved'`),
+      db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='approved'`),
+      db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='deposit' AND status='pending'`),
+      db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='withdraw' AND status='pending'`),
+      db.one(`SELECT COUNT(*) as c FROM users WHERE is_banned=1`),
+      db.one(`SELECT COALESCE(SUM(balance),0) as s FROM users`),
+      // [NEW] Today's deposits
+      db.one(`SELECT COALESCE(SUM(amount),0) as s, COUNT(*) as c FROM transactions WHERE type='deposit' AND status='approved' AND created_at >= NOW() - INTERVAL '24 hours'`),
+      // [NEW] Auto vs semi counts
+      db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE dep_type='auto' AND status='completed'`),
+      db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE dep_type='semi' AND status='completed'`),
+      db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE fraud_flag=1`),
+    ]);
+    res.json({
+      totalUsers: totalUsersRow.c,
+      activeInvests: activeInvestsRow.c,
+      totalDeposit: totalDepositRow.s,
+      totalWithdraw: totalWithdrawRow.s,
+      pendingDep: pendingDepRow.c,
+      pendingWith: pendingWithRow.c,
+      bannedUsers: bannedUsersRow.c,
+      totalBalance: totalBalanceRow.s,
+      // [NEW]
+      todayDepAmount: todayDepRow.s,
+      todayDepCount: todayDepRow.c,
+      autoDepCount: autoDepRow.c,
+      semiDepCount: semiDepRow.c,
+      fraudCount: fraudRow.c,
+    });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// [NEW] Admin deposit history with filters
+app.get('/admin/deposits', adminAuth, async (req, res) => {
+  try {
+    const { status, dep_type, date_from, date_to, limit=50 } = req.query;
+    let q = `SELECT d.*, u.first_name, u.username FROM auto_deposits d LEFT JOIN users u ON d.user_id=u.id WHERE 1=1`;
+    const params = [];
+    if (status)   { params.push(status);   q += ` AND d.status=$${params.length}`; }
+    if (dep_type) { params.push(dep_type); q += ` AND d.dep_type=$${params.length}`; }
+    if (date_from){ params.push(date_from); q += ` AND d.created_at >= $${params.length}::date`; }
+    if (date_to)  { params.push(date_to);   q += ` AND d.created_at < ($${params.length}::date + INTERVAL '1 day')`; }
+    params.push(limit); q += ` ORDER BY d.created_at DESC LIMIT $${params.length}`;
+    const rows = await db.all(q, params);
+    res.json({ deposits: rows });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
@@ -722,7 +827,39 @@ app.post('/admin/user/ban', adminAuth, async (req, res) => {
 app.post('/admin/user/unban', adminAuth, async (req, res) => {
   try {
     await db.run(`UPDATE users SET is_banned=0, ban_reason=NULL WHERE id=$1`, [req.body.user_id]);
+    log('ADMIN', `User ${req.body.user_id} unbanned`);
     res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// [NEW] Block user from deposits (fraud block)
+app.post('/admin/user/deposit-block', adminAuth, async (req, res) => {
+  try {
+    const { user_id, minutes } = req.body;
+    const dur = parseInt(minutes || 30);
+    const until = new Date(Date.now() + dur * 60000);
+    await db.run(`UPDATE users SET blocked_until=$1 WHERE id=$2`, [until, user_id]);
+    log('ADMIN', `User ${user_id} deposit-blocked for ${dur}min by admin`);
+    res.json({success:true, blocked_until: until});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// [NEW] Unblock user deposits
+app.post('/admin/user/deposit-unblock', adminAuth, async (req, res) => {
+  try {
+    await clearFraud(req.body.user_id);
+    log('ADMIN', `User ${req.body.user_id} deposit-unblocked by admin`);
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// [NEW] View logs
+app.get('/admin/logs', adminAuth, async (req, res) => {
+  try {
+    if (!fs.existsSync(LOG_FILE)) return res.json({logs:''});
+    const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean);
+    const last100 = lines.slice(-100).reverse().join('\n');
+    res.json({logs: last100});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
@@ -969,6 +1106,22 @@ app.post('/api/deposit/create', userAuth, async (req, res) => {
     const amt    = parseFloat(amount);
     if (!amt || amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
 
+    // [ANTI-FRAUD] Cancel any existing pending auto deposit for this user
+    const existing = await db.one(
+      `SELECT id FROM auto_deposits WHERE user_id=$1 AND dep_type='auto' AND status='pending' AND expires_at > NOW()`,
+      [u.id]
+    );
+    if (existing) {
+      await db.run(`UPDATE auto_deposits SET status='cancelled' WHERE id=$1`, [existing.id]);
+    }
+
+    // [ANTI-FRAUD] Check if user is blocked
+    const blockMsg = await checkBlocked(u.id);
+    if (blockMsg) return res.status(429).json({error: blockMsg});
+
+    // Track attempts counter
+    await db.run(`UPDATE users SET deposit_attempts=deposit_attempts+1 WHERE id=$1`, [u.id]);
+
     const uAmt = await generateUniqueAmt(amt);
     const dep  = await db.one(
       `INSERT INTO auto_deposits (user_id, amount, unique_amt, network, dep_type)
@@ -984,6 +1137,10 @@ app.post('/api/deposit/create', userAuth, async (req, res) => {
 app.post('/api/deposit/semi', userAuth, async (req, res) => {
   try {
     const u      = req.tgUser;
+    // [ANTI-FRAUD] Block check
+    const blockMsg = await checkBlocked(u.id);
+    if (blockMsg) return res.status(429).json({error: blockMsg});
+
     const amt    = parseFloat(req.body.amount);
     const minDep = parseFloat(await getSetting('deposit_min') || 5);
     if (!amt || amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
@@ -1004,14 +1161,30 @@ app.post('/api/deposit/verify', userAuth, async (req, res) => {
     const { deposit_id, tx_hash } = req.body;
     if (!deposit_id || !tx_hash) return res.status(400).json({error:'deposit_id and tx_hash required'});
 
+    // [ANTI-FRAUD] Block check
+    const blockMsg = await checkBlocked(u.id);
+    if (blockMsg) return res.status(429).json({error: blockMsg});
+
+    // [STRICT] TX reuse check
     const dup = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [tx_hash]);
-    if (dup) return res.status(400).json({error:'TX already used'});
+    if (dup) {
+      await recordFraud(u.id, 'TX reuse attempt: ' + tx_hash.slice(0,16));
+      return res.status(400).json({error:'TX already used'});
+    }
 
     const dep = await db.one(
       `SELECT * FROM auto_deposits WHERE id=$1 AND user_id=$2 AND dep_type='semi' AND status='pending'`,
       [deposit_id, u.id]
     );
     if (!dep) return res.status(404).json({error:'Deposit not found or already processed'});
+
+    // [STRICT] Expiry check
+    if (new Date() > new Date(dep.expires_at)) {
+      await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
+      log('EXPIRY', `Semi deposit ${dep.id} expired for user ${u.id}`);
+      await recordFraud(u.id, 'Expired deposit submit');
+      return res.status(400).json({error:'Amount expired, generate a new deposit'});
+    }
 
     // Verify via Moralis - same endpoint as auto scanner, filter by tx_hash
     const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=100&order=DESC`;
@@ -1030,6 +1203,7 @@ app.post('/api/deposit/verify', userAuth, async (req, res) => {
     );
 
     if (!match) {
+      await recordFraud(u.id, 'TX not found or wrong recipient: ' + tx_hash.slice(0,16));
       return res.status(400).json({error:'Transaction not found. Make sure it is confirmed and sent to correct address.'});
     }
 
@@ -1039,7 +1213,11 @@ app.post('/api/deposit/verify', userAuth, async (req, res) => {
     console.log(`[SEMI] tx=${tx_hash.slice(0,16)} txAmt=${txAmt} expected=${dep.unique_amt}`);
 
     if (txAmt === 0) return res.status(400).json({error:'USDT transfer to our wallet not found in this TX'});
+
+    // [STRICT] Amount must match within $0.01
     if (Math.abs(txAmt - dep.unique_amt) > 0.01) {
+      await db.run(`UPDATE auto_deposits SET fraud_flag=1 WHERE id=$1`, [dep.id]);
+      await recordFraud(u.id, `Amount mismatch: expected=${dep.unique_amt} got=${txAmt}`);
       return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt}, got $${txAmt.toFixed(2)}`});
     }
 
@@ -1138,7 +1316,14 @@ async function scanBEP20() {
         console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
 
         if (diff < 0.0001) {
-          console.log(`[BEP20] ✅ MATCH dep=${dep.id} user=${dep.user_id}`);
+          // [STRICT] Double-check expiry before crediting
+          if (new Date() > new Date(dep.expires_at)) {
+            await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
+            log('EXPIRY', `Auto deposit ${dep.id} expired before match user=${dep.user_id}`);
+            matched = true; // stop searching for this dep
+            break;
+          }
+          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
           await creditAutoDeposit(dep, tx.transaction_hash);
           matched = true;
           break;
