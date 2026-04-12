@@ -1013,25 +1013,30 @@ app.post('/api/deposit/verify', userAuth, async (req, res) => {
     );
     if (!dep) return res.status(404).json({error:'Deposit not found or already processed'});
 
-    // Verify via Moralis ERC20 transfers endpoint
-    const url  = `https://deep-index.moralis.io/api/v2.2/erc20/transfers?chain=bsc&transaction_hash=${tx_hash}`;
+    // Verify via Moralis transaction ERC20 transfers
+    const url  = `https://deep-index.moralis.io/api/v2.2/transaction/${tx_hash}/erc20-transfers?chain=bsc`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     console.log(`[SEMI] Moralis response:`, JSON.stringify(data).slice(0, 300));
 
-    if (!data || data.message || !Array.isArray(data.result) || !data.result.length) {
+    if (!data || data.message) {
+      console.log('[SEMI] Moralis error:', JSON.stringify(data));
       return res.status(400).json({error:'Transaction not found. Wait for blockchain confirmation and try again.'});
     }
 
+    // New endpoint returns array directly or {result:[]}
+    const transfers = Array.isArray(data) ? data : (data.result || []);
+    if (!transfers.length) return res.status(400).json({error:'No token transfers found in this transaction'});
+
     // Find USDT transfer to our wallet
     let txAmt = 0;
-    for (const transfer of data.result) {
-      if (
-        transfer.address && transfer.address.toLowerCase() === USDT_CONTRACT &&
-        transfer.to_address && transfer.to_address.toLowerCase() === DEPOSIT_WALLET
-      ) {
+    for (const transfer of transfers) {
+      const contractAddr = (transfer.address || transfer.token_address || '').toLowerCase();
+      const toAddr = (transfer.to_address || '').toLowerCase();
+      console.log(`[SEMI] transfer: contract=${contractAddr} to=${toAddr} val=${transfer.value_decimal}`);
+      if (contractAddr === USDT_CONTRACT && toAddr === DEPOSIT_WALLET) {
         txAmt = parseFloat(transfer.value_decimal || 0);
-        console.log(`[SEMI] Found transfer: to=${transfer.to_address} amt=${txAmt}`);
+        console.log(`[SEMI] Found USDT transfer: amt=${txAmt}`);
         break;
       }
     }
