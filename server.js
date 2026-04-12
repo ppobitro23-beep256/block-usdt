@@ -46,7 +46,15 @@ const LOG_FILE = path.join('/tmp', 'blockusdt.log');
 function log(tag, msg) {
   const line = `[${new Date().toISOString()}] [${tag}] ${msg}\n`;
   console.log(line.trim());
-  try { fs.appendFileSync(LOG_FILE, line); } catch(_) {}
+  try {
+    // [LOG ROTATION] Cap at 500KB
+    const stats = fs.existsSync(LOG_FILE) ? fs.statSync(LOG_FILE) : null;
+    if (stats && stats.size > 500 * 1024) {
+      const old = fs.readFileSync(LOG_FILE, 'utf8').split('\n');
+      fs.writeFileSync(LOG_FILE, old.slice(-200).join('\n') + '\n');
+    }
+    fs.appendFileSync(LOG_FILE, line);
+  } catch(_) {}
 }
 
 // ── Fraud Block Helpers ─────────────────────────────
@@ -214,6 +222,9 @@ async function setupDB() {
     )
   `);
   await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_dep_txhash ON auto_deposits (tx_hash) WHERE tx_hash IS NOT NULL`);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_auto_dep_user   ON auto_deposits (user_id)`);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_auto_dep_status ON auto_deposits (status, expires_at)`);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_tx_user_type    ON transactions (user_id, type, status)`);
 
   // Default settings
   const defaults = {
@@ -924,9 +935,17 @@ app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
     const {tx_id, admin_note} = req.body;
     const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
-    if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
-    await db.run(`UPDATE transactions SET status='approved', admin_note=$1 WHERE id=$2`, [admin_note||'', tx_id]);
+
+    // [ATOMIC] Only update if still pending — prevents double approval under race
+    const result = await pool.query(
+      `UPDATE transactions SET status='approved', admin_note=$1 WHERE id=$2 AND status='pending' RETURNING id`,
+      [admin_note||'', tx_id]
+    );
+    if (result.rowCount === 0) return res.status(400).json({error:'Already processed'});
+
+    // Safe atomic balance credit
     await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
+    log('ADMIN', `Deposit approved tx=${tx_id} user=${tx.user_id} amt=$${tx.amount}`);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -934,7 +953,11 @@ app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
 app.post('/admin/deposit/reject', adminAuth, async (req, res) => {
   try {
     const {tx_id, admin_note} = req.body;
-    await db.run(`UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2`, [admin_note||'', tx_id]);
+    const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`, [tx_id]);
+    if (!tx) return res.status(404).json({error:'Not found'});
+    if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
+    await db.run(`UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2`, [admin_note||'Rejected by admin', tx_id]);
+    log('ADMIN', `Deposit rejected tx=${tx_id} user=${tx.user_id}`);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -944,11 +967,14 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
     const {tx_id, admin_note} = req.body;
     const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='withdraw'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
-    if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
-    await db.run(
-      `UPDATE transactions SET status='approved', admin_note=$1, approved_at=NOW() WHERE id=$2`,
+
+    // [ATOMIC] Only approve if still pending
+    const result = await pool.query(
+      `UPDATE transactions SET status='approved', admin_note=$1, approved_at=NOW() WHERE id=$2 AND status='pending' RETURNING id`,
       [admin_note||'', tx_id]
     );
+    if (result.rowCount === 0) return res.status(400).json({error:'Already processed'});
+
     log('WITHDRAW', `APPROVED tx=${tx_id} user=${tx.user_id} amt=$${tx.amount} addr=${(tx.address||'').slice(0,16)}`);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -1287,12 +1313,17 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
 // ══════════════════════════════════════════
 async function creditAutoDeposit(dep, txHash) {
   try {
-    // Mark deposit complete (UNIQUE index prevents double-credit)
-    await db.run(
+    // [RACE GUARD] Only credit if this UPDATE actually changed a row
+    // If another process already completed this deposit, rowCount = 0 → skip
+    const result = await pool.query(
       `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
       [txHash, dep.id]
     );
-    // Credit balance
+    if (result.rowCount === 0) {
+      console.log(`[SKIP] Deposit ${dep.id} already processed (race guard)`);
+      return;
+    }
+    // Credit balance only after confirmed row lock
     await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.unique_amt, dep.user_id]);
     // Transaction log
     await db.run(
@@ -1314,9 +1345,11 @@ async function creditAutoDeposit(dep, txHash) {
     }
     console.log(`✅ Auto deposit: user=${dep.user_id} amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
   } catch(e) {
-    // Ignore unique constraint violation (double-credit prevention)
-    if (!e.message.includes('unique') && !e.message.includes('duplicate')) {
-      console.error('creditAutoDeposit error:', e.message);
+    // Gracefully handle unique constraint (tx_hash duplicate = already credited)
+    if (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash')) {
+      console.log(`[SAFE] TX ${txHash.slice(0,16)} already processed — skipping`);
+    } else {
+      console.error('[creditAutoDeposit] error:', e.message);
     }
   }
 }
@@ -1368,7 +1401,11 @@ async function scanBEP20() {
           break;
         }
       }
-      if (!matched) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt}`);
+      // [REDUCED LOG] Only log no-match for very recent deposits (< 5 min)
+      if (!matched) {
+        const age = (Date.now() - new Date(dep.created_at).getTime()) / 60000;
+        if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
+      }
     }
   } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
 }
