@@ -5,6 +5,41 @@ const https    = require('https');
 const { Pool } = require('pg');
 
 // ══════════════════════════════════════════
+// RATE LIMITING (no extra library needed)
+// ══════════════════════════════════════════
+const ipHits = new Map(); // ip -> { count, resetAt }
+
+function rateLimit(maxReq, windowMs) {
+  return (req, res, next) => {
+    const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+    const now = Date.now();
+    let   rec = ipHits.get(ip);
+    if (!rec || now > rec.resetAt) {
+      rec = { count: 0, resetAt: now + windowMs };
+      ipHits.set(ip, rec);
+    }
+    rec.count++;
+    if (rec.count > maxReq) {
+      return res.status(429).json({ error: 'Too many requests, try again later' });
+    }
+    next();
+  };
+}
+
+// Clean stale IP records every 5 minutes (memory safety)
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of ipHits) {
+    if (now > rec.resetAt) ipHits.delete(ip);
+  }
+}, 5 * 60 * 1000);
+
+const globalLimit   = rateLimit(100, 60_000);   // 100/min per IP
+const depositLimit  = rateLimit(10,  60_000);   // 10/min
+const verifyLimit   = rateLimit(5,   60_000);   // 5/min
+const withdrawLimit = rateLimit(3,   60_000);   // 3/min
+
+// ══════════════════════════════════════════
 // AUTO DEPOSIT SCANNER CONFIG
 // ══════════════════════════════════════════
 const MORALIS_KEY         = process.env.MORALIS_API_KEY || '';
@@ -108,15 +143,43 @@ const BOT_TOKEN    = process.env.BOT_TOKEN    || "YOUR_BOT_TOKEN";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin123";
 const DATABASE_URL = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_4IVJ1PZzcjnW@ep-long-art-anucops0-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
 
+// ── CORS — allow Netlify frontend + Telegram ──────
+const ALLOWED_ORIGIN = process.env.FRONTEND_URL || null; // e.g. https://yourapp.netlify.app
 const corsConfig = {
-  origin: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  origin: (origin, cb) => {
+    // Allow: no origin (server-to-server, mobile), allowed domain, or any if not set
+    if (!origin || !ALLOWED_ORIGIN || origin === ALLOWED_ORIGIN) return cb(null, true);
+    cb(new Error('CORS not allowed'));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'x-telegram-init-data', 'x-admin-secret', 'Accept'],
   credentials: false,
 };
 app.use(cors(corsConfig));
 app.options('*', cors(corsConfig));
-app.use(express.json());
+
+// ── Security headers ─────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+
+// ── Global rate limit ─────────────────────────────
+app.use(globalLimit);
+
+// ── Request timeout (10s) ─────────────────────────
+app.use((req, res, next) => {
+  res.setTimeout(10000, () => {
+    if (!res.headersSent) res.status(503).json({ error: 'Request timeout' });
+  });
+  next();
+});
+
+// ── Body size limit ───────────────────────────────
+app.use(express.json({ limit: '50kb' }));
 
 // ══════════════════════════════════════════
 // PostgreSQL CONNECTION
@@ -343,6 +406,18 @@ process.on('unhandledRejection', (err) => {
 async function getSetting(key) {
   const r = await db.one(`SELECT value FROM settings WHERE key=$1`, [key]);
   return r ? r.value : null;
+}
+
+// ── Input validators ─────────────────────────────
+function isValidAmount(v, max = 100000) {
+  const n = parseFloat(v);
+  return !isNaN(n) && n > 0 && n <= max && isFinite(n);
+}
+function isValidTxHash(h) {
+  return typeof h === 'string' && /^0x[a-fA-F0-9]{64}$/.test(h.trim());
+}
+function isValidBEP20Address(a) {
+  return typeof a === 'string' && /^0x[a-fA-F0-9]{40}$/.test(a.trim());
 }
 
 // ══════════════════════════════════════════
@@ -577,7 +652,7 @@ app.post('/api/deposit', userAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-app.post('/api/withdraw', userAuth, async (req, res) => {
+app.post('/api/withdraw', withdrawLimit, userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     const { amount, address } = req.body;
@@ -602,9 +677,9 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
       return res.status(400).json({error:`Minimum withdrawal is $${minW} USDT`});
     }
     if (amt > maxW) return res.status(400).json({error:`Maximum withdrawal is $${maxW}`});
-    if (!address || address.trim().length < 10) {
-      log('WITHDRAW', `User ${u.id} rejected: invalid address`);
-      return res.status(400).json({error:'Please enter a valid wallet address'});
+    if (!address || !isValidBEP20Address(address)) {
+      log('WITHDRAW', `User ${u.id} rejected: invalid address format`);
+      return res.status(400).json({error:'Invalid BEP20 wallet address (must start with 0x, 42 chars)'});
     }
     if (user.balance < amt) {
       log('WITHDRAW', `User ${u.id} rejected: insufficient balance (bal=${user.balance} req=${amt})`);
@@ -613,11 +688,23 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
 
     // [NEW] One pending withdrawal per user
     const existing = await db.one(
-      `SELECT id FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='pending'`,
+      `SELECT id, created_at FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='pending'`,
       [u.id]
     );
     if (existing) {
       return res.status(400).json({error:'You already have a pending withdrawal request'});
+    }
+    // [COOLDOWN] 5 min between withdrawal requests
+    const lastWith = await db.one(
+      `SELECT created_at FROM transactions WHERE user_id=$1 AND type='withdraw' ORDER BY created_at DESC LIMIT 1`,
+      [u.id]
+    );
+    if (lastWith) {
+      const minsAgo = (Date.now() - new Date(lastWith.created_at).getTime()) / 60000;
+      if (minsAgo < 5) {
+        const wait = Math.ceil(5 - minsAgo);
+        return res.status(429).json({error:`Please wait ${wait} minute(s) before next withdrawal request`});
+      }
     }
 
     const fee = +(amt * feePct / 100).toFixed(2);
@@ -1163,13 +1250,14 @@ async function generateUniqueAmt(base) {
 }
 
 // ── POST /api/deposit/create ──────────────
-app.post('/api/deposit/create', userAuth, async (req, res) => {
+app.post('/api/deposit/create', depositLimit, userAuth, async (req, res) => {
   try {
     const u      = req.tgUser;
     const { amount } = req.body;
+    if (!isValidAmount(amount, 50000)) return res.status(400).json({error:'Invalid amount'});
     const minDep = parseFloat(await getSetting('deposit_min') || 5);
     const amt    = parseFloat(amount);
-    if (!amt || amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
+    if (amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
 
     // [ANTI-FRAUD] Cancel any existing pending auto deposit for this user
     const existing = await db.one(
@@ -1199,7 +1287,7 @@ app.post('/api/deposit/create', userAuth, async (req, res) => {
 });
 
 // ── POST /api/deposit/semi (SEMI-AUTO) ────────────
-app.post('/api/deposit/semi', userAuth, async (req, res) => {
+app.post('/api/deposit/semi', depositLimit, userAuth, async (req, res) => {
   try {
     const u      = req.tgUser;
     // [ANTI-FRAUD] Block check
@@ -1220,11 +1308,12 @@ app.post('/api/deposit/semi', userAuth, async (req, res) => {
 });
 
 // ── POST /api/deposit/verify (SEMI-AUTO TXID) ─────
-app.post('/api/deposit/verify', userAuth, async (req, res) => {
+app.post('/api/deposit/verify', verifyLimit, userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     const { deposit_id, tx_hash } = req.body;
     if (!deposit_id || !tx_hash) return res.status(400).json({error:'deposit_id and tx_hash required'});
+    if (!isValidTxHash(tx_hash)) return res.status(400).json({error:'Invalid transaction hash format'});
 
     // [ANTI-FRAUD] Block check
     const blockMsg = await checkBlocked(u.id);
@@ -1422,6 +1511,28 @@ function startScanners() {
     await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
   }, 60000);
 }
+
+// ══════════════════════════════════════════
+// START
+// ══════════════════════════════════════════
+// ══════════════════════════════════════════
+// GLOBAL ERROR HANDLER
+// ══════════════════════════════════════════
+app.use((err, req, res, next) => {
+  // CORS error
+  if (err.message === 'CORS not allowed') {
+    return res.status(403).json({ error: 'Origin not allowed' });
+  }
+  log('ERROR', `${req.method} ${req.path} — ${err.message}`);
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
 
 // ══════════════════════════════════════════
 // START
