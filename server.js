@@ -1238,8 +1238,8 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
   for (let i = 0; i < 50; i++) {
-    const dec  = (Math.floor(Math.random() * 9000) + 1000);
-    const uAmt = +(parseFloat(base) + dec / 10000).toFixed(4); // e.g. 10.3847
+    const dec  = (Math.floor(Math.random() * 41) + 10); // 10-50 → 0.010-0.050
+    const uAmt = +(parseFloat(base) + dec / 1000).toFixed(3); // e.g. 10.016
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
       [uAmt]
