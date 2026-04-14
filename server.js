@@ -382,6 +382,9 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS dep_type TEXT DEFAULT 'auto'`),
     db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active_ref BOOLEAN DEFAULT FALSE`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS uid TEXT`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deposit_blocked INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS fraud_flag INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_attempts INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fraud_attempts TEXT DEFAULT '[]'`),
@@ -406,6 +409,36 @@ process.on('unhandledRejection', (err) => {
 async function getSetting(key) {
   const r = await db.one(`SELECT value FROM settings WHERE key=$1`, [key]);
   return r ? r.value : null;
+}
+
+
+// ── Rank + UID helpers ────────────────────
+function getUserRank(activeRefs) {
+  const n = parseInt(activeRefs) || 0;
+  if (n >= 20) return 'VIP 5';
+  if (n >= 10) return 'VIP 4';
+  if (n >= 5)  return 'VIP 3';
+  if (n >= 3)  return 'VIP 2';
+  if (n >= 1)  return 'VIP 1';
+  return 'Member';
+}
+function maskName(name) {
+  if (!name || name.length === 0) return 'User****';
+  if (name.length <= 2) return name + '****';
+  return name.substring(0, 2) + '****';
+}
+function generateUID() {
+  return 'U' + Math.floor(100000 + Math.random() * 900000);
+}
+
+// ── Plan unlock: active referral requirements ──
+function getPlanReferralReq(planName) {
+  const n = (planName || '').toLowerCase();
+  if (n.includes('quantum'))  return 20;
+  if (n.includes('titanium')) return 10;
+  if (n.includes('diamond'))  return 3;
+  if (n.includes('platinum')) return 1;
+  return 0; // bronze, silver, gold — always open
 }
 
 // ── Input validators ─────────────────────────────
@@ -505,7 +538,13 @@ app.post('/api/auth', async (req, res) => {
     // Clean pending ref
     await db.run('DELETE FROM pending_refs WHERE user_id=$1', [uid]).catch(()=>{});
 
-    const user = await db.one('SELECT * FROM users WHERE id=$1', [uid]);
+    let user = await db.one('SELECT * FROM users WHERE id=$1', [uid]);
+    // Assign UID if missing
+    if (user && !user.uid) {
+      const newUID = generateUID();
+      await db.run('UPDATE users SET uid=$1 WHERE id=$2', [newUID, uid]);
+      user.uid = newUID;
+    }
     if (user && user.is_banned) return res.status(403).json({error:'banned', reason: user.ban_reason||''});
 
     res.json({success: true});
@@ -539,7 +578,7 @@ app.get('/api/user/:id', async (req, res) => {
       db.all(`SELECT id,first_name,username,created_at FROM users WHERE referred_by=$1`, [req.params.id]),
       db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`),
       db.all(`SELECT * FROM settings`),
-      db.one(`SELECT COUNT(DISTINCT i.user_id) as cnt FROM investments i JOIN users us ON us.id=i.user_id WHERE us.referred_by=$1 AND i.status='active'`, [req.params.id]),
+      db.one(`SELECT COUNT(*) as cnt FROM users WHERE referred_by=$1 AND is_active_ref=TRUE`, [req.params.id]),
     ]);
     const tasks    = taskRows.map(t => t.task_key);
     const settings = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
@@ -561,6 +600,8 @@ app.get('/api/user/:id', async (req, res) => {
       total_commission:   parseFloat(user.total_commission   || 0),
       is_deposit_blocked: user.blocked_until && new Date() < new Date(user.blocked_until) ? 1 : 0,
     };
+    userWithComm.rank   = getUserRank(activeReferrals);
+    userWithComm.active_referrals = activeReferrals;
     res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -578,6 +619,21 @@ app.post('/api/invest', userAuth, async (req, res) => {
     if (amount < plan.min_amt) return res.status(400).json({error:`Min $${plan.min_amt}`});
     if (amount > plan.max_amt) return res.status(400).json({error:`Max $${plan.max_amt}`});
     if (user.balance < amount) return res.status(400).json({error:'Insufficient balance'});
+
+    // [PLAN UNLOCK] Check active referral requirement (backend safety — cannot bypass)
+    const refReq = getPlanReferralReq(plan.name);
+    if (refReq > 0) {
+      const activeRefs = await db.one(
+        `SELECT COUNT(*) as cnt FROM users WHERE referred_by=$1 AND is_active_ref=TRUE`,
+        [u.id]
+      );
+      const activeCount = parseInt(activeRefs?.cnt || 0);
+      if (activeCount < refReq) {
+        return res.status(403).json({
+          error: `This plan requires ${refReq} active referral${refReq>1?'s':''} (you have ${activeCount})`
+        });
+      }
+    }
 
     // Check daily limit
     if (plan.daily_limit > 0) {
@@ -612,6 +668,12 @@ app.post('/api/invest', userAuth, async (req, res) => {
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
       [u.id,'invest',amount,'completed',`Invested in ${plan.name}`]
     );
+
+    // [ACTIVE REF] Mark user as active referral on first investment
+    if (!user.is_active_ref && user.referred_by && user.id !== user.referred_by) {
+      await db.run(`UPDATE users SET is_active_ref=TRUE WHERE id=$1`, [user.id]);
+      log('REF', `User ${user.id} marked as active referral of ${user.referred_by}`);
+    }
 
     // Distribute referral commissions (3 levels)
     try {
@@ -773,7 +835,7 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
       const countRow = await db.one(
         `SELECT COUNT(DISTINCT i.user_id) as cnt FROM investments i
          JOIN users us ON us.id=i.user_id
-         WHERE us.referred_by=$1 AND i.status='active'`,
+         WHERE us.is_active_ref=TRUE AND us.referred_by=$1 AND i.status='active'`,
         [u.id]
       );
       const activeCount = parseInt(countRow.cnt) || 0;
@@ -1476,7 +1538,7 @@ async function scanBEP20() {
         const diff  = Math.abs(txAmt - dep.unique_amt);
         console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
 
-        if (diff < 0.0001) {
+        if (diff <= 0.02) {
           // [STRICT] Double-check expiry before crediting
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
@@ -1515,6 +1577,31 @@ function startScanners() {
 // ══════════════════════════════════════════
 // START
 // ══════════════════════════════════════════
+
+// ══════════════════════════════════════════
+// LEADERBOARD
+// ══════════════════════════════════════════
+app.get('/leaderboard', async (req, res) => {
+  try {
+    const rows = await db.all(
+      `SELECT first_name, uid, total_earned,
+              (SELECT COUNT(*) FROM users u2 WHERE u2.referred_by=u.id AND u2.is_active_ref=TRUE) as active_refs
+       FROM users u
+       WHERE total_earned > 0
+       ORDER BY total_earned DESC
+       LIMIT 10`
+    );
+    const board = rows.map((u, i) => ({
+      pos:          i + 1,
+      name:         maskName(u.first_name),
+      uid:          u.uid || '------',
+      total_earned: parseFloat(u.total_earned || 0).toFixed(2),
+      rank:         getUserRank(u.active_refs)
+    }));
+    res.json({ leaderboard: board });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
 // ══════════════════════════════════════════
 // GLOBAL ERROR HANDLER
 // ══════════════════════════════════════════
