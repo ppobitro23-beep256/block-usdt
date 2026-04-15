@@ -149,8 +149,8 @@ const BOT_TOKEN    = process.env.BOT_TOKEN    || "YOUR_BOT_TOKEN";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin123";
 const DATABASE_URL = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_4IVJ1PZzcjnW@ep-long-art-anucops0-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
 
-// ── CORS — allow Netlify frontend + Telegram ──────
-const ALLOWED_ORIGIN = process.env.FRONTEND_URL || null; // e.g. https://yourapp.netlify.app
+// ── CORS — allow Cloudflare Pages frontend + Telegram ──────
+const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'https://block-usdt.pages.dev';
 const corsConfig = {
   origin: (origin, cb) => {
     // Allow: no origin (server-to-server, mobile), allowed domain, or any if not set
