@@ -668,6 +668,8 @@ app.post('/api/invest', userAuth, async (req, res) => {
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
       [u.id,'invest',amount,'completed',`Invested in ${plan.name}`]
     );
+    // Increment total buy count
+    await db.run(`UPDATE plans SET buy_count = buy_count + 1 WHERE id = $1`, [plan_id]);
 
     // [ACTIVE REF] Mark user as active referral on first investment
     if (!user.is_active_ref && user.referred_by && user.id !== user.referred_by) {
@@ -1216,6 +1218,15 @@ app.post('/admin/plans/delete', adminAuth, async (req, res) => {
   try {
     // Permanently delete the plan
     await db.run(`DELETE FROM plans WHERE id=$1`, [req.body.id]);
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.post('/admin/plan/update-count', adminAuth, async (req, res) => {
+  try {
+    const { plan_id, count } = req.body;
+    if (!plan_id || count === undefined) return res.status(400).json({error:'plan_id and count required'});
+    await db.run(`UPDATE plans SET buy_count = $1 WHERE id = $2`, [parseInt(count), plan_id]);
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
