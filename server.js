@@ -92,6 +92,12 @@ function log(tag, msg) {
   } catch(_) {}
 }
 
+// ── Security Event Logger (money flow) ──────────────
+function logSecurity(event, data) {
+  const payload = typeof data === 'object' ? JSON.stringify(data) : data;
+  log('SECURITY', `[${event}] ${payload}`);
+}
+
 // ── Fraud Block Helpers ─────────────────────────────
 const FRAUD_WINDOW_MS  = 2 * 60 * 60 * 1000; // 2 hours
 const FRAUD_MAX        = 15;                   // max failed attempts
@@ -394,6 +400,7 @@ async function setupDB() {
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS today_count INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`),
+    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS buy_count INT DEFAULT 0`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS link TEXT DEFAULT ''`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS chat_id TEXT DEFAULT ''`),
   ]);
@@ -655,7 +662,12 @@ app.post('/api/invest', userAuth, async (req, res) => {
     }
 
     const daily = +(amount * plan.daily_pct / 100).toFixed(4);
-    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [amount, u.id]);
+    // [DB-LEVEL GUARD] Conditional deduct — prevents negative balance under race condition
+    const deductResult = await pool.query(
+      `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
+      [amount, u.id]
+    );
+    if (deductResult.rowCount === 0) return res.status(400).json({error:'Insufficient balance'});
     await db.run(
       `INSERT INTO investments (user_id,plan_name,amount,daily_pct,daily_earn,days_total) VALUES ($1,$2,$3,$4,$5,$6)`,
       [u.id, plan.emoji+' '+plan.name, amount, plan.daily_pct, daily, plan.duration]
@@ -772,7 +784,12 @@ app.post('/api/withdraw', withdrawLimit, userAuth, async (req, res) => {
     }
 
     const fee = +(amt * feePct / 100).toFixed(2);
-    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [amt, u.id]);
+    // [DB-LEVEL GUARD] Conditional deduct — prevents negative balance under race condition
+    const deductResult = await pool.query(
+      `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
+      [amt, u.id]
+    );
+    if (deductResult.rowCount === 0) return res.status(400).json({error:'Insufficient balance'});
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,address,fee,note) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [u.id,'withdraw',amt,network,address.trim(),fee,'Processing time: 0–24 hours']
@@ -917,17 +934,38 @@ app.post('/api/set-pending-ref', async (req, res) => {
     res.json({success:true});
   } catch(e) { res.json({success:false}); }
 });
-app.get('/api/recent-activity', async (req, res) => {
+// ── Activity cache (reduces DB load) ──
+var activityCache = [];
+var activityLastFetch = 0;
+
+app.get('/api/activity', async (req, res) => {
   try {
+    const now = Date.now();
+    if (now - activityLastFetch < 10000 && activityCache.length > 0) {
+      return res.json(activityCache);
+    }
     const rows = await db.all(`
-      SELECT t.type, t.amount, u.first_name
-      FROM transactions t
-      LEFT JOIN users u ON t.user_id = u.id
-      WHERE t.type IN ('deposit', 'withdraw') AND t.status = 'approved'
-      ORDER BY t.created_at DESC LIMIT 30
+      SELECT type, amount, created_at
+      FROM transactions
+      WHERE type IN ('deposit','withdraw') AND status='approved'
+      ORDER BY created_at DESC LIMIT 10
     `);
-    res.json({ activity: rows });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    const activity = rows.map(function(r) {
+      const diff = Math.floor((now - new Date(r.created_at).getTime()) / 1000);
+      let time;
+      if      (diff < 60)    time = diff + 's ago';
+      else if (diff < 3600)  time = Math.floor(diff/60) + 'm ago';
+      else if (diff < 86400) time = Math.floor(diff/3600) + 'h ago';
+      else                   time = Math.floor(diff/86400) + 'd ago';
+      return { type: r.type, amount: parseFloat(r.amount), time };
+    });
+    activityCache = activity;
+    activityLastFetch = now;
+    res.json(activity);
+  } catch(e) {
+    console.error('Activity API error:', e);
+    res.json(activityCache.length ? activityCache : []);
+  }
 });
 
 app.get('/api/plans', async (req, res) => {
@@ -1097,8 +1135,11 @@ app.get('/admin/transactions', adminAuth, async (req, res) => {
 app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
   try {
     const {tx_id, admin_note} = req.body;
+    if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
+
     const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
+    if (parseFloat(tx.amount) <= 0) return res.status(400).json({error:'Invalid amount'});
 
     // [ATOMIC] Only update if still pending — prevents double approval under race
     const result = await pool.query(
@@ -1110,6 +1151,7 @@ app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
     // Safe atomic balance credit
     await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
     log('ADMIN', `Deposit approved tx=${tx_id} user=${tx.user_id} amt=$${tx.amount}`);
+    logSecurity('DEPOSIT_APPROVED', {tx_id, user_id: tx.user_id, amount: tx.amount});
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -1117,6 +1159,7 @@ app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
 app.post('/admin/deposit/reject', adminAuth, async (req, res) => {
   try {
     const {tx_id, admin_note} = req.body;
+    if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
     const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
     if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
@@ -1129,17 +1172,20 @@ app.post('/admin/deposit/reject', adminAuth, async (req, res) => {
 app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
   try {
     const {tx_id, admin_note} = req.body;
+    if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
     const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='withdraw'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
 
-    // [ATOMIC] Only approve if still pending
+    // [ATOMIC] Only approve if still pending — rowCount=0 means already processed
     const result = await pool.query(
-      `UPDATE transactions SET status='approved', admin_note=$1, approved_at=NOW() WHERE id=$2 AND status='pending' RETURNING id`,
+      `UPDATE transactions SET status='approved', admin_note=$1, approved_at=NOW() WHERE id=$2 AND status='pending' RETURNING id, user_id, amount`,
       [admin_note||'', tx_id]
     );
     if (result.rowCount === 0) return res.status(400).json({error:'Already processed'});
 
-    log('WITHDRAW', `APPROVED tx=${tx_id} user=${tx.user_id} amt=$${tx.amount} addr=${(tx.address||'').slice(0,16)}`);
+    const {user_id, amount} = result.rows[0];
+    log('WITHDRAW', `APPROVED tx=${tx_id} user=${user_id} amt=$${amount} addr=${(tx.address||'').slice(0,16)}`);
+    logSecurity('WITHDRAW_APPROVED', {tx_id, user_id, amount, address: (tx.address||'').slice(0,20)});
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -1147,16 +1193,20 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
 app.post('/admin/withdraw/reject', adminAuth, async (req, res) => {
   try {
     const {tx_id, admin_note} = req.body;
-    const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='withdraw'`, [tx_id]);
-    if (!tx) return res.status(404).json({error:'Not found'});
-    if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
-    await db.run(
-      `UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2`,
+    if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
+
+    // [ATOMIC] Reject only if still pending — prevents double refund on concurrent clicks
+    const result = await pool.query(
+      `UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2 AND status='pending' RETURNING id, amount, user_id`,
       [admin_note||'Rejected by admin', tx_id]
     );
-    // Refund balance
-    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [tx.amount, tx.user_id]);
-    log('WITHDRAW', `REJECTED tx=${tx_id} user=${tx.user_id} amt=$${tx.amount} — refunded`);
+    if (result.rowCount === 0) return res.status(400).json({error:'Already processed'});
+
+    const {amount, user_id} = result.rows[0];
+    // Refund balance only after confirmed atomic status change
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [amount, user_id]);
+    log('WITHDRAW', `REJECTED tx=${tx_id} user=${user_id} amt=$${amount} — refunded`);
+    logSecurity('WITHDRAW_REJECTED_REFUNDED', {tx_id, user_id, amount});
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -1237,10 +1287,13 @@ app.post('/admin/plans/delete', adminAuth, async (req, res) => {
 
 app.post('/admin/plan/update-count', adminAuth, async (req, res) => {
   try {
-    const { plan_id, count } = req.body;
-    if (!plan_id || count === undefined) return res.status(400).json({error:'plan_id and count required'});
-    await db.run(`UPDATE plans SET buy_count = $1 WHERE id = $2`, [parseInt(count), plan_id]);
-    res.json({success:true});
+    const { plan_id } = req.body;
+    let count = parseInt(req.body.count) || 0;
+    if (!plan_id || req.body.count === undefined) return res.status(400).json({error:'plan_id and count required'});
+    if (count < 0)      count = 0;
+    if (count > 100000) count = 100000;
+    await db.run(`UPDATE plans SET buy_count = $1 WHERE id = $2`, [count, plan_id]);
+    res.json({success:true, count});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
@@ -1605,6 +1658,22 @@ function startScanners() {
 // ══════════════════════════════════════════
 // LEADERBOARD
 // ══════════════════════════════════════════
+app.get('/admin/deposit-stats', adminAuth, async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT
+        TO_CHAR(created_at, 'HH24:MI') as time,
+        SUM(amount) as total
+      FROM transactions
+      WHERE type='deposit' AND status='approved'
+        AND created_at > NOW() - INTERVAL '1 hour'
+      GROUP BY TO_CHAR(created_at, 'HH24:MI')
+      ORDER BY MIN(created_at) ASC
+    `);
+    res.json(rows.map(r => ({ time: r.time, total: parseFloat(r.total) })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/leaderboard', async (req, res) => {
   try {
     const rows = await db.all(
