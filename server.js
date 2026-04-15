@@ -37,7 +37,7 @@ setInterval(() => {
 const globalLimit   = rateLimit(100, 60_000);   // 100/min per IP
 const depositLimit  = rateLimit(10,  60_000);   // 10/min
 const verifyLimit   = rateLimit(5,   60_000);   // 5/min
-const withdrawLimit = rateLimit(3,   60_000);   // 3/min
+const withdrawLimit = rateLimit(10,  60_000);   // 10/min
 
 // ══════════════════════════════════════════
 // AUTO DEPOSIT SCANNER CONFIG
@@ -770,17 +770,13 @@ app.post('/api/withdraw', withdrawLimit, userAuth, async (req, res) => {
     if (existing) {
       return res.status(400).json({error:'You already have a pending withdrawal request'});
     }
-    // [COOLDOWN] 5 min between withdrawal requests
-    const lastWith = await db.one(
-      `SELECT created_at FROM transactions WHERE user_id=$1 AND type='withdraw' ORDER BY created_at DESC LIMIT 1`,
+    // [DAILY LIMIT] Max 2 withdrawals per day
+    const todayCount = await db.one(
+      `SELECT COUNT(*) as cnt FROM transactions WHERE user_id=$1 AND type='withdraw' AND created_at >= NOW() - INTERVAL '24 hours'`,
       [u.id]
     );
-    if (lastWith) {
-      const minsAgo = (Date.now() - new Date(lastWith.created_at).getTime()) / 60000;
-      if (minsAgo < 5) {
-        const wait = Math.ceil(5 - minsAgo);
-        return res.status(429).json({error:`Please wait ${wait} minute(s) before next withdrawal request`});
-      }
+    if (parseInt(todayCount.cnt) >= 2) {
+      return res.status(400).json({error:'Daily withdrawal limit reached (max 2 per day). Try again tomorrow.'});
     }
 
     const fee = +(amt * feePct / 100).toFixed(2);
