@@ -917,6 +917,19 @@ app.post('/api/set-pending-ref', async (req, res) => {
     res.json({success:true});
   } catch(e) { res.json({success:false}); }
 });
+app.get('/api/recent-activity', async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT t.type, t.amount, u.first_name
+      FROM transactions t
+      LEFT JOIN users u ON t.user_id = u.id
+      WHERE t.type IN ('deposit', 'withdraw') AND t.status = 'approved'
+      ORDER BY t.created_at DESC LIMIT 30
+    `);
+    res.json({ activity: rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/plans', async (req, res) => {
   try {
     await db.run(`
