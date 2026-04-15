@@ -1059,10 +1059,10 @@ app.get('/admin/users', adminAuth, async (req, res) => {
     // Enrich each user with analytics
     const enriched = await Promise.all(users.map(async u => {
       const [depRow, withRow, lastDep, lastWith] = await Promise.all([
-        db.one(`SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM deposits WHERE user_id=$1 AND status='approved'`, [u.id]),
-        db.one(`SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM withdrawals WHERE user_id=$1 AND status='approved'`, [u.id]),
-        db.one(`SELECT MAX(created_at) as t FROM deposits WHERE user_id=$1 AND status='approved'`, [u.id]),
-        db.one(`SELECT MAX(created_at) as t FROM withdrawals WHERE user_id=$1 AND status='approved'`, [u.id]),
+        db.one(`SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [u.id]),
+        db.one(`SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='approved'`, [u.id]),
+        db.one(`SELECT MAX(created_at) as t FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [u.id]),
+        db.one(`SELECT MAX(created_at) as t FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='approved'`, [u.id]),
       ]);
       const totalDeposit  = parseFloat(depRow.total)  || 0;
       const totalWithdraw = parseFloat(withRow.total) || 0;
@@ -1089,11 +1089,11 @@ app.get('/admin/user/:id/details', adminAuth, async (req, res) => {
     const uid    = req.params.id;
     const status = req.query.status || '';
     const depQ   = status
-      ? `SELECT 'deposit' as type, amount, status, created_at, network FROM deposits WHERE user_id=$1 AND status=$2 ORDER BY created_at DESC LIMIT 50`
-      : `SELECT 'deposit' as type, amount, status, created_at, network FROM deposits WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50`;
+      ? `SELECT 'deposit' as type, amount, status, created_at, network FROM transactions WHERE user_id=$1 AND type='deposit' AND status=$2 ORDER BY created_at DESC LIMIT 50`
+      : `SELECT 'deposit' as type, amount, status, created_at, network FROM transactions WHERE user_id=$1 AND type='deposit' ORDER BY created_at DESC LIMIT 50`;
     const withQ  = status
-      ? `SELECT 'withdraw' as type, amount, status, created_at, address as network FROM withdrawals WHERE user_id=$1 AND status=$2 ORDER BY created_at DESC LIMIT 50`
-      : `SELECT 'withdraw' as type, amount, status, created_at, address as network FROM withdrawals WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50`;
+      ? `SELECT 'withdraw' as type, amount, status, created_at, address as network FROM transactions WHERE user_id=$1 AND type='withdraw' AND status=$2 ORDER BY created_at DESC LIMIT 50`
+      : `SELECT 'withdraw' as type, amount, status, created_at, address as network FROM transactions WHERE user_id=$1 AND type='withdraw' ORDER BY created_at DESC LIMIT 50`;
     const depParams  = status ? [uid, status] : [uid];
     const withParams = status ? [uid, status] : [uid];
     const [deps, withs] = await Promise.all([
