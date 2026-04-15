@@ -1719,7 +1719,18 @@ app.use((req, res) => {
 // ══════════════════════════════════════════
 setupDB().then(() => {
   startScanners();
-  app.listen(PORT, () => console.log(`✅ Server on port ${PORT} — Neon PostgreSQL connected`));
+  app.listen(PORT, () => {
+    console.log(`✅ Server on port ${PORT} — Neon PostgreSQL connected`);
+
+    // ── SELF-PING (Render sleep prevent) ──
+    const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    setInterval(() => {
+      fetch(SELF_URL + '/health')
+        .then(r => console.log(`[ping] ✅ ${r.status}`))
+        .catch(e => console.warn(`[ping] ⚠️ ${e.message}`));
+    }, 5 * 60 * 1000); // every 5 minutes
+    console.log(`[ping] Self-ping started → ${SELF_URL}/health`);
+  });
 }).catch(e => {
   console.error('DB setup failed:', e);
   process.exit(1);
