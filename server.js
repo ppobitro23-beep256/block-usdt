@@ -35,7 +35,7 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 const globalLimit   = rateLimit(100, 60_000);   // 100/min per IP
-const depositLimit  = rateLimit(10,  60_000);   // 10/min
+const depositLimit  = rateLimit(30,  60_000);   // 30/min
 const verifyLimit   = rateLimit(5,   60_000);   // 5/min
 const withdrawLimit = rateLimit(10,  60_000);   // 10/min
 
