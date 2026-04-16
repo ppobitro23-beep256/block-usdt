@@ -1816,6 +1816,59 @@ app.get('/leaderboard', async (req, res) => {
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
+// ══ TOP EARNERS (top 20) ══
+app.get('/top-earners', async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT first_name, uid, total_earned,
+        (SELECT COUNT(*) FROM users u2 WHERE u2.referred_by=u.id AND u2.is_active_ref=TRUE) as active_refs
+      FROM users u
+      WHERE total_earned > 0
+      ORDER BY total_earned DESC
+      LIMIT 20
+    `);
+    const earners = rows.map((u, i) => ({
+      pos:          i + 1,
+      name:         maskName(u.first_name),
+      uid:          u.uid || '------',
+      total_earned: parseFloat(u.total_earned || 0).toFixed(2),
+      badge:        getUserRank(u.active_refs)
+    }));
+    res.json({ earners });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══ REFERRALS BY LEVEL ══
+app.get('/api/referrals/:userId', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const [level1, level2, level3] = await Promise.all([
+      db.all(`
+        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
+          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned
+        FROM users u WHERE u.referred_by=$1 ORDER BY u.created_at DESC
+      `, [userId]),
+      db.all(`
+        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
+          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned
+        FROM users u
+        WHERE u.referred_by IN (SELECT id FROM users WHERE referred_by=$1)
+        ORDER BY u.created_at DESC
+      `, [userId]),
+      db.all(`
+        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
+          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned
+        FROM users u
+        WHERE u.referred_by IN (
+          SELECT id FROM users WHERE referred_by IN (SELECT id FROM users WHERE referred_by=$1)
+        )
+        ORDER BY u.created_at DESC
+      `, [userId]),
+    ]);
+    res.json({ level1, level2, level3 });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══════════════════════════════════════════
 // GLOBAL ERROR HANDLER
 // ══════════════════════════════════════════
