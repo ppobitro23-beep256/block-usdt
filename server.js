@@ -1521,26 +1521,25 @@ app.post('/api/deposit/verify', verifyLimit, userAuth, async (req, res) => {
       return res.status(400).json({error:'Amount expired, generate a new deposit'});
     }
 
-    // Verify via Moralis - direct tx_hash lookup (fast, no scanning)
-    const txUrl = `https://deep-index.moralis.io/api/v2.2/transaction/${tx_hash}/erc20/transfers?chain=bsc`;
-    const data  = await httpsGet(txUrl, { 'X-API-Key': MORALIS_KEY });
+    // Verify via Moralis - fetch recent transfers and find by tx_hash
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=50&order=DESC`;
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
-    console.log(`[SEMI] Moralis tx lookup: ${tx_hash.slice(0,16)} → ${data.result ? data.result.length : 0} transfers`);
+    console.log(`[SEMI] Moralis fetched ${data.result ? data.result.length : 0} txs, looking for ${tx_hash.slice(0,16)}`);
 
-    if (!data || !Array.isArray(data.result) || data.result.length === 0) {
-      // TX not confirmed yet — do NOT record fraud, just ask user to wait
-      return res.status(400).json({error:'Transaction not found yet. Wait 1-2 minutes for confirmation and try again.'});
+    if (!data || !Array.isArray(data.result)) {
+      return res.status(400).json({error:'Could not reach verification service. Try again.'});
     }
 
-    // Find transfer to our wallet in this tx
+    // Find the specific tx_hash
     const match = data.result.find(t =>
-      t.to_address && t.to_address.toLowerCase() === DEPOSIT_WALLET.toLowerCase() &&
-      t.token_address && t.token_address.toLowerCase() === USDT_CONTRACT.toLowerCase()
+      t.transaction_hash && t.transaction_hash.toLowerCase() === tx_hash.toLowerCase() &&
+      t.to_address && t.to_address.toLowerCase() === DEPOSIT_WALLET.toLowerCase()
     );
 
     if (!match) {
-      await recordFraud(u.id, 'TX not sent to correct address: ' + tx_hash.slice(0,16));
-      return res.status(400).json({error:'This transaction was not sent to our deposit address.'});
+      // TX not in recent 50 — may not be confirmed yet, do NOT record fraud
+      return res.status(400).json({error:'Transaction not found yet. Wait 1-2 minutes for blockchain confirmation and try again.'});
     }
 
     const txAmt = parseFloat(match.value_decimal || 0);
