@@ -1870,12 +1870,12 @@ app.get('/admin/deposit-stats', adminAuth, async (req, res) => {
   try {
     const rows = await db.all(`
       SELECT
-        TO_CHAR(created_at, 'HH24:MI') as time,
+        TO_CHAR(created_at, 'HH24') as time,
         SUM(amount) as total
       FROM transactions
       WHERE type='deposit' AND status='approved'
-        AND created_at > NOW() - INTERVAL '1 hour'
-      GROUP BY TO_CHAR(created_at, 'HH24:MI')
+        AND created_at > NOW() - INTERVAL '24 hours'
+      GROUP BY TO_CHAR(created_at, 'HH24')
       ORDER BY MIN(created_at) ASC
     `);
     res.json(rows.map(r => ({ time: r.time, total: parseFloat(r.total) })));
