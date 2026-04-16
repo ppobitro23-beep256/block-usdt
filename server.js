@@ -271,6 +271,19 @@ async function setupDB() {
   `);
 
   await db.run(`
+    CREATE TABLE IF NOT EXISTS story_tasks (
+      id           SERIAL PRIMARY KEY,
+      user_id      BIGINT NOT NULL,
+      claim_date   DATE NOT NULL DEFAULT CURRENT_DATE,
+      attempts     INTEGER DEFAULT 0,
+      claimed      INTEGER DEFAULT 0,
+      last_attempt TIMESTAMP,
+      claimed_at   TIMESTAMP,
+      UNIQUE(user_id, claim_date)
+    )
+  \`);
+
+  await db.run(\`
     CREATE TABLE IF NOT EXISTS settings (
       key   TEXT PRIMARY KEY,
       value TEXT
@@ -899,6 +912,72 @@ app.post('/api/verify-task', userAuth, async (req, res) => {
     // No chat_id set — just trust the user
     res.json({ verified: true });
   } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+
+// ── GET /api/story-task/status ────────────────────
+app.get('/api/story-task/status', userAuth, async (req, res) => {
+  try {
+    const u    = req.tgUser;
+    const today = new Date().toISOString().slice(0, 10);
+    const row  = await db.one(
+      `SELECT attempts, claimed FROM story_tasks WHERE user_id=$1 AND claim_date=$2`,
+      [u.id, today]
+    );
+    res.json({
+      claimedToday: row ? !!row.claimed : false,
+      attempts:     row ? (row.attempts || 0) : 0
+    });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// ── POST /api/story-task/claim ────────────────────
+app.post('/api/story-task/claim', userAuth, async (req, res) => {
+  try {
+    const u     = req.tgUser;
+    const today = new Date().toISOString().slice(0, 10);
+    const REWARD = 0.30;
+
+    // Upsert row for today
+    await db.run(
+      `INSERT INTO story_tasks (user_id, claim_date, attempts, claimed, last_attempt)
+       VALUES ($1, $2, 1, 0, NOW())
+       ON CONFLICT (user_id, claim_date) DO UPDATE
+       SET attempts = story_tasks.attempts + 1, last_attempt = NOW()`,
+      [u.id, today]
+    );
+
+    const row = await db.one(
+      `SELECT attempts, claimed FROM story_tasks WHERE user_id=$1 AND claim_date=$2`,
+      [u.id, today]
+    );
+
+    // Already claimed today
+    if (row && row.claimed) {
+      return res.status(400).json({ error: 'Already claimed today. Come back in 24 hours.' });
+    }
+
+    // Attempt limit
+    if (row && row.attempts > 3) {
+      return res.status(400).json({ error: 'Max attempts reached. Try again tomorrow.' });
+    }
+
+    // Credit reward
+    await db.run(
+      `UPDATE story_tasks SET claimed=1, claimed_at=NOW() WHERE user_id=$1 AND claim_date=$2`,
+      [u.id, today]
+    );
+    await db.run(
+      `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1 WHERE id=$2`,
+      [REWARD, u.id]
+    );
+    await db.run(
+      `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
+      [u.id, 'task_reward', REWARD, 'completed', 'Story task reward']
+    );
+
+    res.json({ success: true, amount: REWARD });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════
