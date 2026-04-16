@@ -281,9 +281,9 @@ async function setupDB() {
       claimed_at   TIMESTAMP,
       UNIQUE(user_id, claim_date)
     )
-  \`);
+  `);
 
-  await db.run(\`
+  await db.run(`
     CREATE TABLE IF NOT EXISTS settings (
       key   TEXT PRIMARY KEY,
       value TEXT
