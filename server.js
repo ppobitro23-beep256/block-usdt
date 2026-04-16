@@ -1869,6 +1869,21 @@ app.get('/api/referrals/:userId', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══ COLLECT COMMISSION ══
+app.post('/api/collect-commission', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
+    if (!user) return res.status(404).json({error:'Not found'});
+    const pending = parseFloat(user.pending_commission || 0);
+    if (pending <= 0) return res.status(400).json({error:'No pending commission'});
+    await db.run(`UPDATE users SET balance=balance+$1, pending_commission=0 WHERE id=$2`, [pending, u.id]);
+    await db.run(`UPDATE commissions SET status='collected' WHERE user_id=$1 AND status='pending'`, [u.id]);
+    await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',pending,'completed','Referral commission collected']);
+    res.json({success:true, collected:pending});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
 // ══════════════════════════════════════════
 // GLOBAL ERROR HANDLER
 // ══════════════════════════════════════════
@@ -1908,16 +1923,4 @@ setupDB().then(() => {
 }).catch(e => {
   console.error('DB setup failed:', e);
   process.exit(1);
-});app.post('/api/collect-commission', userAuth, async (req, res) => {
-  try {
-    const u = req.tgUser;
-    const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
-    if (!user) return res.status(404).json({error:'Not found'});
-    const pending = parseFloat(user.pending_commission || 0);
-    if (pending <= 0) return res.status(400).json({error:'No pending commission'});
-    await db.run(`UPDATE users SET balance=balance+$1, pending_commission=0 WHERE id=$2`, [pending, u.id]);
-    await db.run(`UPDATE commissions SET status='collected' WHERE user_id=$1 AND status='pending'`, [u.id]);
-    await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',pending,'completed','Referral commission collected']);
-    res.json({success:true, collected:pending});
-  } catch(e) { res.status(500).json({error:e.message}); }
 });
