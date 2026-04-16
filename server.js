@@ -402,6 +402,9 @@ async function setupDB() {
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS dep_type TEXT DEFAULT 'auto'`),
     db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active_ref BOOLEAN DEFAULT FALSE`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_auto_deposits_created ON auto_deposits(created_at)`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(created_at)`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type, status)`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS uid TEXT`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deposit_blocked INTEGER DEFAULT 0`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS fraud_flag INTEGER DEFAULT 0`),
@@ -1107,65 +1110,78 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
 // Deposit history (clickable stat)
 app.get('/admin/stat/deposits', adminAuth, async (req, res) => {
   try {
-    const offset = parseInt(req.query.offset) || 0;
-    const rows = await db.all(`
-      SELECT t.user_id, u.username, u.first_name, t.amount, t.network, t.status, t.created_at
-      FROM transactions t LEFT JOIN users u ON u.id=t.user_id
-      WHERE t.type='deposit' AND t.status='approved'
-      ORDER BY t.created_at DESC LIMIT 50 OFFSET $1
-    `, [offset]);
-    const totalRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='deposit' AND status='approved'`);
-    res.json({ rows, total: parseInt(totalRow.c), offset });
+    const page  = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+    const [rows, totalRow] = await Promise.all([
+      db.all(`
+        SELECT ad.user_id, u.username, u.first_name, ad.amount, ad.network, ad.status, ad.created_at
+        FROM auto_deposits ad LEFT JOIN users u ON u.id=ad.user_id
+        WHERE ad.status='completed'
+        ORDER BY ad.created_at DESC LIMIT $1 OFFSET $2
+      `, [limit, offset]),
+      db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE status='completed'`)
+    ]);
+    const total = parseInt(totalRow.c);
+    res.json({ rows, total, currentPage: page, totalPages: Math.ceil(total/limit), limit });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // Withdrawal history (clickable stat)
 app.get('/admin/stat/withdrawals', adminAuth, async (req, res) => {
   try {
-    const offset = parseInt(req.query.offset) || 0;
-    const rows = await db.all(`
-      SELECT t.user_id, u.username, u.first_name, t.amount, t.address, t.status, t.created_at
-      FROM transactions t LEFT JOIN users u ON u.id=t.user_id
-      WHERE t.type='withdraw'
-      ORDER BY t.created_at DESC LIMIT 50 OFFSET $1
-    `, [offset]);
-    const totalRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='withdraw'`);
-    res.json({ rows, total: parseInt(totalRow.c), offset });
+    const page  = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+    const [rows, totalRow] = await Promise.all([
+      db.all(`
+        SELECT t.user_id, u.username, u.first_name, t.amount, t.address, t.status, t.created_at
+        FROM transactions t LEFT JOIN users u ON u.id=t.user_id
+        WHERE t.type='withdraw'
+        ORDER BY t.created_at DESC LIMIT $1 OFFSET $2
+      `, [limit, offset]),
+      db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='withdraw'`)
+    ]);
+    const total = parseInt(totalRow.c);
+    res.json({ rows, total, currentPage: page, totalPages: Math.ceil(total/limit), limit });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // All users by balance (clickable stat)
 app.get('/admin/stat/balances', adminAuth, async (req, res) => {
   try {
-    const offset = parseInt(req.query.offset) || 0;
-    const rows = await db.all(`
-      SELECT id, username, first_name, balance
-      FROM users ORDER BY balance DESC LIMIT 50 OFFSET $1
-    `, [offset]);
-    const totalRow = await db.one(`SELECT COUNT(*) as c FROM users`);
-    res.json({ rows, total: parseInt(totalRow.c), offset });
+    const page  = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+    const [rows, totalRow] = await Promise.all([
+      db.all(`SELECT id, username, first_name, balance FROM users ORDER BY balance DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+      db.one(`SELECT COUNT(*) as c FROM users`)
+    ]);
+    const total = parseInt(totalRow.c);
+    res.json({ rows, total, currentPage: page, totalPages: Math.ceil(total/limit), limit });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // Daily income total + per-user breakdown
 app.get('/admin/stat/daily-income', adminAuth, async (req, res) => {
   try {
-    const offset = parseInt(req.query.offset) || 0;
-    const totalRow = await db.one(`
-      SELECT COALESCE(SUM(amount),0) as total
-      FROM transactions WHERE type='earn' AND created_at >= CURRENT_DATE
-    `);
-    const rows = await db.all(`
-      SELECT u.username, u.first_name, t.user_id, SUM(t.amount) as daily_income
-      FROM transactions t LEFT JOIN users u ON u.id=t.user_id
-      WHERE t.type='earn' AND t.created_at >= CURRENT_DATE
-      GROUP BY t.user_id, u.username, u.first_name
-      ORDER BY daily_income DESC LIMIT 50 OFFSET $1
-    `, [offset]);
-    const countRow = await db.one(`
-      SELECT COUNT(DISTINCT user_id) as c FROM transactions WHERE type='earn' AND created_at >= CURRENT_DATE
-    `);
-    res.json({ total: parseFloat(totalRow.total), rows, totalUsers: parseInt(countRow.c), offset });
+    const page  = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const offset = (page - 1) * limit;
+    const [totalRow, rows, countRow] = await Promise.all([
+      db.one(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE type='earn' AND created_at >= CURRENT_DATE`),
+      db.all(`
+        SELECT u.username, u.first_name, t.user_id, SUM(t.amount) as daily_income
+        FROM transactions t LEFT JOIN users u ON u.id=t.user_id
+        WHERE t.type='earn' AND t.created_at >= CURRENT_DATE
+        GROUP BY t.user_id, u.username, u.first_name
+        ORDER BY daily_income DESC LIMIT $1 OFFSET $2
+      `, [limit, offset]),
+      db.one(`SELECT COUNT(DISTINCT user_id) as c FROM transactions WHERE type='earn' AND created_at >= CURRENT_DATE`)
+    ]);
+    const total = parseFloat(totalRow.total);
+    const totalUsers = parseInt(countRow.c);
+    res.json({ total, rows, totalUsers, currentPage: page, totalPages: Math.ceil(totalUsers/limit), limit });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
