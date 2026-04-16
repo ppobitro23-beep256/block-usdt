@@ -36,7 +36,7 @@ setInterval(() => {
 
 const globalLimit   = rateLimit(100, 60_000);   // 100/min per IP
 const depositLimit  = rateLimit(30,  60_000);   // 30/min
-const verifyLimit   = rateLimit(5,   60_000);   // 5/min
+const verifyLimit   = rateLimit(15,  60_000);   // 15/min
 const withdrawLimit = rateLimit(10,  60_000);   // 10/min
 
 // ══════════════════════════════════════════
@@ -1521,25 +1521,26 @@ app.post('/api/deposit/verify', verifyLimit, userAuth, async (req, res) => {
       return res.status(400).json({error:'Amount expired, generate a new deposit'});
     }
 
-    // Verify via Moralis - same endpoint as auto scanner, filter by tx_hash
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=100&order=DESC`;
-    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
+    // Verify via Moralis - direct tx_hash lookup (fast, no scanning)
+    const txUrl = `https://deep-index.moralis.io/api/v2.2/transaction/${tx_hash}/erc20/transfers?chain=bsc`;
+    const data  = await httpsGet(txUrl, { 'X-API-Key': MORALIS_KEY });
 
-    console.log(`[SEMI] Moralis fetched ${data.result ? data.result.length : 0} txs`);
+    console.log(`[SEMI] Moralis tx lookup: ${tx_hash.slice(0,16)} → ${data.result ? data.result.length : 0} transfers`);
 
-    if (!data || !Array.isArray(data.result)) {
-      return res.status(400).json({error:'Could not fetch transactions. Try again.'});
+    if (!data || !Array.isArray(data.result) || data.result.length === 0) {
+      // TX not confirmed yet — do NOT record fraud, just ask user to wait
+      return res.status(400).json({error:'Transaction not found yet. Wait 1-2 minutes for confirmation and try again.'});
     }
 
-    // Find the specific tx_hash in recent transfers
+    // Find transfer to our wallet in this tx
     const match = data.result.find(t =>
-      t.transaction_hash && t.transaction_hash.toLowerCase() === tx_hash.toLowerCase() &&
-      t.to_address && t.to_address.toLowerCase() === DEPOSIT_WALLET
+      t.to_address && t.to_address.toLowerCase() === DEPOSIT_WALLET.toLowerCase() &&
+      t.token_address && t.token_address.toLowerCase() === USDT_CONTRACT.toLowerCase()
     );
 
     if (!match) {
-      await recordFraud(u.id, 'TX not found or wrong recipient: ' + tx_hash.slice(0,16));
-      return res.status(400).json({error:'Transaction not found. Make sure it is confirmed and sent to correct address.'});
+      await recordFraud(u.id, 'TX not sent to correct address: ' + tx_hash.slice(0,16));
+      return res.status(400).json({error:'This transaction was not sent to our deposit address.'});
     }
 
     const txAmt = parseFloat(match.value_decimal || 0);
