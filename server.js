@@ -1100,6 +1100,76 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
+// ══════════════════════════════════════════
+// ADMIN DASHBOARD DETAIL ENDPOINTS
+// ══════════════════════════════════════════
+
+// Deposit history (clickable stat)
+app.get('/admin/stat/deposits', adminAuth, async (req, res) => {
+  try {
+    const offset = parseInt(req.query.offset) || 0;
+    const rows = await db.all(`
+      SELECT t.user_id, u.username, u.first_name, t.amount, t.network, t.status, t.created_at
+      FROM transactions t LEFT JOIN users u ON u.id=t.user_id
+      WHERE t.type='deposit' AND t.status='approved'
+      ORDER BY t.created_at DESC LIMIT 50 OFFSET $1
+    `, [offset]);
+    const totalRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='deposit' AND status='approved'`);
+    res.json({ rows, total: parseInt(totalRow.c), offset });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// Withdrawal history (clickable stat)
+app.get('/admin/stat/withdrawals', adminAuth, async (req, res) => {
+  try {
+    const offset = parseInt(req.query.offset) || 0;
+    const rows = await db.all(`
+      SELECT t.user_id, u.username, u.first_name, t.amount, t.address, t.status, t.created_at
+      FROM transactions t LEFT JOIN users u ON u.id=t.user_id
+      WHERE t.type='withdraw'
+      ORDER BY t.created_at DESC LIMIT 50 OFFSET $1
+    `, [offset]);
+    const totalRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='withdraw'`);
+    res.json({ rows, total: parseInt(totalRow.c), offset });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// All users by balance (clickable stat)
+app.get('/admin/stat/balances', adminAuth, async (req, res) => {
+  try {
+    const offset = parseInt(req.query.offset) || 0;
+    const rows = await db.all(`
+      SELECT id, username, first_name, balance
+      FROM users ORDER BY balance DESC LIMIT 50 OFFSET $1
+    `, [offset]);
+    const totalRow = await db.one(`SELECT COUNT(*) as c FROM users`);
+    res.json({ rows, total: parseInt(totalRow.c), offset });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// Daily income total + per-user breakdown
+app.get('/admin/stat/daily-income', adminAuth, async (req, res) => {
+  try {
+    const offset = parseInt(req.query.offset) || 0;
+    const totalRow = await db.one(`
+      SELECT COALESCE(SUM(amount),0) as total
+      FROM transactions WHERE type='earn' AND created_at >= CURRENT_DATE
+    `);
+    const rows = await db.all(`
+      SELECT u.username, u.first_name, t.user_id, SUM(t.amount) as daily_income
+      FROM transactions t LEFT JOIN users u ON u.id=t.user_id
+      WHERE t.type='earn' AND t.created_at >= CURRENT_DATE
+      GROUP BY t.user_id, u.username, u.first_name
+      ORDER BY daily_income DESC LIMIT 50 OFFSET $1
+    `, [offset]);
+    const countRow = await db.one(`
+      SELECT COUNT(DISTINCT user_id) as c FROM transactions WHERE type='earn' AND created_at >= CURRENT_DATE
+    `);
+    res.json({ total: parseFloat(totalRow.total), rows, totalUsers: parseInt(countRow.c), offset });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+
 // [NEW] Admin deposit history with filters
 app.get('/admin/deposits', adminAuth, async (req, res) => {
   try {
