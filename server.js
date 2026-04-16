@@ -369,7 +369,7 @@ async function setupDB() {
       {key:'join_channel',   icon:'📢', name:'Join our Telegram Channel',  reward:2,   sort:1},
       {key:'join_group',     icon:'👥', name:'Join our Telegram Group',     reward:2,   sort:2},
       {key:'follow_twitter', icon:'🐦', name:'Follow us on Twitter',         reward:2,   sort:3},
-      {key:'first_deposit',  icon:'💰', name:'Make your first deposit',     reward:3,   sort:4},
+      {key:'first_deposit',  icon:'💰', name:'Make your first deposit',     reward:0,   sort:4},
       {key:'first_invest',   icon:'📊', name:'Purchase any plan',           reward:5,   sort:5},
       {key:'invite_friend',  icon:'🤝', name:'Invite 1 friend',             reward:5,   sort:6},
       {key:'daily_checkin',  icon:'🔄', name:'Daily check-in',              reward:0.5, sort:7},
@@ -1680,7 +1680,7 @@ async function creditAutoDeposit(dep, txHash) {
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [dep.user_id,'deposit',dep.unique_amt,'BEP20',txHash,'approved',(dep.dep_type==='semi'?'Semi-auto verified':'Auto-detected')]
     );
-    // First deposit task reward
+    // Mark first_deposit task as completed (NO balance reward — exact deposit amount only)
     const taskDone = await db.one(
       `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
     );
@@ -1690,8 +1690,9 @@ async function creditAutoDeposit(dep, txHash) {
          VALUES ($1,'first_deposit',1,NOW()) ON CONFLICT DO NOTHING`,
         [dep.user_id]
       );
-      await db.run(`UPDATE users SET balance=balance+3 WHERE id=$1`, [dep.user_id]);
     }
+    console.log('[Deposit] Deposit amount:', dep.unique_amt);
+    console.log('[Deposit] Final added:', dep.unique_amt);
     console.log(`✅ Auto deposit: user=${dep.user_id} amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
   } catch(e) {
     // Gracefully handle unique constraint (tx_hash duplicate = already credited)
