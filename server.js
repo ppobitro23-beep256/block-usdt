@@ -936,7 +936,7 @@ app.post('/api/story-task/claim', userAuth, async (req, res) => {
   try {
     const u     = req.tgUser;
     const today = new Date().toISOString().slice(0, 10);
-    const REWARD = 0.30;
+    const REWARD = 0.04;
 
     // Upsert row for today
     await db.run(
