@@ -598,7 +598,7 @@ app.get('/api/user/:id', async (req, res) => {
       db.all(`SELECT id,first_name,username,created_at FROM users WHERE referred_by=$1`, [req.params.id]),
       db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`),
       db.all(`SELECT * FROM settings`),
-      db.one(`SELECT COUNT(*) as cnt FROM users WHERE referred_by=$1 AND is_active_ref=TRUE`, [req.params.id]),
+      db.one(`SELECT COUNT(DISTINCT u.id) as cnt FROM users u JOIN investments i ON u.id=i.user_id WHERE u.referred_by=$1 AND i.status='active'`, [req.params.id]),
     ]);
     const tasks    = taskRows.map(t => t.task_key);
     const settings = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
@@ -644,7 +644,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
     const refReq = getPlanReferralReq(plan.name);
     if (refReq > 0) {
       const activeRefs = await db.one(
-        `SELECT COUNT(*) as cnt FROM users WHERE referred_by=$1 AND is_active_ref=TRUE`,
+        `SELECT COUNT(DISTINCT u.id) as cnt FROM users u JOIN investments i ON u.id=i.user_id WHERE u.referred_by=$1 AND i.status='active'`,
         [u.id]
       );
       const activeCount = parseInt(activeRefs?.cnt || 0);
@@ -1467,11 +1467,11 @@ app.get('/api/referral-stats/:id', async (req, res) => {
       lvl3ids = lvl3rows.map(r => r.id);
     }
 
-    // Active = has at least one approved deposit
+    // Active = has at least one active investment (strict rule, same as plan section)
     const countActive = async (ids) => {
       if (!ids.length) return 0;
       const r = await db.one(
-        `SELECT COUNT(DISTINCT user_id) as cnt FROM transactions WHERE user_id = ANY($1::bigint[]) AND type='deposit' AND status='approved'`,
+        `SELECT COUNT(DISTINCT user_id) as cnt FROM investments WHERE user_id = ANY($1::bigint[]) AND status='active'`,
         [ids]
       );
       return parseInt(r.cnt) || 0;
@@ -1800,7 +1800,7 @@ app.get('/leaderboard', async (req, res) => {
   try {
     const rows = await db.all(
       `SELECT first_name, uid, total_earned,
-              (SELECT COUNT(*) FROM users u2 WHERE u2.referred_by=u.id AND u2.is_active_ref=TRUE) as active_refs
+              (SELECT COUNT(DISTINCT i.user_id) FROM investments i JOIN users u2 ON u2.id=i.user_id WHERE u2.referred_by=u.id AND i.status='active') as active_refs
        FROM users u
        WHERE total_earned > 0
        ORDER BY total_earned DESC
@@ -1822,7 +1822,7 @@ app.get('/top-earners', async (req, res) => {
   try {
     const rows = await db.all(`
       SELECT first_name, uid, total_earned,
-        (SELECT COUNT(*) FROM users u2 WHERE u2.referred_by=u.id AND u2.is_active_ref=TRUE) as active_refs
+        (SELECT COUNT(DISTINCT i.user_id) FROM investments i JOIN users u2 ON u2.id=i.user_id WHERE u2.referred_by=u.id AND i.status='active') as active_refs
       FROM users u
       WHERE total_earned > 0
       ORDER BY total_earned DESC
@@ -1846,19 +1846,22 @@ app.get('/api/referrals/:userId', async (req, res) => {
     const [level1, level2, level3] = await Promise.all([
       db.all(`
         SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned
+          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
+          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
         FROM users u WHERE u.referred_by=$1 ORDER BY u.created_at DESC
       `, [userId]),
       db.all(`
         SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned
+          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
+          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
         FROM users u
         WHERE u.referred_by IN (SELECT id FROM users WHERE referred_by=$1)
         ORDER BY u.created_at DESC
       `, [userId]),
       db.all(`
         SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned
+          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
+          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
         FROM users u
         WHERE u.referred_by IN (
           SELECT id FROM users WHERE referred_by IN (SELECT id FROM users WHERE referred_by=$1)
