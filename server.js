@@ -1791,7 +1791,7 @@ async function creditAutoDeposit(dep, txHash) {
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER (Moralis)
+// BEP20 AUTO SCANNER (BscScan)
 // ══════════════════════════════════════════
 async function scanBEP20() {
   try {
@@ -1850,9 +1850,9 @@ async function scanBEP20() {
 // START SCANNERS
 // ══════════════════════════════════════════
 function startScanners() {
-  console.log('🔍 BEP20 Moralis scanner started (10s interval)');
+  console.log('🔍 BEP20 Moralis scanner started (30s interval)');
   setTimeout(scanBEP20, 5000);
-  setInterval(scanBEP20, 10000);
+  setInterval(scanBEP20, 30000);
   // Auto-expire old pending deposits every minute
   setInterval(async () => {
     await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
