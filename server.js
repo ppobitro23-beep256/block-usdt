@@ -214,6 +214,7 @@ async function setupDB() {
       balance      REAL DEFAULT 0,
       total_earned REAL DEFAULT 0,
       today_earned REAL DEFAULT 0,
+      last_earn_date TEXT DEFAULT '',
       ref_code     TEXT UNIQUE,
       referred_by  BIGINT,
       is_banned    INTEGER DEFAULT 0,
@@ -399,6 +400,7 @@ async function setupDB() {
   // Run all migrations in parallel
   await Promise.all([
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_commission REAL DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_earn_date TEXT DEFAULT ''`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS dep_type TEXT DEFAULT 'auto'`),
     db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active_ref BOOLEAN DEFAULT FALSE`),
@@ -615,6 +617,15 @@ app.get('/api/user/:id', async (req, res) => {
         if (hoursPassed >= (p.reset_hours || 24)) p.today_count = 0;
       }
     });
+
+    // Auto-reset today_earned if it's a new UTC day
+    const todayUTC = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+    if (user.last_earn_date !== todayUTC && parseFloat(user.today_earned || 0) > 0) {
+      await db.run(`UPDATE users SET today_earned=0, last_earn_date=$1 WHERE id=$2`, [todayUTC, user.id]);
+      user.today_earned = 0;
+      user.last_earn_date = todayUTC;
+      console.log(`[RESET] today_earned auto-reset for user ${user.id}`);
+    }
 
     // Add commission data to user
     const userWithComm = {
@@ -834,7 +845,7 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
 
     const earn = parseFloat(inv.daily_earn);
     await db.run(
-      `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1, today_earned=today_earned+$1 WHERE id=$2`,
+      `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1, today_earned=today_earned+$1, last_earn_date=TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') WHERE id=$2`,
       [earn, u.id]
     );
     await db.run(
