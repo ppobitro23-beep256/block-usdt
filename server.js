@@ -1644,10 +1644,13 @@ app.post('/api/deposit/semi', depositLimit, userAuth, async (req, res) => {
     const minDep = parseFloat(await getSetting('deposit_min') || 5);
     if (!amt || amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
 
+    // [ANTI-FRAUD] Add fixed 0.01 suffix so txid cannot be reused from auto deposits
+    const semiUniqueAmt = parseFloat((amt + 0.01).toFixed(6));
+
     const dep = await db.one(
       `INSERT INTO auto_deposits (user_id, amount, unique_amt, network, dep_type, expires_at)
        VALUES ($1,$2,$3,'BEP20','semi', NOW() + INTERVAL '60 minutes') RETURNING id, unique_amt, expires_at`,
-      [u.id, amt, amt]
+      [u.id, amt, semiUniqueAmt]
     );
     res.json({ id: dep.id, amount: dep.unique_amt, address: DEPOSIT_WALLET, network: 'BEP20' });
   } catch(e) { res.status(500).json({error: e.message}); }
@@ -1665,11 +1668,16 @@ app.post('/api/deposit/verify', verifyLimit, userAuth, async (req, res) => {
     const blockMsg = await checkBlocked(u.id);
     if (blockMsg) return res.status(429).json({error: blockMsg});
 
-    // [STRICT] TX reuse check
+    // [STRICT] TX reuse check — check both auto_deposits AND transactions table
     const dup = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [tx_hash]);
     if (dup) {
-      await recordFraud(u.id, 'TX reuse attempt: ' + tx_hash.slice(0,16));
-      return res.status(400).json({error:'TX already used'});
+      await recordFraud(u.id, 'TX reuse attempt (auto_deposits): ' + tx_hash.slice(0,16));
+      return res.status(400).json({error:'This transaction has already been used'});
+    }
+    const dupTx = await db.one(`SELECT id FROM transactions WHERE txid=$1`, [tx_hash]);
+    if (dupTx) {
+      await recordFraud(u.id, 'TX reuse attempt (transactions): ' + tx_hash.slice(0,16));
+      return res.status(400).json({error:'This transaction has already been used'});
     }
 
     const dep = await db.one(
@@ -1714,15 +1722,15 @@ app.post('/api/deposit/verify', verifyLimit, userAuth, async (req, res) => {
 
     if (txAmt === 0) return res.status(400).json({error:'USDT transfer to our wallet not found in this TX'});
 
-    // [STRICT] Amount must match within $0.01
-    if (Math.abs(txAmt - dep.unique_amt) > 0.01) {
+    // [STRICT] Amount must match within $0.001 (tight — prevents auto txid reuse)
+    if (Math.abs(txAmt - dep.unique_amt) > 0.001) {
       await db.run(`UPDATE auto_deposits SET fraud_flag=1 WHERE id=$1`, [dep.id]);
       await recordFraud(u.id, `Amount mismatch: expected=${dep.unique_amt} got=${txAmt}`);
-      return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt}, got $${txAmt.toFixed(2)}`});
+      return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt.toFixed(6)}, got $${txAmt.toFixed(6)}`});
     }
 
     await creditAutoDeposit(dep, tx_hash);
-    res.json({success: true, amount: dep.unique_amt});
+    res.json({success: true, amount: dep.amount}); // return base amount to frontend
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
@@ -1759,12 +1767,12 @@ async function creditAutoDeposit(dep, txHash) {
       return;
     }
     // Credit balance only after confirmed row lock
-    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.unique_amt, dep.user_id]);
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]); // credit base amount, not unique_amt (which has suffix)
     // Transaction log
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id,'deposit',dep.unique_amt,'BEP20',txHash,'approved',(dep.dep_type==='semi'?'Semi-auto verified':'Auto-detected')]
+      [dep.user_id,'deposit',dep.amount,'BEP20',txHash,'approved',(dep.dep_type==='semi'?'Semi-auto verified':'Auto-detected')]
     );
     // Mark first_deposit task as completed (NO balance reward — exact deposit amount only)
     const taskDone = await db.one(
