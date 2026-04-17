@@ -744,7 +744,7 @@ app.post('/api/deposit', userAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-app.post('/api/withdraw', withdrawLimit, userAuth, async (req, res) => {
+app.post('/api/withdraw', userAuth, async (req, res) => { // IP rate limit removed — per-user DB checks handle limits
   try {
     const u = req.tgUser;
     const { amount, address } = req.body;
@@ -855,9 +855,14 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
 app.post('/api/task/complete', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
-    const {task_key, reward} = req.body;
+    const {task_key} = req.body; // reward from CLIENT ignored — always use server-side value
     const ex = await db.one(`SELECT * FROM tasks WHERE user_id=$1 AND task_key=$2`, [u.id, task_key]);
     if (ex?.completed) return res.status(400).json({error:'Already done'});
+
+    // [SECURITY] Get reward from DB, not from client
+    const taskCfg = await db.one(`SELECT * FROM tasks_config WHERE task_key=$1 AND is_active=1`, [task_key]);
+    if (!taskCfg) return res.status(404).json({error:'Task not found'});
+    const reward = parseFloat(taskCfg.reward) || 0;
 
     // For invite tasks — verify actual active referral count
     if (task_key && task_key.indexOf('invite') !== -1) {
