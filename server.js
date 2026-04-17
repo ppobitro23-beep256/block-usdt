@@ -1998,6 +1998,48 @@ app.get('/api/referrals/:userId', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══ ADMIN REFERRAL DETAILS ══
+app.get('/admin/referral-details/:userId', adminAuth, async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    const search = (req.query.search || '').toLowerCase();
+
+    const [user, uplineRow, level1, level2, level3] = await Promise.all([
+      db.one(`SELECT id, first_name, last_name, username, balance, created_at,
+        (SELECT COUNT(*) FROM investments WHERE user_id=$1 AND status='active') as active_plans,
+        referred_by
+        FROM users WHERE id=$1`, [userId]),
+      db.one(`SELECT id, first_name, username FROM users WHERE id=(SELECT referred_by FROM users WHERE id=$1)`, [userId]),
+      db.all(`SELECT u.id, u.first_name, u.username, u.balance, u.created_at,
+        EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as has_plan
+        FROM users u WHERE u.referred_by=$1 ORDER BY u.created_at DESC`, [userId]),
+      db.all(`SELECT u.id, u.first_name, u.username, u.balance, u.created_at,
+        EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as has_plan
+        FROM users u WHERE u.referred_by IN (SELECT id FROM users WHERE referred_by=$1)
+        ORDER BY u.created_at DESC`, [userId]),
+      db.all(`SELECT u.id, u.first_name, u.username, u.balance, u.created_at,
+        EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as has_plan
+        FROM users u WHERE u.referred_by IN (
+          SELECT id FROM users WHERE referred_by IN (SELECT id FROM users WHERE referred_by=$1)
+        ) ORDER BY u.created_at DESC`, [userId]),
+    ]);
+
+    const filterFn = search ? (u => 
+      (u.username||'').toLowerCase().includes(search) ||
+      (u.first_name||'').toLowerCase().includes(search) ||
+      String(u.id).includes(search)
+    ) : () => true;
+
+    res.json({
+      user: user || null,
+      upline: uplineRow || null,
+      level1: level1.filter(filterFn),
+      level2: level2.filter(filterFn),
+      level3: level3.filter(filterFn),
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ══ COLLECT COMMISSION ══
 app.post('/api/collect-commission', userAuth, async (req, res) => {
   try {
