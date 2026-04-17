@@ -1870,6 +1870,21 @@ function startScanners() {
   setInterval(async () => {
     await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
   }, 60000);
+  // Reset today_earned every 24 hours at midnight UTC
+  function scheduleDailyReset() {
+    const now = new Date();
+    const nextMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
+    const msUntilMidnight = nextMidnight - now;
+    setTimeout(async () => {
+      try {
+        await db.run(`UPDATE users SET today_earned = 0`);
+        console.log('[RESET] today_earned reset to 0 for all users');
+      } catch(e) { console.error('[RESET] today_earned reset error:', e.message); }
+      scheduleDailyReset(); // schedule next day
+    }, msUntilMidnight);
+    console.log(`[RESET] today_earned will reset in ${Math.round(msUntilMidnight/1000/60)} minutes`);
+  }
+  scheduleDailyReset();
 }
 
 // ══════════════════════════════════════════
