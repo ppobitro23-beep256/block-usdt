@@ -421,6 +421,7 @@ async function setupDB() {
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS buy_count INT DEFAULT 0`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS link TEXT DEFAULT ''`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS chat_id TEXT DEFAULT ''`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS app_language VARCHAR(10) DEFAULT ''`),
   ]);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
@@ -547,7 +548,7 @@ app.post('/api/auth', async (req, res) => {
       }
     }
 
-    // Upsert user
+    // Upsert user — app_language is NEVER overwritten by Telegram language_code
     await db.run(`
       INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
@@ -555,7 +556,6 @@ app.post('/api/auth', async (req, res) => {
         first_name=EXCLUDED.first_name,
         last_name=EXCLUDED.last_name,
         username=EXCLUDED.username,
-        language=EXCLUDED.language,
         is_premium=EXCLUDED.is_premium,
         referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
     `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
@@ -638,6 +638,22 @@ app.get('/api/user/:id', async (req, res) => {
     userWithComm.active_referrals = activeReferrals;
     res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals});
   } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── Language save route ───────────────────────────────
+app.post('/api/user/language', async (req, res) => {
+  try {
+    const { user_id, language } = req.body;
+    const SUPPORTED = ['en','ru','es','pt','vi','ar','fa'];
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+    if (!language || SUPPORTED.indexOf(language) === -1) return res.status(400).json({ error: 'Invalid language' });
+    // Save to app_language — separate from Telegram language_code, never overwritten by auth
+    await db.run(`UPDATE users SET app_language=$1 WHERE id=$2`, [language, user_id]);
+    res.json({ success: true });
+  } catch(e) {
+    console.error('Language save error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/invest', userAuth, async (req, res) => {
@@ -2038,19 +2054,6 @@ app.get('/admin/referral-details/:userId', adminAuth, async (req, res) => {
       level3: level3.filter(filterFn),
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ══ SET LANGUAGE ══
-app.post('/api/set-language', userAuth, async (req, res) => {
-  try {
-    const u = req.tgUser;
-    if (!u || !u.id) return res.status(400).json({error:'No user'});
-    const { language } = req.body;
-    const validLangs = ['en','ru','es','pt','vi','ar','fa'];
-    const lang = validLangs.includes(language) ? language : 'en';
-    await db.run(`UPDATE users SET language=$1 WHERE id=$2`, [lang, u.id]);
-    res.json({success: true, language: lang});
-  } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // ══ COLLECT COMMISSION ══
