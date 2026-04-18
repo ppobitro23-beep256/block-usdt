@@ -2040,6 +2040,19 @@ app.get('/admin/referral-details/:userId', adminAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ══ SET LANGUAGE ══
+app.post('/api/set-language', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    if (!u || !u.id) return res.status(400).json({error:'No user'});
+    const { language } = req.body;
+    const validLangs = ['en','ru','es','pt','vi','ar','fa'];
+    const lang = validLangs.includes(language) ? language : 'en';
+    await db.run(`UPDATE users SET language=$1 WHERE id=$2`, [lang, u.id]);
+    res.json({success: true, language: lang});
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
 // ══ COLLECT COMMISSION ══
 app.post('/api/collect-commission', userAuth, async (req, res) => {
   try {
