@@ -1959,7 +1959,7 @@ app.get('/leaderboard', async (req, res) => {
 });
 
 // ══ TOP EARNERS (top 20) ══
-app.get('/top-earners', async (req, res) => {
+app.get('/api/top-earners', async (req, res) => {
   try {
     const rows = await db.all(`
       SELECT first_name, uid, total_earned,
