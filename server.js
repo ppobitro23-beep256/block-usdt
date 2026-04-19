@@ -149,12 +149,21 @@ const BOT_TOKEN    = process.env.BOT_TOKEN    || "YOUR_BOT_TOKEN";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin123";
 const DATABASE_URL = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_4IVJ1PZzcjnW@ep-long-art-anucops0-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
 
-// ── CORS — allow Cloudflare Pages frontend + Telegram ──────
+// ── CORS — allow Cloudflare Pages frontend + all Telegram origins ──────
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'https://block-usdt.pages.dev';
+const TELEGRAM_ORIGINS = [
+  'https://web.telegram.org',
+  'https://k.web.telegram.org',
+  'https://z.web.telegram.org',
+  'https://a.web.telegram.org',
+];
 const corsConfig = {
   origin: (origin, cb) => {
-    // Allow: no origin (server-to-server, mobile), allowed domain, or any if not set
-    if (!origin || !ALLOWED_ORIGIN || origin === ALLOWED_ORIGIN) return cb(null, true);
+    if (!origin) return cb(null, true);
+    if (!ALLOWED_ORIGIN) return cb(null, true);
+    if (origin === ALLOWED_ORIGIN) return cb(null, true);
+    if (TELEGRAM_ORIGINS.indexOf(origin) > -1) return cb(null, true);
+    if (origin.endsWith('.telegram.org')) return cb(null, true);
     cb(new Error('CORS not allowed'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -548,7 +557,7 @@ app.post('/api/auth', async (req, res) => {
       }
     }
 
-    // Upsert user — app_language is NEVER overwritten by Telegram language_code
+    // Upsert user
     await db.run(`
       INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
@@ -556,6 +565,7 @@ app.post('/api/auth', async (req, res) => {
         first_name=EXCLUDED.first_name,
         last_name=EXCLUDED.last_name,
         username=EXCLUDED.username,
+        language=EXCLUDED.language,
         is_premium=EXCLUDED.is_premium,
         referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
     `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
@@ -640,20 +650,14 @@ app.get('/api/user/:id', async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// ── Language save route ───────────────────────────────
+// ── Save user language preference ──────────────────────────
 app.post('/api/user/language', async (req, res) => {
   try {
     const { user_id, language } = req.body;
-    const SUPPORTED = ['en','ru','es','pt','vi','ar','fa'];
-    if (!user_id) return res.status(400).json({ error: 'user_id required' });
-    if (!language || SUPPORTED.indexOf(language) === -1) return res.status(400).json({ error: 'Invalid language' });
-    // Save to app_language — separate from Telegram language_code, never overwritten by auth
+    if (!user_id || !language) return res.status(400).json({ error: 'Missing fields' });
     await db.run(`UPDATE users SET app_language=$1 WHERE id=$2`, [language, user_id]);
-    res.json({ success: true });
-  } catch(e) {
-    console.error('Language save error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/invest', userAuth, async (req, res) => {
