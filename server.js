@@ -1664,10 +1664,10 @@ app.get('/api/referral-stats/:id', userAuth, async (req, res) => {
 // AUTO DEPOSIT — Generate unique amount
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
-  for (let i = 0; i < 100; i++) {
-    // 1-99 → 0.001-0.099 (3 decimal places, 99 possible values)
-    const dec  = (Math.floor(Math.random() * 99) + 1);
-    const uAmt = +(parseFloat(base) + dec / 1000).toFixed(3);
+  for (let i = 0; i < 50; i++) {
+    // 1-5 → 0.01-0.05 (2 decimal places, 5 possible values)
+    const dec  = (Math.floor(Math.random() * 5) + 1);
+    const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
       [uAmt]
@@ -1812,7 +1812,7 @@ async function scanBEP20() {
         const diff  = Math.abs(txAmt - dep.unique_amt);
         console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
 
-        if (diff <= 0.002) {
+        if (diff <= 0.01) {
           // [STRICT] Double-check expiry before crediting
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
