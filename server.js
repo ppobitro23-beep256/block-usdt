@@ -626,7 +626,9 @@ app.get('/api/user/:id', async (req, res) => {
       db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect FROM investments WHERE user_id=$1 AND status='active'`, [req.params.id]),
       db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [req.params.id]),
       db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [req.params.id]),
-      db.all(`SELECT id,first_name,username,created_at FROM users WHERE referred_by=$1`, [req.params.id]),
+      db.all(`SELECT u.id, u.first_name, u.username, u.created_at,
+        COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id AND c.status='collected'), 0) as earned
+        FROM users u WHERE u.referred_by=$1 ORDER BY u.created_at DESC`, [req.params.id]),
       db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`),
       db.all(`SELECT * FROM settings`),
       db.one(`SELECT COUNT(DISTINCT u.id) as cnt FROM users u JOIN investments i ON u.id=i.user_id WHERE u.referred_by=$1 AND i.status='active'`, [req.params.id]),
