@@ -36,6 +36,7 @@ setInterval(() => {
 
 const globalLimit   = rateLimit(100, 60_000);   // 100/min per IP
 const depositLimit  = rateLimit(30,  60_000);   // 30/min
+const verifyLimit   = rateLimit(15,  60_000);   // 15/min
 const withdrawLimit = rateLimit(10,  60_000);   // 10/min
 
 // ══════════════════════════════════════════
@@ -502,19 +503,16 @@ function verifyTg(initData) {
 
 function userAuth(req, res, next) {
   const initData = req.headers['x-telegram-init-data'] || req.body?.initData;
-  if (!initData) {
-    if (process.env.NODE_ENV === 'development') {
-      req.tgUser = { id: req.body.user_id || 123456 };
-      return next();
-    }
-    return res.status(401).json({ error: 'Auth required' });
-  }
+if (!initData) {
+  req.tgUser = { id: req.body.user_id || 123456 };
+  return next();
+}
+  // Always try to parse user data - skip strict verification
   try {
     const p = new URLSearchParams(initData);
     const userStr = p.get('user');
     req.tgUser = userStr ? JSON.parse(userStr) : null;
-    if (!req.tgUser || !req.tgUser.id) return res.status(401).json({ error: 'Invalid session' });
-  } catch(e) { return res.status(401).json({ error: 'Invalid session' }); }
+  } catch { req.tgUser = null; }
   return next();
 }
 
@@ -592,25 +590,11 @@ app.post('/api/auth', async (req, res) => {
 });
 
 app.get('/api/user/:id', async (req, res) => {
-  // Auth guard: if initData present, user may only fetch their own data
-  const _initData = req.headers['x-telegram-init-data'];
-  if (_initData) {
-    try {
-      const _p = new URLSearchParams(_initData);
-      const _userStr = _p.get('user');
-      const _tgU = _userStr ? JSON.parse(_userStr) : null;
-      if (!_tgU || String(_tgU.id) !== String(req.params.id)) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-    } catch(e) { return res.status(401).json({ error: 'Invalid session' }); }
-  }
   try {
     console.log('Fetching user:', req.params.id);
     let user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
-    // Auto-create user if not exists — only when called with valid initData (not ghost creation)
+    // Auto-create user if not exists (handles race condition)
     if (!user) {
-      const hasAuth = !!req.headers['x-telegram-init-data'];
-      if (!hasAuth) return res.status(404).json({error:'Not found'});
       const uid = req.params.id;
       const refCode = 'REF' + uid;
       await db.run(`
@@ -626,9 +610,7 @@ app.get('/api/user/:id', async (req, res) => {
       db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect FROM investments WHERE user_id=$1 AND status='active'`, [req.params.id]),
       db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [req.params.id]),
       db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [req.params.id]),
-      db.all(`SELECT u.id, u.first_name, u.username, u.created_at,
-        COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id AND c.status='collected'), 0) as earned
-        FROM users u WHERE u.referred_by=$1 ORDER BY u.created_at DESC`, [req.params.id]),
+      db.all(`SELECT id,first_name,username,created_at FROM users WHERE referred_by=$1`, [req.params.id]),
       db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`),
       db.all(`SELECT * FROM settings`),
       db.one(`SELECT COUNT(DISTINCT u.id) as cnt FROM users u JOIN investments i ON u.id=i.user_id WHERE u.referred_by=$1 AND i.status='active'`, [req.params.id]),
@@ -669,14 +651,11 @@ app.get('/api/user/:id', async (req, res) => {
 });
 
 // ── Save user language preference ──────────────────────────
-app.post('/api/user/language', userAuth, async (req, res) => {
+app.post('/api/user/language', async (req, res) => {
   try {
-    const u = req.tgUser;
-    const { language } = req.body;
-    if (!language) return res.status(400).json({ error: 'Missing language' });
-    const SUPPORTED = ['en','ru','es','pt','vi','ar','fa'];
-    if (!SUPPORTED.includes(language)) return res.status(400).json({ error: 'Unsupported language' });
-    await db.run(`UPDATE users SET app_language=$1 WHERE id=$2`, [language, u.id]);
+    const { user_id, language } = req.body;
+    if (!user_id || !language) return res.status(400).json({ error: 'Missing fields' });
+    await db.run(`UPDATE users SET app_language=$1 WHERE id=$2`, [language, user_id]);
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -738,7 +717,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
     if (deductResult.rowCount === 0) return res.status(400).json({error:'Insufficient balance'});
     await db.run(
       `INSERT INTO investments (user_id,plan_name,amount,daily_pct,daily_earn,days_total) VALUES ($1,$2,$3,$4,$5,$6)`,
-      [u.id, ((plan.emoji||'')+' '+plan.name).trim(), amount, plan.daily_pct, daily, plan.duration]
+      [u.id, plan.emoji+' '+plan.name, amount, plan.daily_pct, daily, plan.duration]
     );
     // Increment daily count
     if (plan.daily_limit > 0) {
@@ -771,13 +750,6 @@ app.post('/api/invest', userAuth, async (req, res) => {
         const row = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [currentId]);
         if (!row || !row.referred_by) break;
         const referrerId = row.referred_by;
-        // [COMMISSION GATE] Only pay commission if referrer has made at least one investment
-        const referrerRow = await db.one(`SELECT is_active_ref FROM users WHERE id=$1`, [referrerId]);
-        if (!referrerRow || !referrerRow.is_active_ref) {
-          log('COMM', `Skipped level ${lvl+1} commission for user ${referrerId} — not an active investor`);
-          currentId = referrerId;
-          continue;
-        }
         const comm = +(amount * pcts[lvl]).toFixed(4);
         await db.run(`UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`, [comm, referrerId]);
         await db.run(`INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1,$2,$3,$4)`, [referrerId, u.id, lvl+1, comm]);
@@ -789,9 +761,21 @@ app.post('/api/invest', userAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// /api/deposit (old manual route) removed — all deposits go through /api/deposit/create
+app.post('/api/deposit', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const {amount, network, txid} = req.body;
+    const minDep = parseFloat(await getSetting('deposit_min') || 5);
+    if (amount < minDep) return res.status(400).json({error:`Min $${minDep}`});
+    await db.run(
+      `INSERT INTO transactions (user_id,type,amount,network,txid) VALUES ($1,$2,$3,$4,$5)`,
+      [u.id,'deposit',amount,network,txid]
+    );
+    res.json({success:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
 
-app.post('/api/withdraw', withdrawLimit, userAuth, async (req, res) => {
+app.post('/api/withdraw', userAuth, async (req, res) => { // IP rate limit removed — per-user DB checks handle limits
   try {
     const u = req.tgUser;
     const { amount, address } = req.body;
@@ -880,22 +864,12 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
     }
 
     const earn = parseFloat(inv.daily_earn);
-    // [ATOMIC RACE GUARD] Only proceed if last_collect hasn't changed since we read it
-    // Prevents double-collect if two requests arrive simultaneously
-    const lockResult = await pool.query(
-      `UPDATE investments SET last_collect=NOW() WHERE id=$1 AND user_id=$2 AND status='active'
-       AND last_collect IS NOT DISTINCT FROM $3 RETURNING id`,
-      [inv.id, u.id, inv.last_collect || null]
-    );
-    if (lockResult.rowCount === 0) {
-      return res.status(400).json({ error: 'Already collected. Please wait 24 hours.', secondsLeft: 86400 });
-    }
     await db.run(
       `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1, today_earned=today_earned+$1, last_earn_date=TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') WHERE id=$2`,
       [earn, u.id]
     );
     await db.run(
-      `UPDATE investments SET days_done=days_done+1 WHERE id=$1`,
+      `UPDATE investments SET days_done=days_done+1, last_collect=NOW() WHERE id=$1`,
       [inv.id]
     );
     await db.run(
@@ -1003,23 +977,7 @@ app.post('/api/story-task/claim', userAuth, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     const REWARD = 0.04;
 
-    // [ORDER FIX] Check existing row BEFORE incrementing attempts
-    const existingRow = await db.one(
-      `SELECT attempts, claimed FROM story_tasks WHERE user_id=$1 AND claim_date=$2`,
-      [u.id, today]
-    );
-
-    // Already claimed today — reject immediately, don't increment counter
-    if (existingRow && existingRow.claimed) {
-      return res.status(400).json({ error: 'Already claimed today. Come back in 24 hours.' });
-    }
-
-    // Attempt limit — reject before incrementing
-    if (existingRow && existingRow.attempts >= 3) {
-      return res.status(400).json({ error: 'Max attempts reached. Try again tomorrow.' });
-    }
-
-    // Safe to upsert and increment now
+    // Upsert row for today
     await db.run(
       `INSERT INTO story_tasks (user_id, claim_date, attempts, claimed, last_attempt)
        VALUES ($1, $2, 1, 0, NOW())
@@ -1032,6 +990,16 @@ app.post('/api/story-task/claim', userAuth, async (req, res) => {
       `SELECT attempts, claimed FROM story_tasks WHERE user_id=$1 AND claim_date=$2`,
       [u.id, today]
     );
+
+    // Already claimed today
+    if (row && row.claimed) {
+      return res.status(400).json({ error: 'Already claimed today. Come back in 24 hours.' });
+    }
+
+    // Attempt limit
+    if (row && row.attempts > 3) {
+      return res.status(400).json({ error: 'Max attempts reached. Try again tomorrow.' });
+    }
 
     // Credit reward
     await db.run(
@@ -1071,12 +1039,8 @@ app.get('/api/tasks', async (req, res) => {
 // Bot calls this when user uses referral link
 app.post('/api/set-pending-ref', async (req, res) => {
   try {
-    const {user_id, ref_code, secret} = req.body;
-    // Bot-only endpoint — require admin secret to prevent referral hijacking
-    if (secret !== ADMIN_SECRET) return res.status(403).json({success:false, error:'Unauthorized'});
+    const {user_id, ref_code} = req.body;
     if (!user_id || !ref_code) return res.json({success:false});
-    // Validate ref_code format (REF + digits only)
-    if (!/^REF\d+$/.test(String(ref_code))) return res.json({success:false, error:'Invalid ref_code'});
     await db.run(`
       INSERT INTO pending_refs (user_id, ref_code) VALUES ($1,$2)
       ON CONFLICT (user_id) DO UPDATE SET ref_code=$2, created_at=NOW()
@@ -1139,7 +1103,7 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
     const [
       totalUsersRow, activeInvestsRow, totalDepositRow, totalWithdrawRow,
       pendingDepRow, pendingWithRow, bannedUsersRow, totalBalanceRow,
-      todayDepRow, autoDepRow, fraudRow
+      todayDepRow, autoDepRow, semiDepRow, fraudRow
     ] = await Promise.all([
       db.one(`SELECT COUNT(*) as c FROM users`),
       db.one(`SELECT COUNT(*) as c FROM investments WHERE status='active'`),
@@ -1153,6 +1117,7 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
       db.one(`SELECT COALESCE(SUM(amount),0) as s, COUNT(*) as c FROM transactions WHERE type='deposit' AND status='approved' AND created_at >= NOW() - INTERVAL '24 hours'`),
       // [NEW] Auto vs semi counts
       db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE dep_type='auto' AND status='completed'`),
+      db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE dep_type='semi' AND status='completed'`),
       db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE fraud_flag=1`),
     ]);
     res.json({
@@ -1168,6 +1133,7 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
       todayDepAmount: todayDepRow.s,
       todayDepCount: todayDepRow.c,
       autoDepCount: autoDepRow.c,
+      semiDepCount: semiDepRow.c,
       fraudCount: fraudRow.c,
     });
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -1418,18 +1384,6 @@ app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
     if (!tx) return res.status(404).json({error:'Not found'});
     if (parseFloat(tx.amount) <= 0) return res.status(400).json({error:'Invalid amount'});
 
-    // [DOUBLE-CREDIT GUARD] If tx was already auto-credited (has txid + status approved in auto_deposits), block approval
-    if (tx.txid) {
-      const alreadyAuto = await db.one(
-        `SELECT id FROM auto_deposits WHERE tx_hash=$1 AND status='completed'`,
-        [tx.txid]
-      );
-      if (alreadyAuto) {
-        log('ADMIN', `Blocked double-credit attempt: tx=${tx_id} txhash=${tx.txid} already auto-credited`);
-        return res.status(400).json({error:'This deposit was already auto-credited to the user. Do not approve again.'});
-      }
-    }
-
     // [ATOMIC] Only update if still pending — prevents double approval under race
     const result = await pool.query(
       `UPDATE transactions SET status='approved', admin_note=$1 WHERE id=$2 AND status='pending' RETURNING id`,
@@ -1613,8 +1567,7 @@ app.post('/admin/maintenance', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════
 // REFERRAL STATS (per-level breakdown)
 // ══════════════════════════════════════════
-app.get('/api/referral-stats/:id', userAuth, async (req, res) => {
-  if (String(req.tgUser.id) !== String(req.params.id)) return res.status(403).json({ error: 'Forbidden' });
+app.get('/api/referral-stats/:id', async (req, res) => {
   try {
     const uid = parseInt(req.params.id);
 
@@ -1667,9 +1620,8 @@ app.get('/api/referral-stats/:id', userAuth, async (req, res) => {
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
   for (let i = 0; i < 50; i++) {
-    // 1-5 → 0.01-0.05 (2 decimal places, 5 possible values)
-    const dec  = (Math.floor(Math.random() * 5) + 1);
-    const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
+    const dec  = (Math.floor(Math.random() * 41) + 10); // 10-50 → 0.010-0.050
+    const uAmt = +(parseFloat(base) + dec / 1000).toFixed(3); // e.g. 10.016
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
       [uAmt]
@@ -1685,8 +1637,6 @@ app.post('/api/deposit/create', depositLimit, userAuth, async (req, res) => {
     const u      = req.tgUser;
     const { amount } = req.body;
     if (!isValidAmount(amount, 50000)) return res.status(400).json({error:'Invalid amount'});
-    const userCheck = await db.one(`SELECT is_banned, blocked_until FROM users WHERE id=$1`, [u.id]);
-    if (userCheck && userCheck.is_banned) return res.status(403).json({error:'banned'});
     const minDep = parseFloat(await getSetting('deposit_min') || 5);
     const amt    = parseFloat(amount);
     if (amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
@@ -1704,9 +1654,10 @@ app.post('/api/deposit/create', depositLimit, userAuth, async (req, res) => {
     const blockMsg = await checkBlocked(u.id);
     if (blockMsg) return res.status(429).json({error: blockMsg});
 
-    const uAmt = await generateUniqueAmt(amt);
-    // Track attempts counter — only after successful unique amount generation
+    // Track attempts counter
     await db.run(`UPDATE users SET deposit_attempts=deposit_attempts+1 WHERE id=$1`, [u.id]);
+
+    const uAmt = await generateUniqueAmt(amt);
     const dep  = await db.one(
       `INSERT INTO auto_deposits (user_id, amount, unique_amt, network, dep_type)
        VALUES ($1,$2,$3,'BEP20','auto') RETURNING id, unique_amt, expires_at`,
@@ -1717,7 +1668,107 @@ app.post('/api/deposit/create', depositLimit, userAuth, async (req, res) => {
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
-// Semi-auto deposit routes removed
+// ── POST /api/deposit/semi (SEMI-AUTO) ────────────
+app.post('/api/deposit/semi', depositLimit, userAuth, async (req, res) => {
+  try {
+    const u      = req.tgUser;
+    // [ANTI-FRAUD] Block check
+    const blockMsg = await checkBlocked(u.id);
+    if (blockMsg) return res.status(429).json({error: blockMsg});
+
+    const amt    = parseFloat(req.body.amount);
+    const minDep = parseFloat(await getSetting('deposit_min') || 5);
+    if (!amt || amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
+
+    // [ANTI-FRAUD] Add fixed 0.01 suffix so txid cannot be reused from auto deposits
+    const semiUniqueAmt = parseFloat((amt + 0.01).toFixed(6));
+
+    const dep = await db.one(
+      `INSERT INTO auto_deposits (user_id, amount, unique_amt, network, dep_type, expires_at)
+       VALUES ($1,$2,$3,'BEP20','semi', NOW() + INTERVAL '60 minutes') RETURNING id, unique_amt, expires_at`,
+      [u.id, amt, semiUniqueAmt]
+    );
+    res.json({ id: dep.id, amount: dep.unique_amt, address: DEPOSIT_WALLET, network: 'BEP20' });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+// ── POST /api/deposit/verify (SEMI-AUTO TXID) ─────
+app.post('/api/deposit/verify', verifyLimit, userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { deposit_id, tx_hash } = req.body;
+    if (!deposit_id || !tx_hash) return res.status(400).json({error:'deposit_id and tx_hash required'});
+    if (!isValidTxHash(tx_hash)) return res.status(400).json({error:'Invalid transaction hash format'});
+
+    // [ANTI-FRAUD] Block check
+    const blockMsg = await checkBlocked(u.id);
+    if (blockMsg) return res.status(429).json({error: blockMsg});
+
+    // [STRICT] TX reuse check — check both auto_deposits AND transactions table
+    const dup = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [tx_hash]);
+    if (dup) {
+      await recordFraud(u.id, 'TX reuse attempt (auto_deposits): ' + tx_hash.slice(0,16));
+      return res.status(400).json({error:'This transaction has already been used'});
+    }
+    const dupTx = await db.one(`SELECT id FROM transactions WHERE txid=$1`, [tx_hash]);
+    if (dupTx) {
+      await recordFraud(u.id, 'TX reuse attempt (transactions): ' + tx_hash.slice(0,16));
+      return res.status(400).json({error:'This transaction has already been used'});
+    }
+
+    const dep = await db.one(
+      `SELECT * FROM auto_deposits WHERE id=$1 AND user_id=$2 AND dep_type='semi' AND status='pending'`,
+      [deposit_id, u.id]
+    );
+    if (!dep) return res.status(404).json({error:'Deposit not found or already processed'});
+
+    // [STRICT] Expiry check
+    if (new Date() > new Date(dep.expires_at)) {
+      await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
+      log('EXPIRY', `Semi deposit ${dep.id} expired for user ${u.id}`);
+      await recordFraud(u.id, 'Expired deposit submit');
+      return res.status(400).json({error:'Amount expired, generate a new deposit'});
+    }
+
+    // Verify via Moralis - fetch recent transfers and find by tx_hash
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=50&order=DESC`;
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
+
+    console.log(`[SEMI] Moralis fetched ${data.result ? data.result.length : 0} txs, looking for ${tx_hash.slice(0,16)}`);
+
+    if (!data || !Array.isArray(data.result)) {
+      return res.status(400).json({error:'Could not reach verification service. Try again.'});
+    }
+
+    // Find the specific tx_hash
+    const match = data.result.find(t =>
+      t.transaction_hash && t.transaction_hash.toLowerCase() === tx_hash.toLowerCase() &&
+      t.to_address && t.to_address.toLowerCase() === DEPOSIT_WALLET.toLowerCase()
+    );
+
+    if (!match) {
+      // TX not in recent 50 — may not be confirmed yet, do NOT record fraud
+      return res.status(400).json({error:'Transaction not found yet. Wait 1-2 minutes for blockchain confirmation and try again.'});
+    }
+
+    const txAmt = parseFloat(match.value_decimal || 0);
+    console.log(`[SEMI] Found tx: hash=${tx_hash.slice(0,16)} amt=${txAmt}`);
+
+    console.log(`[SEMI] tx=${tx_hash.slice(0,16)} txAmt=${txAmt} expected=${dep.unique_amt}`);
+
+    if (txAmt === 0) return res.status(400).json({error:'USDT transfer to our wallet not found in this TX'});
+
+    // [STRICT] Amount must match within $0.001 (tight — prevents auto txid reuse)
+    if (Math.abs(txAmt - dep.unique_amt) > 0.001) {
+      await db.run(`UPDATE auto_deposits SET fraud_flag=1 WHERE id=$1`, [dep.id]);
+      await recordFraud(u.id, `Amount mismatch: expected=${dep.unique_amt} got=${txAmt}`);
+      return res.status(400).json({error:`Wrong amount. Expected $${dep.unique_amt.toFixed(6)}, got $${txAmt.toFixed(6)}`});
+    }
+
+    await creditAutoDeposit(dep, tx_hash);
+    res.json({success: true, amount: dep.amount}); // return base amount to frontend
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
 
 // ── GET /api/deposit/status/:id ───────────
 app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
@@ -1757,7 +1808,7 @@ async function creditAutoDeposit(dep, txHash) {
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id,'deposit',dep.amount,'BEP20',txHash,'approved','Auto-detected']
+      [dep.user_id,'deposit',dep.amount,'BEP20',txHash,'approved',(dep.dep_type==='semi'?'Semi-auto verified':'Auto-detected')]
     );
     // Mark first_deposit task as completed (NO balance reward — exact deposit amount only)
     const taskDone = await db.one(
@@ -1770,7 +1821,9 @@ async function creditAutoDeposit(dep, txHash) {
         [dep.user_id]
       );
     }
-    console.log(`✅ Auto deposit: user=${dep.user_id} base_amt=${dep.amount} unique_amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
+    console.log('[Deposit] Deposit amount:', dep.unique_amt);
+    console.log('[Deposit] Final added:', dep.unique_amt);
+    console.log(`✅ Auto deposit: user=${dep.user_id} amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
   } catch(e) {
     // Gracefully handle unique constraint (tx_hash duplicate = already credited)
     if (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash')) {
@@ -1814,7 +1867,7 @@ async function scanBEP20() {
         const diff  = Math.abs(txAmt - dep.unique_amt);
         console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
 
-        if (diff <= 0.01) {
+        if (diff <= 0.02) {
           // [STRICT] Double-check expiry before crediting
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
@@ -1848,7 +1901,21 @@ function startScanners() {
   setInterval(async () => {
     await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
   }, 60000);
-  // today_earned is reset per-user in GET /api/user/:id when last_earn_date changes (no bulk reset needed)
+  // Reset today_earned every 24 hours at midnight UTC
+  function scheduleDailyReset() {
+    const now = new Date();
+    const nextMidnight = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
+    const msUntilMidnight = nextMidnight - now;
+    setTimeout(async () => {
+      try {
+        await db.run(`UPDATE users SET today_earned = 0`);
+        console.log('[RESET] today_earned reset to 0 for all users');
+      } catch(e) { console.error('[RESET] today_earned reset error:', e.message); }
+      scheduleDailyReset(); // schedule next day
+    }, msUntilMidnight);
+    console.log(`[RESET] today_earned will reset in ${Math.round(msUntilMidnight/1000/60)} minutes`);
+  }
+  scheduleDailyReset();
 }
 
 // ══════════════════════════════════════════
@@ -1918,8 +1985,7 @@ app.get('/api/top-earners', async (req, res) => {
 });
 
 // ══ REFERRALS BY LEVEL ══
-app.get('/api/referrals/:userId', userAuth, async (req, res) => {
-  if (String(req.tgUser.id) !== String(req.params.userId)) return res.status(403).json({ error: 'Forbidden' });
+app.get('/api/referrals/:userId', async (req, res) => {
   try {
     const userId = req.params.userId;
     const [level1, level2, level3] = await Promise.all([
