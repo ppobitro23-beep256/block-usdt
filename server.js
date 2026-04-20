@@ -36,7 +36,7 @@ setInterval(() => {
 
 const globalLimit   = rateLimit(100, 60_000);   // 100/min per IP
 const depositLimit  = rateLimit(30,  60_000);   // 30/min
-const withdrawLimit = rateLimit(10,  60_000);   // 10/min
+const withdrawLimit = rateLimit(10,  60_000);   // 10/min (unused on withdraw route — per-user DB limits used instead)
 
 // ══════════════════════════════════════════
 // AUTO DEPOSIT SCANNER CONFIG
@@ -791,7 +791,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
 
 // /api/deposit (old manual route) removed — all deposits go through /api/deposit/create
 
-app.post('/api/withdraw', withdrawLimit, userAuth, async (req, res) => {
+app.post('/api/withdraw', userAuth, async (req, res) => { // Per-user DB limits handle abuse (1 pending + max 2/day)
   try {
     const u = req.tgUser;
     const { amount, address } = req.body;
