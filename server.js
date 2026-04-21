@@ -446,7 +446,7 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_locked BOOLEAN DEFAULT FALSE`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_updated_at TIMESTAMP DEFAULT NULL`),
     // Unique index: one address per account (NULL allowed for unbound users)
-    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_withdraw_address ON users (LOWER(withdraw_address)) WHERE withdraw_address IS NOT NULL`),
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_withdraw_address ON users (withdraw_address) WHERE withdraw_address IS NOT NULL`),
   ]);
 
   // Audit log table for address changes
@@ -917,6 +917,9 @@ app.post('/api/withdraw/bind-address', userAuth, async (req, res) => {
       return res.status(403).json({error:'Address is locked. Contact support to change.'});
     }
 
+    // Save and lock immediately — store lowercase for consistent uniqueness
+    const cleanAddr = address.trim().toLowerCase();
+
     // ✅ UNIQUE CHECK: Address must not belong to another account
     const existing = await db.one(
       `SELECT id FROM users WHERE LOWER(withdraw_address)=$1 AND id!=$2`,
@@ -924,18 +927,15 @@ app.post('/api/withdraw/bind-address', userAuth, async (req, res) => {
     );
     if (existing) {
       const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-      log('SECURITY', `Duplicate address attempt user=${u.id} addr=${address.trim().slice(0,16)}... ip=${ip}`);
+      log('SECURITY', `Duplicate address attempt user=${u.id} addr=${cleanAddr.slice(0,16)}... ip=${ip}`);
       await db.run(
         `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action) VALUES ($1,$2,$3,$4,$5)`,
-        ['system', u.id, null, address.trim(), 'duplicate_attempt']
+        ['system', u.id, null, cleanAddr, 'duplicate_attempt']
       );
       return res.status(400).json({
         error:'This wallet address is already linked to another account. Please use your own wallet.'
       });
     }
-
-    // Save and lock immediately — store lowercase for consistent uniqueness
-    const cleanAddr = address.trim().toLowerCase();
     await db.run(
       `UPDATE users SET withdraw_address=$1, address_locked=TRUE, address_updated_at=NOW() WHERE id=$2`,
       [cleanAddr, u.id]
