@@ -151,7 +151,7 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 // Safety check — crash early if critical env vars missing
 if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.exit(1); }
 if (!ADMIN_SECRET) { console.error('❌ ADMIN_SECRET env var missing'); process.exit(1); }
-if (!BOT_TOKEN)    { console.error("❌ BOT_TOKEN env var missing — all auth will fail safely"); }
+if (!BOT_TOKEN)    { console.error('❌ BOT_TOKEN env var missing'); process.exit(1); }
 
 // ── CORS — allow Cloudflare Pages frontend + all Telegram origins ──────
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'https://block-usdt.pages.dev';
@@ -441,6 +441,7 @@ async function setupDB() {
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS link TEXT DEFAULT ''`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS chat_id TEXT DEFAULT ''`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS app_language VARCHAR(10) DEFAULT ''`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_pending_refs_user ON pending_refs (user_id)`),
     // Wallet address bind system
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS withdraw_address TEXT DEFAULT NULL`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_locked BOOLEAN DEFAULT FALSE`),
@@ -524,14 +525,36 @@ function isValidBEP20Address(a) {
 // ══════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════
-function verifyTg(initData) {
+function verifyTg(initData, logContext) {
   try {
     const p = new URLSearchParams(initData);
-    const hash = p.get('hash'); p.delete('hash');
+    const hash = p.get('hash');
+    if (!hash) {
+      if (logContext) log('AUTH', `[${logContext}] No hash in initData`);
+      return false;
+    }
+    p.delete('hash');
+
+    // Check auth_date expiry (24 hours)
+    // Telegram initData stays same for entire session — 5min is too short
+    const authDate = parseInt(p.get('auth_date') || '0');
+    const now      = Math.floor(Date.now() / 1000);
+    const age      = now - authDate;
+    if (authDate && age > 86400) {
+      if (logContext) log('AUTH', `[${logContext}] initData expired: age=${age}s (>24h)`);
+      return false;
+    }
+
     const arr = []; p.forEach((v,k) => arr.push(`${k}=${v}`)); arr.sort();
     const secret = crypto.createHmac('sha256','WebAppData').update(BOT_TOKEN).digest();
-    return crypto.createHmac('sha256',secret).update(arr.join('\n')).digest('hex') === hash;
-  } catch { return false; }
+    const computed = crypto.createHmac('sha256',secret).update(arr.join('\n')).digest('hex');
+    const valid = computed === hash;
+    if (!valid && logContext) log('AUTH', `[${logContext}] Hash mismatch`);
+    return valid;
+  } catch(e) {
+    if (logContext) log('AUTH', `[${logContext}] verifyTg exception: ${e.message}`);
+    return false;
+  }
 }
 
 function userAuth(req, res, next) {
@@ -545,23 +568,39 @@ function userAuth(req, res, next) {
   }
 
   // Verify Telegram initData signature
-  if (BOT_TOKEN && process.env.NODE_ENV !== 'development' && !verifyTg(initData)) {
-    log('SECURITY', `Invalid initData rejected from IP: ${req.headers['x-forwarded-for'] || req.ip}`);
-    return res.status(401).json({ error: 'Invalid session' });
+  if (BOT_TOKEN && process.env.NODE_ENV !== 'development') {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+    if (!verifyTg(initData, `${req.method} ${req.path} ip=${ip}`)) {
+      return res.status(401).json({ error: 'Invalid session' });
+    }
   }
 
   try {
     const p = new URLSearchParams(initData);
     const userStr = p.get('user');
     req.tgUser = userStr ? JSON.parse(userStr) : null;
-    if (!req.tgUser || !req.tgUser.id) return res.status(401).json({ error: 'Invalid session' });
-  } catch(e) { return res.status(401).json({ error: 'Invalid session' }); }
+    if (!req.tgUser || !req.tgUser.id) {
+      log('AUTH', `No user in initData path=${req.path}`);
+      return res.status(401).json({ error: 'Invalid session' });
+    }
+    // Auth OK — no log here to avoid noise (failures are logged above)
+  } catch(e) {
+    log('AUTH', `Parse error path=${req.path}: ${e.message}`);
+    return res.status(401).json({ error: 'Invalid session' });
+  }
   return next();
 }
 
 function adminAuth(req, res, next) {
-  const secret = req.headers['x-admin-secret'] || req.body?.adminSecret;
-  if (secret !== ADMIN_SECRET) return res.status(403).json({error:'Unauthorized'});
+  const secret = req.headers['x-admin-secret'] || req.body?.adminSecret || '';
+  // Timing-safe compare prevents timing attacks on admin secret
+  try {
+    const a = Buffer.from(secret.padEnd(64));
+    const b = Buffer.from(ADMIN_SECRET.padEnd(64));
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(403).json({error:'Unauthorized'});
+    }
+  } catch { return res.status(403).json({error:'Unauthorized'}); }
   next();
 }
 
@@ -573,8 +612,8 @@ app.post('/api/auth', authLimit, async (req, res) => {
     // ✅ SECURITY FIX: Verify initData on auth too
     const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
     if (BOT_TOKEN && raw && raw.length > 10 && process.env.NODE_ENV !== 'development') {
-      if (!verifyTg(raw)) {
-        log('SECURITY', `Fake auth attempt from IP: ${req.headers['x-forwarded-for'] || req.ip}`);
+      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+      if (!verifyTg(raw, `POST /api/auth ip=${ip}`)) {
         return res.status(401).json({error: 'Invalid session'});
       }
     }
@@ -608,7 +647,7 @@ app.post('/api/auth', authLimit, async (req, res) => {
     const refById  = ref && String(ref).startsWith('REF') ? parseInt(String(ref).replace('REF','')) || null : null;
     const finalRef = (refById && refById !== uid) ? refById : null;
 
-    log('REF', `Auth uid=${uid} ref=${ref||'none'} refById=${refById||'none'} finalRef=${finalRef||'none'}`);
+    if (finalRef) log('REF', `Auth uid=${uid} ref=${ref} finalRef=${finalRef}`);
 
     // Check pending ref
     let pendingRef = finalRef;
