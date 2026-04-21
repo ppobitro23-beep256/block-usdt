@@ -35,8 +35,8 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 const globalLimit   = rateLimit(100, 60_000);   // 100/min per IP
+const authLimit     = rateLimit(20,  60_000);   // 20/min per IP
 const depositLimit  = rateLimit(30,  60_000);   // 30/min
-const withdrawLimit = rateLimit(10,  60_000);   // 10/min (unused on withdraw route — per-user DB limits used instead)
 
 // ══════════════════════════════════════════
 // AUTO DEPOSIT SCANNER CONFIG
@@ -144,9 +144,13 @@ async function clearFraud(userId) {
   log('FRAUD', `User ${userId} fraud state cleared`);
 }
 
-const BOT_TOKEN    = process.env.BOT_TOKEN    || "YOUR_BOT_TOKEN";
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin123";
-const DATABASE_URL = process.env.DATABASE_URL || "postgresql://neondb_owner:npg_4IVJ1PZzcjnW@ep-long-art-anucops0-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require";
+const BOT_TOKEN    = process.env.BOT_TOKEN    || '';
+const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
+const DATABASE_URL = process.env.DATABASE_URL || '';
+
+// Safety check — crash early if critical env vars missing
+if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.exit(1); }
+if (!ADMIN_SECRET) { console.error('❌ ADMIN_SECRET env var missing'); process.exit(1); }
 
 // ── CORS — allow Cloudflare Pages frontend + all Telegram origins ──────
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'https://block-usdt.pages.dev';
@@ -527,7 +531,7 @@ function adminAuth(req, res, next) {
 // ══════════════════════════════════════════
 // USER ROUTES
 // ══════════════════════════════════════════
-app.post('/api/auth', async (req, res) => {
+app.post('/api/auth', authLimit, async (req, res) => {
   try {
     // Priority: parse from initData header first (always fresh from Telegram)
     // Fallback to body.tgUser (may be stale cached data from WebApp)
@@ -608,7 +612,6 @@ app.get('/api/user/:id', async (req, res) => {
     } catch(e) { return res.status(401).json({ error: 'Invalid session' }); }
   }
   try {
-    console.log('Fetching user:', req.params.id);
     let user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
     // Auto-create user if not exists — only when called with valid initData (not ghost creation)
     if (!user) {
@@ -697,6 +700,12 @@ app.post('/api/invest', userAuth, async (req, res) => {
     if (amount < plan.min_amt) return res.status(400).json({error:`Min $${plan.min_amt}`});
     if (amount > plan.max_amt) return res.status(400).json({error:`Max $${plan.max_amt}`});
     if (user.balance < amount) return res.status(400).json({error:'Insufficient balance'});
+    // Prevent duplicate active investment in same plan
+    const dupInv = await db.one(
+      `SELECT id FROM investments WHERE user_id=$1 AND plan_name=$2 AND status='active'`,
+      [u.id, ((plan.emoji||'')+' '+plan.name).trim()]
+    );
+    if (dupInv) return res.status(400).json({error:'You already have an active investment in this plan'});
 
     // [PLAN UNLOCK] Check active referral requirement (backend safety — cannot bypass)
     const refReq = getPlanReferralReq(plan.name);
@@ -809,9 +818,12 @@ app.post('/api/withdraw', userAuth, async (req, res) => { // Per-user DB limits 
     if (blockMsg) return res.status(429).json({error: blockMsg});
 
     // [IMPROVED] Validations
-    const minW   = parseFloat(await getSetting('withdraw_min') || 2);
-    const maxW   = parseFloat(await getSetting('withdraw_max') || 10000);
-    const feePct = parseFloat(await getSetting('withdraw_fee_pct') || 0);
+    const [wMinRow, wMaxRow, wFeeRow] = await Promise.all([
+      getSetting('withdraw_min'), getSetting('withdraw_max'), getSetting('withdraw_fee_pct')
+    ]);
+    const minW   = parseFloat(wMinRow   || 2);
+    const maxW   = parseFloat(wMaxRow   || 10000);
+    const feePct = parseFloat(wFeeRow   || 0);
     const amt    = parseFloat(amount);
 
     if (!amt || amt < minW) {
@@ -838,7 +850,8 @@ app.post('/api/withdraw', userAuth, async (req, res) => { // Per-user DB limits 
     }
     // [DAILY LIMIT] Max 2 withdrawals per day
     const todayCount = await db.one(
-      `SELECT COUNT(*) as cnt FROM transactions WHERE user_id=$1 AND type='withdraw' AND created_at >= NOW() - INTERVAL '24 hours'`,
+      `SELECT COUNT(*) as cnt FROM transactions WHERE user_id=$1 AND type='withdraw'
+       AND created_at >= CURRENT_DATE AT TIME ZONE 'UTC'`,
       [u.id]
     );
     if (parseInt(todayCount.cnt) >= 2) {
@@ -908,10 +921,12 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
       [u.id,'earn',earn,'completed',`Daily: ${inv.plan_name}`]
     );
-    if (inv.days_done+1 >= inv.days_total) {
+    // Use days_total from inv — days_done already incremented in atomic UPDATE above
+    const newDaysDone = (inv.days_done || 0) + 1;
+    if (newDaysDone >= inv.days_total) {
       await db.run(`UPDATE investments SET status='completed' WHERE id=$1`, [inv.id]);
     }
-    res.json({success:true, earned:earn});
+    res.json({success:true, earned:earn, days_done: newDaysDone, completed: newDaysDone >= inv.days_total});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
@@ -1293,28 +1308,41 @@ app.get('/admin/users', adminAuth, async (req, res) => {
     const users = await db.all(q, params);
     const total = (await db.one(`SELECT COUNT(*) as c FROM users`)).c;
 
-    // Enrich each user with analytics
-    const enriched = await Promise.all(users.map(async u => {
-      const [depRow, withRow, lastDep, lastWith] = await Promise.all([
-        db.one(`SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [u.id]),
-        db.one(`SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='approved'`, [u.id]),
-        db.one(`SELECT MAX(created_at) as t FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [u.id]),
-        db.one(`SELECT MAX(created_at) as t FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='approved'`, [u.id]),
-      ]);
-      const totalDeposit  = parseFloat(depRow.total)  || 0;
-      const totalWithdraw = parseFloat(withRow.total) || 0;
-      const depositCount  = parseInt(depRow.cnt)  || 0;
-      const withdrawCount = parseInt(withRow.cnt) || 0;
+    // Enrich all users in ONE query instead of N*4 queries
+    const userIds = users.map(u => u.id);
+    const enrichRows = userIds.length > 0 ? await db.all(`
+      SELECT
+        user_id,
+        SUM(CASE WHEN type='deposit'  AND status='approved' THEN amount ELSE 0 END) as dep_total,
+        SUM(CASE WHEN type='withdraw' AND status='approved' THEN amount ELSE 0 END) as with_total,
+        COUNT(CASE WHEN type='deposit'  AND status='approved' THEN 1 END) as dep_cnt,
+        COUNT(CASE WHEN type='withdraw' AND status='approved' THEN 1 END) as with_cnt,
+        MAX(CASE WHEN type='deposit'  AND status='approved' THEN created_at END) as last_dep,
+        MAX(CASE WHEN type='withdraw' AND status='approved' THEN created_at END) as last_with
+      FROM transactions
+      WHERE user_id = ANY($1::bigint[])
+      GROUP BY user_id
+    `, [userIds]) : [];
+
+    const enrichMap = {};
+    enrichRows.forEach(r => { enrichMap[r.user_id] = r; });
+
+    const enriched = users.map(u => {
+      const r = enrichMap[u.id] || {};
+      const totalDeposit  = parseFloat(r.dep_total  || 0);
+      const totalWithdraw = parseFloat(r.with_total || 0);
+      const depositCount  = parseInt(r.dep_cnt  || 0);
+      const withdrawCount = parseInt(r.with_cnt || 0);
       const netProfit     = totalDeposit - totalWithdraw;
       const isSuspicious  = (totalWithdraw > totalDeposit * 1.5) || (withdrawCount > depositCount * 2);
       return {
         ...u,
         totalDeposit, totalWithdraw, depositCount, withdrawCount,
         netProfit, isSuspicious,
-        lastDepositAt:  lastDep.t  || null,
-        lastWithdrawAt: lastWith.t || null,
+        lastDepositAt:  r.last_dep  || null,
+        lastWithdrawAt: r.last_with || null,
       };
-    }));
+    });
 
     res.json({users: enriched, total});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -2001,7 +2029,7 @@ app.get('/admin/referral-details/:userId', adminAuth, async (req, res) => {
 });
 
 // ══ COLLECT COMMISSION ══
-app.post('/api/collect-commission', userAuth, async (req, res) => {
+app.post('/api/collect-commission', authLimit, userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
