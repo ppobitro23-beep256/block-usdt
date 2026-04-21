@@ -441,7 +441,24 @@ async function setupDB() {
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS link TEXT DEFAULT ''`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS chat_id TEXT DEFAULT ''`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS app_language VARCHAR(10) DEFAULT ''`),
+    // Wallet address bind system
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS withdraw_address TEXT DEFAULT NULL`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_locked BOOLEAN DEFAULT FALSE`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_updated_at TIMESTAMP DEFAULT NULL`),
   ]);
+
+  // Audit log table for address changes
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS address_change_logs (
+      id           SERIAL PRIMARY KEY,
+      admin_id     TEXT,
+      user_id      BIGINT NOT NULL,
+      old_address  TEXT,
+      new_address  TEXT,
+      action       TEXT DEFAULT 'change',
+      created_at   TIMESTAMP DEFAULT NOW()
+    )
+  `);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
 }
@@ -708,9 +725,12 @@ app.get('/api/user/:id', async (req, res) => {
     // Add commission data to user
     const userWithComm = {
       ...user,
-      pending_commission: parseFloat(user.pending_commission || 0),
-      total_commission:   parseFloat(user.total_commission   || 0),
-      is_deposit_blocked: user.blocked_until && new Date() < new Date(user.blocked_until) ? 1 : 0,
+      pending_commission:  parseFloat(user.pending_commission || 0),
+      total_commission:    parseFloat(user.total_commission   || 0),
+      is_deposit_blocked:  user.blocked_until && new Date() < new Date(user.blocked_until) ? 1 : 0,
+      withdraw_address:    user.withdraw_address || null,
+      address_locked:      !!user.address_locked,
+      address_updated_at:  user.address_updated_at || null,
     };
     userWithComm.rank   = getUserRank(activeReferrals);
     userWithComm.active_referrals = activeReferrals;
@@ -847,23 +867,87 @@ app.post('/api/invest', userAuth, async (req, res) => {
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
-// /api/deposit (old manual route) removed — all deposits go through /api/deposit/create
 
-app.post('/api/withdraw', userAuth, async (req, res) => { // Per-user DB limits handle abuse (1 pending + max 2/day)
+// ══════════════════════════════════════════
+// WALLET ADDRESS BIND SYSTEM
+// ══════════════════════════════════════════
+
+// GET current bound address
+app.get('/api/withdraw/address', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
-    const { amount, address } = req.body;
+    const user = await db.one(`SELECT withdraw_address, address_locked, address_updated_at FROM users WHERE id=$1`, [u.id]);
+    if (!user) return res.status(404).json({error:'Not found'});
+    res.json({
+      address: user.withdraw_address || null,
+      locked: !!user.address_locked,
+      updated_at: user.address_updated_at || null
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// POST bind address (first time only — user cannot change after)
+app.post('/api/withdraw/bind-address', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { address } = req.body;
+
+    if (!address || !isValidBEP20Address(address)) {
+      return res.status(400).json({error:'Invalid BEP20 wallet address (must start with 0x, 42 chars)'});
+    }
+
+    // Check blocked addresses
+    const blockedRow = await getSetting('blocked_addresses');
+    if (blockedRow) {
+      const blockedList = blockedRow.split(',').map(a => a.trim().toLowerCase()).filter(Boolean);
+      if (blockedList.includes(address.trim().toLowerCase())) {
+        log('SECURITY', `Blocked address bind attempt by user ${u.id}: ${address}`);
+        return res.status(400).json({error:'Invalid wallet address'});
+      }
+    }
+
+    const user = await db.one(`SELECT withdraw_address, address_locked FROM users WHERE id=$1`, [u.id]);
+    if (!user) return res.status(404).json({error:'Not found'});
+
+    // ✅ SECURITY: If already locked, user cannot change
+    if (user.address_locked && user.withdraw_address) {
+      log('SECURITY', `User ${u.id} attempted to self-change locked address`);
+      return res.status(403).json({error:'Address is locked. Contact support to change.'});
+    }
+
+    // Save and lock immediately
+    await db.run(
+      `UPDATE users SET withdraw_address=$1, address_locked=TRUE, address_updated_at=NOW() WHERE id=$2`,
+      [address.trim(), u.id]
+    );
+    log('ADDRESS', `User ${u.id} bound address: ${address.trim().slice(0,16)}...`);
+    res.json({success:true, message:'Address bound and locked successfully.'});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// /api/deposit (old manual route) removed — all deposits go through /api/deposit/create
+
+app.post('/api/withdraw', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { amount } = req.body; // ✅ address comes from DB only — not from user input
     const network = 'BEP20';
 
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
     if (!user) return res.status(404).json({error:'Not found'});
     if (user.is_banned) return res.status(403).json({error:'banned'});
 
-    // [NEW] Block check
+    // ✅ BOUND ADDRESS CHECK — must have bound address before withdrawing
+    if (!user.withdraw_address || !user.address_locked) {
+      return res.status(400).json({error:'No withdrawal address bound. Please bind your address first.'});
+    }
+    const address = user.withdraw_address; // use DB address, never trust user input
+
+    // Block check
     const blockMsg = await checkBlocked(u.id);
     if (blockMsg) return res.status(429).json({error: blockMsg});
 
-    // [IMPROVED] Validations
+    // Validations
     const [wMinRow, wMaxRow, wFeeRow] = await Promise.all([
       getSetting('withdraw_min'), getSetting('withdraw_max'), getSetting('withdraw_fee_pct')
     ]);
@@ -877,18 +961,14 @@ app.post('/api/withdraw', userAuth, async (req, res) => { // Per-user DB limits 
       return res.status(400).json({error:`Minimum withdrawal is $${minW} USDT`});
     }
     if (amt > maxW) return res.status(400).json({error:`Maximum withdrawal is $${maxW}`});
-    if (!address || !isValidBEP20Address(address)) {
-      log('WITHDRAW', `User ${u.id} rejected: invalid address format`);
-      return res.status(400).json({error:'Invalid BEP20 wallet address (must start with 0x, 42 chars)'});
-    }
 
-    // ✅ SECURITY FIX: Block known attacker addresses
+    // ✅ SECURITY: Block known attacker addresses (double-check even from DB)
     const blockedAddrsRow = await getSetting('blocked_addresses');
     if (blockedAddrsRow) {
       const blockedList = blockedAddrsRow.split(',').map(a => a.trim().toLowerCase()).filter(Boolean);
       if (blockedList.includes(address.trim().toLowerCase())) {
-        log('SECURITY', `BLOCKED address attempted by user ${u.id}: ${address}`);
-        return res.status(400).json({error:'Invalid wallet address'});
+        log('SECURITY', `BLOCKED address in DB for user ${u.id}: ${address}`);
+        return res.status(400).json({error:'Withdrawal address is blocked. Contact support.'});
       }
     }
     if (user.balance < amt) {
@@ -2123,6 +2203,98 @@ app.post('/api/collect-commission', authLimit, userAuth, async (req, res) => {
     await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',collectedAmt,'completed','Referral commission collected']);
     res.json({success:true, collected:collectedAmt});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+
+// ── Admin: Get user withdraw address ──
+app.get('/admin/user/:id/address', adminAuth, async (req, res) => {
+  try {
+    const user = await db.one(
+      `SELECT id, first_name, username, withdraw_address, address_locked, address_updated_at FROM users WHERE id=$1`,
+      [req.params.id]
+    );
+    if (!user) return res.status(404).json({error:'Not found'});
+    res.json({
+      user_id: user.id,
+      first_name: user.first_name,
+      username: user.username,
+      address: user.withdraw_address || null,
+      locked: !!user.address_locked,
+      updated_at: user.address_updated_at || null
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// ── Admin: Change user withdraw address ──
+app.post('/admin/user/change-address', adminAuth, async (req, res) => {
+  try {
+    const { user_id, new_address } = req.body;
+    if (!user_id) return res.status(400).json({error:'user_id required'});
+    if (!new_address || !isValidBEP20Address(new_address)) {
+      return res.status(400).json({error:'Invalid BEP20 address'});
+    }
+
+    const user = await db.one(`SELECT withdraw_address FROM users WHERE id=$1`, [user_id]);
+    if (!user) return res.status(404).json({error:'User not found'});
+
+    const oldAddress = user.withdraw_address || null;
+
+    // Update address and keep locked
+    await db.run(
+      `UPDATE users SET withdraw_address=$1, address_locked=TRUE, address_updated_at=NOW() WHERE id=$2`,
+      [new_address.trim(), user_id]
+    );
+
+    // Audit log
+    await db.run(
+      `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action) VALUES ($1,$2,$3,$4,$5)`,
+      ['admin', user_id, oldAddress, new_address.trim(), 'change']
+    );
+
+    log('ADMIN', `Address changed for user ${user_id}: ${(oldAddress||'none').slice(0,16)} → ${new_address.trim().slice(0,16)}`);
+    logSecurity('ADMIN_ADDRESS_CHANGE', {user_id, old: oldAddress, new: new_address.trim().slice(0,20)});
+    res.json({success:true});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// ── Admin: Clear user withdraw address (unlock for re-bind) ──
+app.post('/admin/user/clear-address', adminAuth, async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({error:'user_id required'});
+
+    const user = await db.one(`SELECT withdraw_address FROM users WHERE id=$1`, [user_id]);
+    if (!user) return res.status(404).json({error:'User not found'});
+
+    const oldAddress = user.withdraw_address || null;
+
+    await db.run(
+      `UPDATE users SET withdraw_address=NULL, address_locked=FALSE, address_updated_at=NOW() WHERE id=$1`,
+      [user_id]
+    );
+
+    // Audit log
+    await db.run(
+      `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action) VALUES ($1,$2,$3,$4,$5)`,
+      ['admin', user_id, oldAddress, null, 'clear']
+    );
+
+    log('ADMIN', `Address cleared for user ${user_id} (old: ${(oldAddress||'none').slice(0,16)})`);
+    res.json({success:true, message:'Address cleared. User can now re-bind.'});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// ── Admin: View address change logs ──
+app.get('/admin/address-logs', adminAuth, async (req, res) => {
+  try {
+    const { user_id, limit=50 } = req.query;
+    let q = `SELECT l.*, u.first_name, u.username FROM address_change_logs l LEFT JOIN users u ON u.id=l.user_id WHERE 1=1`;
+    const params = [];
+    if (user_id) { params.push(user_id); q += ` AND l.user_id=$${params.length}`; }
+    params.push(limit); q += ` ORDER BY l.created_at DESC LIMIT $${params.length}`;
+    const logs = await db.all(q, params);
+    res.json({logs});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
 });
 
 // ══════════════════════════════════════════
