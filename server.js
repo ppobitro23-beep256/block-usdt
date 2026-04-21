@@ -445,6 +445,8 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS withdraw_address TEXT DEFAULT NULL`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_locked BOOLEAN DEFAULT FALSE`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_updated_at TIMESTAMP DEFAULT NULL`),
+    // Unique index: one address per account (NULL allowed for unbound users)
+    db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_withdraw_address ON users (LOWER(withdraw_address)) WHERE withdraw_address IS NOT NULL`),
   ]);
 
   // Audit log table for address changes
@@ -915,12 +917,30 @@ app.post('/api/withdraw/bind-address', userAuth, async (req, res) => {
       return res.status(403).json({error:'Address is locked. Contact support to change.'});
     }
 
-    // Save and lock immediately
+    // ✅ UNIQUE CHECK: Address must not belong to another account
+    const existing = await db.one(
+      `SELECT id FROM users WHERE LOWER(withdraw_address)=$1 AND id!=$2`,
+      [cleanAddr, u.id]
+    );
+    if (existing) {
+      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+      log('SECURITY', `Duplicate address attempt user=${u.id} addr=${address.trim().slice(0,16)}... ip=${ip}`);
+      await db.run(
+        `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action) VALUES ($1,$2,$3,$4,$5)`,
+        ['system', u.id, null, address.trim(), 'duplicate_attempt']
+      );
+      return res.status(400).json({
+        error:'This wallet address is already linked to another account. Please use your own wallet.'
+      });
+    }
+
+    // Save and lock immediately — store lowercase for consistent uniqueness
+    const cleanAddr = address.trim().toLowerCase();
     await db.run(
       `UPDATE users SET withdraw_address=$1, address_locked=TRUE, address_updated_at=NOW() WHERE id=$2`,
-      [address.trim(), u.id]
+      [cleanAddr, u.id]
     );
-    log('ADDRESS', `User ${u.id} bound address: ${address.trim().slice(0,16)}...`);
+    log('ADDRESS', `User ${u.id} bound address: ${cleanAddr.slice(0,16)}...`);
     res.json({success:true, message:'Address bound and locked successfully.'});
   } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
 });
@@ -2238,21 +2258,45 @@ app.post('/admin/user/change-address', adminAuth, async (req, res) => {
     if (!user) return res.status(404).json({error:'User not found'});
 
     const oldAddress = user.withdraw_address || null;
+    const normalizedNew = new_address.trim().toLowerCase();
+    const { force_override } = req.body; // admin can pass force_override:true to bypass
 
-    // Update address and keep locked
+    // Check if address already belongs to another user
+    const addrOwner = await db.one(
+      `SELECT id, first_name, username FROM users WHERE LOWER(withdraw_address)=$1 AND id!=$2`,
+      [normalizedNew, user_id]
+    );
+    if (addrOwner && !force_override) {
+      return res.status(400).json({
+        error: `Address already belongs to User ID ${addrOwner.id} (@${addrOwner.username || addrOwner.first_name}). Pass force_override:true to override.`,
+        conflict_user_id: addrOwner.id,
+        conflict_username: addrOwner.username || addrOwner.first_name
+      });
+    }
+    if (addrOwner && force_override) {
+      // Clear address from the other user first
+      await db.run(
+        `UPDATE users SET withdraw_address=NULL, address_locked=FALSE, address_updated_at=NOW() WHERE id=$1`,
+        [addrOwner.id]
+      );
+      log('ADMIN', `Force override: cleared address from user ${addrOwner.id} to assign to ${user_id}`);
+    }
+
+    // Update address and keep locked — store lowercase for consistent uniqueness
+    const cleanNewAddr = new_address.trim().toLowerCase();
     await db.run(
       `UPDATE users SET withdraw_address=$1, address_locked=TRUE, address_updated_at=NOW() WHERE id=$2`,
-      [new_address.trim(), user_id]
+      [cleanNewAddr, user_id]
     );
 
     // Audit log
     await db.run(
       `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action) VALUES ($1,$2,$3,$4,$5)`,
-      ['admin', user_id, oldAddress, new_address.trim(), 'change']
+      ['admin', user_id, oldAddress, cleanNewAddr, force_override ? 'force_change' : 'change']
     );
 
-    log('ADMIN', `Address changed for user ${user_id}: ${(oldAddress||'none').slice(0,16)} → ${new_address.trim().slice(0,16)}`);
-    logSecurity('ADMIN_ADDRESS_CHANGE', {user_id, old: oldAddress, new: new_address.trim().slice(0,20)});
+    log('ADMIN', `Address changed for user ${user_id}: ${(oldAddress||'none').slice(0,16)} → ${cleanNewAddr.slice(0,16)}`);
+    logSecurity('ADMIN_ADDRESS_CHANGE', {user_id, old: oldAddress, new: cleanNewAddr.slice(0,20), force: !!force_override});
     res.json({success:true});
   } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
 });
