@@ -151,7 +151,6 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 // Safety check — crash early if critical env vars missing
 if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.exit(1); }
 if (!ADMIN_SECRET) { console.error('❌ ADMIN_SECRET env var missing'); process.exit(1); }
-if (!BOT_TOKEN)    { console.error("❌ BOT_TOKEN env var missing — all auth will fail safely"); }
 
 // ── CORS — allow Cloudflare Pages frontend + all Telegram origins ──────
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'https://block-usdt.pages.dev';
@@ -206,12 +205,6 @@ app.use(express.json({ limit: '50kb' }));
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10,                  // max connections
-  idleTimeoutMillis: 30000, // close idle after 30s
-  connectionTimeoutMillis: 5000, // fail fast if DB unreachable
-});
-pool.on('error', (err) => {
-  console.error('[PG POOL ERROR]', err.message);
 });
 
 const db = {
@@ -448,11 +441,7 @@ async function setupDB() {
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (err) => {
-  console.error('[unhandledRejection]', err?.message || err);
-});
-process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err?.message || err);
-  // Don't exit — log and keep running (Render will restart on crash anyway)
+  console.error('Unhandled rejection:', err.message);
 });
 
 async function getSetting(key) {
@@ -524,13 +513,6 @@ function userAuth(req, res, next) {
     }
     return res.status(401).json({ error: 'Auth required' });
   }
-
-  // Verify Telegram initData signature
-  if (BOT_TOKEN && process.env.NODE_ENV !== 'development' && !verifyTg(initData)) {
-    log('SECURITY', `Invalid initData rejected from IP: ${req.headers['x-forwarded-for'] || req.ip}`);
-    return res.status(401).json({ error: 'Invalid session' });
-  }
-
   try {
     const p = new URLSearchParams(initData);
     const userStr = p.get('user');
@@ -551,15 +533,10 @@ function adminAuth(req, res, next) {
 // ══════════════════════════════════════════
 app.post('/api/auth', authLimit, async (req, res) => {
   try {
-    // ✅ SECURITY FIX: Verify initData on auth too
-    const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
-    if (BOT_TOKEN && raw && raw.length > 10 && process.env.NODE_ENV !== 'development') {
-      if (!verifyTg(raw)) {
-        log('SECURITY', `Fake auth attempt from IP: ${req.headers['x-forwarded-for'] || req.ip}`);
-        return res.status(401).json({error: 'Invalid session'});
-      }
-    }
+    // Priority: parse from initData header first (always fresh from Telegram)
+    // Fallback to body.tgUser (may be stale cached data from WebApp)
     let u = null;
+    const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
     if (raw && raw.length > 10) {
       try {
         const p = new URLSearchParams(raw);
@@ -567,8 +544,11 @@ app.post('/api/auth', authLimit, async (req, res) => {
         if (us) u = JSON.parse(us);
       } catch(e) {}
     }
-    // NO body fallback — initData is required in production
-    if (!u || !u.id) return res.status(400).json({error:'No user data. Send x-telegram-init-data header.'});
+    // Fallback to body if initData parse failed
+    if (!u || !u.id) {
+      u = req.body?.tgUser || req.body?.user || null;
+    }
+    if (!u || !u.id) return res.status(400).json({error:'No user data'});
 
     const uid      = u.id;
     const refCode  = 'REF' + uid;
@@ -613,37 +593,31 @@ app.post('/api/auth', authLimit, async (req, res) => {
 
     res.json({success: true});
   } catch(e) {
-    log('ERROR', 'Auth error: ' + e.message);
-    res.status(500).json({error: 'Server error. Please try again.'});
+    console.error('Auth error:', e.message);
+    res.status(500).json({error: e.message});
   }
 });
 
 app.get('/api/user/:id', async (req, res) => {
-  // Auth: initData header required, signature verified if BOT_TOKEN set
-  const _initData = req.headers['x-telegram-init-data'] || req.body?.initData;
-  if (!_initData) return res.status(401).json({ error: 'Auth required' });
-  // Verify signature only when BOT_TOKEN is configured
-  if (BOT_TOKEN && process.env.NODE_ENV !== 'development' && !verifyTg(_initData)) {
-    log('SECURITY', `Invalid initData on /api/user from IP: ${req.headers['x-forwarded-for'] || req.ip}`);
-    return res.status(401).json({ error: 'Invalid session' });
+  // Auth guard: if initData present, user may only fetch their own data
+  const _initData = req.headers['x-telegram-init-data'];
+  if (_initData) {
+    try {
+      const _p = new URLSearchParams(_initData);
+      const _userStr = _p.get('user');
+      const _tgU = _userStr ? JSON.parse(_userStr) : null;
+      if (!_tgU || String(_tgU.id) !== String(req.params.id)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } catch(e) { return res.status(401).json({ error: 'Invalid session' }); }
   }
-  try {
-    const _p = new URLSearchParams(_initData);
-    const _userStr = _p.get('user');
-    const _tgU = _userStr ? JSON.parse(_userStr) : null;
-    // User can only access their own data
-    if (!_tgU || String(_tgU.id) !== String(req.params.id)) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-  } catch(e) { return res.status(401).json({ error: 'Invalid session' }); }
   try {
     let user = await db.one(`SELECT * FROM users WHERE id=$1`, [req.params.id]);
     // Auto-create user if not exists — only when called with valid initData (not ghost creation)
     if (!user) {
       const hasAuth = !!req.headers['x-telegram-init-data'];
       if (!hasAuth) return res.status(404).json({error:'Not found'});
-      const uid = String(parseInt(req.params.id)); // sanitize to integer string
-      if (!uid || uid === 'NaN') return res.status(400).json({error:'Invalid user id'});
+      const uid = req.params.id;
       const refCode = 'REF' + uid;
       await db.run(`
         INSERT INTO users (id,first_name,ref_code) VALUES ($1,$2,$3)
@@ -697,7 +671,7 @@ app.get('/api/user/:id', async (req, res) => {
     userWithComm.rank   = getUserRank(activeReferrals);
     userWithComm.active_referrals = activeReferrals;
     res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ── Save user language preference ──────────────────────────
@@ -710,15 +684,13 @@ app.post('/api/user/language', userAuth, async (req, res) => {
     if (!SUPPORTED.includes(language)) return res.status(400).json({ error: 'Unsupported language' });
     await db.run(`UPDATE users SET app_language=$1 WHERE id=$2`, [language, u.id]);
     res.json({ ok: true });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({ error: "Server error. Please try again." }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/invest', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
-    const {plan_id} = req.body;
-    const amount = parseFloat(req.body.amount);
-    if (!isValidAmount(amount)) return res.status(400).json({error:'Invalid amount'});
+    const {plan_id, amount} = req.body;
     const user = await db.one(`SELECT * FROM users WHERE id=$1`, [u.id]);
     if (!user) return res.status(404).json({error:'Not found'});
     if (user.is_banned) return res.status(403).json({error:'banned'});
@@ -826,7 +798,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
     } catch(e) { console.log('Commission error:', e.message); }
 
     res.json({success:true, daily_earn:daily});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // /api/deposit (old manual route) removed — all deposits go through /api/deposit/create
@@ -863,16 +835,6 @@ app.post('/api/withdraw', userAuth, async (req, res) => { // Per-user DB limits 
       log('WITHDRAW', `User ${u.id} rejected: invalid address format`);
       return res.status(400).json({error:'Invalid BEP20 wallet address (must start with 0x, 42 chars)'});
     }
-
-    // ✅ SECURITY FIX: Block known attacker addresses
-    const blockedAddrsRow = await getSetting('blocked_addresses');
-    if (blockedAddrsRow) {
-      const blockedList = blockedAddrsRow.split(',').map(a => a.trim().toLowerCase()).filter(Boolean);
-      if (blockedList.includes(address.trim().toLowerCase())) {
-        log('SECURITY', `BLOCKED address attempted by user ${u.id}: ${address}`);
-        return res.status(400).json({error:'Invalid wallet address'});
-      }
-    }
     if (user.balance < amt) {
       log('WITHDRAW', `User ${u.id} rejected: insufficient balance (bal=${user.balance} req=${amt})`);
       return res.status(400).json({error:'Insufficient balance'});
@@ -907,12 +869,9 @@ app.post('/api/withdraw', userAuth, async (req, res) => { // Per-user DB limits 
       `INSERT INTO transactions (user_id,type,amount,network,address,fee,note) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [u.id,'withdraw',amt,network,address.trim(),fee,'Processing time: 0–24 hours']
     );
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
-    const ua = (req.headers['user-agent'] || '').slice(0, 80);
-    log('WITHDRAW', `User ${u.id} requested $${amt} to ${address.trim().slice(0,16)}... fee=$${fee} ip=${ip}`);
-    logSecurity('WITHDRAW_SUBMITTED', {user_id: u.id, amount: amt, address: address.slice(0,20), ip, ua});
+    log('WITHDRAW', `User ${u.id} requested $${amt} to ${address.trim().slice(0,16)}... fee=$${fee}`);
     res.json({success:true, fee, message:'Withdrawal submitted. Processing time: 0–24 hours.'});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/api/collect-daily', userAuth, async (req, res) => {
@@ -968,14 +927,17 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
       await db.run(`UPDATE investments SET status='completed' WHERE id=$1`, [inv.id]);
     }
     res.json({success:true, earned:earn, days_done: newDaysDone, completed: newDaysDone >= inv.days_total});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/api/task/complete', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     const {task_key} = req.body; // reward from CLIENT ignored — always use server-side value
-    // [SECURITY] Get reward from DB first, not from client
+    const ex = await db.one(`SELECT * FROM tasks WHERE user_id=$1 AND task_key=$2`, [u.id, task_key]);
+    if (ex?.completed) return res.status(400).json({error:'Already done'});
+
+    // [SECURITY] Get reward from DB, not from client
     const taskCfg = await db.one(`SELECT * FROM tasks_config WHERE task_key=$1 AND is_active=1`, [task_key]);
     if (!taskCfg) return res.status(404).json({error:'Task not found'});
     const reward = parseFloat(taskCfg.reward) || 0;
@@ -996,22 +958,17 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
       }
     }
 
-    // ✅ ATOMIC: INSERT only if not already completed — race condition safe
-    const taskResult = await pool.query(
-      `INSERT INTO tasks (user_id,task_key,completed,completed_at) VALUES ($1,$2,1,NOW())
-       ON CONFLICT (user_id,task_key) DO UPDATE SET completed=1
-       WHERE tasks.completed=0
-       RETURNING id`,
+    await db.run(
+      `INSERT INTO tasks (user_id,task_key,completed,completed_at) VALUES ($1,$2,1,NOW()) ON CONFLICT (user_id,task_key) DO UPDATE SET completed=1`,
       [u.id, task_key]
     );
-    if (taskResult.rowCount === 0) return res.status(400).json({error:'Already done'});
     await db.run(`UPDATE users SET balance=balance+$1, total_earned=total_earned+$1 WHERE id=$2`, [reward, u.id]);
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
       [u.id, 'task_reward', reward, 'completed', 'Task: ' + task_key]
     );
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // Verify task (checks Telegram membership for channel/group tasks)
@@ -1040,7 +997,7 @@ app.post('/api/verify-task', userAuth, async (req, res) => {
 
     // No chat_id set — just trust the user
     res.json({ verified: true });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 
@@ -1057,7 +1014,7 @@ app.get('/api/story-task/status', userAuth, async (req, res) => {
       claimedToday: row ? !!row.claimed : false,
       attempts:     row ? (row.attempts || 0) : 0
     });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error: "Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // ── POST /api/story-task/claim ────────────────────
@@ -1092,16 +1049,16 @@ app.post('/api/story-task/claim', userAuth, async (req, res) => {
       [u.id, today]
     );
 
-    // ✅ FIX: Atomic claim — prevent race condition double-credit
-    const claimResult = await pool.query(
-      `UPDATE story_tasks SET claimed=1, claimed_at=NOW()
-       WHERE user_id=$1 AND claim_date=$2 AND claimed=0
-       RETURNING id`,
+    const row = await db.one(
+      `SELECT attempts, claimed FROM story_tasks WHERE user_id=$1 AND claim_date=$2`,
       [u.id, today]
     );
-    if (claimResult.rowCount === 0) {
-      return res.status(400).json({ error: 'Already claimed today. Come back in 24 hours.' });
-    }
+
+    // Credit reward
+    await db.run(
+      `UPDATE story_tasks SET claimed=1, claimed_at=NOW() WHERE user_id=$1 AND claim_date=$2`,
+      [u.id, today]
+    );
     await db.run(
       `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1 WHERE id=$2`,
       [REWARD, u.id]
@@ -1112,7 +1069,7 @@ app.post('/api/story-task/claim', userAuth, async (req, res) => {
     );
 
     res.json({ success: true, amount: REWARD });
-  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══════════════════════════════════════════
@@ -1192,7 +1149,7 @@ app.get('/api/plans', async (req, res) => {
     `);
     const plans = await db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY id`);
     res.json({plans});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ══════════════════════════════════════════
@@ -1234,7 +1191,7 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
       autoDepCount: autoDepRow.c,
       fraudCount: fraudRow.c,
     });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ══════════════════════════════════════════
@@ -1258,7 +1215,7 @@ app.get('/admin/stat/deposits', adminAuth, async (req, res) => {
     ]);
     const total = parseInt(totalRow.c);
     res.json({ rows, total, currentPage: page, totalPages: Math.ceil(total/limit), limit });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // Withdrawal history (clickable stat)
@@ -1278,7 +1235,7 @@ app.get('/admin/stat/withdrawals', adminAuth, async (req, res) => {
     ]);
     const total = parseInt(totalRow.c);
     res.json({ rows, total, currentPage: page, totalPages: Math.ceil(total/limit), limit });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // All users by balance (clickable stat)
@@ -1293,7 +1250,7 @@ app.get('/admin/stat/balances', adminAuth, async (req, res) => {
     ]);
     const total = parseInt(totalRow.c);
     res.json({ rows, total, currentPage: page, totalPages: Math.ceil(total/limit), limit });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // Daily income total + per-user breakdown
@@ -1316,7 +1273,7 @@ app.get('/admin/stat/daily-income', adminAuth, async (req, res) => {
     const total = parseFloat(totalRow.total);
     const totalUsers = parseInt(countRow.c);
     res.json({ total, rows, totalUsers, currentPage: page, totalPages: Math.ceil(totalUsers/limit), limit });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 
@@ -1333,7 +1290,7 @@ app.get('/admin/deposits', adminAuth, async (req, res) => {
     params.push(limit); q += ` ORDER BY d.created_at DESC LIMIT $${params.length}`;
     const rows = await db.all(q, params);
     res.json({ deposits: rows });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.get('/admin/users', adminAuth, async (req, res) => {
@@ -1388,7 +1345,7 @@ app.get('/admin/users', adminAuth, async (req, res) => {
     });
 
     res.json({users: enriched, total});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // User transaction details with optional status filter
@@ -1410,7 +1367,7 @@ app.get('/admin/user/:id/details', adminAuth, async (req, res) => {
     ]);
     const txs = [...deps, ...withs].sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
     res.json({transactions: txs});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/user/ban', adminAuth, async (req, res) => {
@@ -1418,7 +1375,7 @@ app.post('/admin/user/ban', adminAuth, async (req, res) => {
     const {user_id, reason} = req.body;
     await db.run(`UPDATE users SET is_banned=1, ban_reason=$1 WHERE id=$2`, [reason||'Violated terms', user_id]);
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/user/unban', adminAuth, async (req, res) => {
@@ -1426,7 +1383,7 @@ app.post('/admin/user/unban', adminAuth, async (req, res) => {
     await db.run(`UPDATE users SET is_banned=0, ban_reason=NULL WHERE id=$1`, [req.body.user_id]);
     log('ADMIN', `User ${req.body.user_id} unbanned`);
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // [NEW] Block user from deposits (fraud block)
@@ -1438,7 +1395,7 @@ app.post('/admin/user/deposit-block', adminAuth, async (req, res) => {
     await db.run(`UPDATE users SET blocked_until=$1 WHERE id=$2`, [until, user_id]);
     log('ADMIN', `User ${user_id} deposit-blocked for ${dur}min by admin`);
     res.json({success:true, blocked_until: until});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // [NEW] Unblock user deposits
@@ -1447,7 +1404,7 @@ app.post('/admin/user/deposit-unblock', adminAuth, async (req, res) => {
     await clearFraud(req.body.user_id);
     log('ADMIN', `User ${req.body.user_id} deposit-unblocked by admin`);
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // [NEW] View logs
@@ -1457,28 +1414,20 @@ app.get('/admin/logs', adminAuth, async (req, res) => {
     const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean);
     const last100 = lines.slice(-100).reverse().join('\n');
     res.json({logs: last100});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/user/balance', adminAuth, async (req, res) => {
   try {
-    const {user_id, type} = req.body;
-    const amount = parseFloat(req.body.amount);
-    if (!user_id || isNaN(amount) || amount <= 0) return res.status(400).json({error:'Invalid user_id or amount'});
+    const {user_id, amount, type} = req.body;
     const change = type==='deduct' ? -Math.abs(amount) : Math.abs(amount);
-    // Guard: prevent deduct below zero
-    if (type === 'deduct') {
-      const r = await pool.query(`UPDATE users SET balance=balance+$1 WHERE id=$2 AND balance>=$3 RETURNING id`, [change, user_id, Math.abs(amount)]);
-      if (r.rowCount === 0) return res.status(400).json({error:'Insufficient balance for deduction'});
-    } else {
-      await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [change, user_id]);
-    }
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [change, user_id]);
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
       [user_id, type==='deduct'?'admin_deduct':'admin_add', Math.abs(amount), 'completed', 'Admin adjustment']
     );
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.get('/admin/transactions', adminAuth, async (req, res) => {
@@ -1491,7 +1440,7 @@ app.get('/admin/transactions', adminAuth, async (req, res) => {
     params.push(limit); q += ` ORDER BY t.created_at DESC LIMIT $${params.length}`;
     const txs = await db.all(q, params);
     res.json({transactions: txs});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
@@ -1527,7 +1476,7 @@ app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
     log('ADMIN', `Deposit approved tx=${tx_id} user=${tx.user_id} amt=$${tx.amount}`);
     logSecurity('DEPOSIT_APPROVED', {tx_id, user_id: tx.user_id, amount: tx.amount});
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/deposit/reject', adminAuth, async (req, res) => {
@@ -1540,7 +1489,7 @@ app.post('/admin/deposit/reject', adminAuth, async (req, res) => {
     await db.run(`UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2`, [admin_note||'Rejected by admin', tx_id]);
     log('ADMIN', `Deposit rejected tx=${tx_id} user=${tx.user_id}`);
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
@@ -1561,7 +1510,7 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
     log('WITHDRAW', `APPROVED tx=${tx_id} user=${user_id} amt=$${amount} addr=${(tx.address||'').slice(0,16)}`);
     logSecurity('WITHDRAW_APPROVED', {tx_id, user_id, amount, address: (tx.address||'').slice(0,20)});
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/withdraw/reject', adminAuth, async (req, res) => {
@@ -1582,7 +1531,7 @@ app.post('/admin/withdraw/reject', adminAuth, async (req, res) => {
     log('WITHDRAW', `REJECTED tx=${tx_id} user=${user_id} amt=$${amount} — refunded`);
     logSecurity('WITHDRAW_REJECTED_REFUNDED', {tx_id, user_id, amount});
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ── Admin Tasks ──
@@ -1590,7 +1539,7 @@ app.get('/admin/tasks', adminAuth, async (req, res) => {
   try {
     const tasks = await db.all('SELECT * FROM tasks_config ORDER BY sort_order');
     res.json({tasks});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/tasks/add', adminAuth, async (req, res) => {
@@ -1601,7 +1550,7 @@ app.post('/admin/tasks/add', adminAuth, async (req, res) => {
       [task_key, icon||'⚡', name, reward||1, sort_order||99, link||'', chat_id||'']
     );
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/tasks/edit', adminAuth, async (req, res) => {
@@ -1612,21 +1561,21 @@ app.post('/admin/tasks/edit', adminAuth, async (req, res) => {
       [icon, name, reward, is_active, sort_order, link||'', chat_id||'', id]
     );
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/tasks/delete', adminAuth, async (req, res) => {
   try {
     await db.run('DELETE FROM tasks_config WHERE id=$1', [req.body.id]);
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.get('/admin/plans', adminAuth, async (req, res) => {
   try {
     const plans = await db.all(`SELECT * FROM plans ORDER BY id`);
     res.json({plans});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/plans/add', adminAuth, async (req, res) => {
@@ -1637,7 +1586,7 @@ app.post('/admin/plans/add', adminAuth, async (req, res) => {
       [name,emoji,daily_pct,min_amt,max_amt,duration,daily_limit,reset_hours]
     );
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/plans/edit', adminAuth, async (req, res) => {
@@ -1648,7 +1597,7 @@ app.post('/admin/plans/edit', adminAuth, async (req, res) => {
       [name,emoji,daily_pct,min_amt,max_amt,duration,is_active,daily_limit,reset_hours,id]
     );
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/plans/delete', adminAuth, async (req, res) => {
@@ -1656,7 +1605,7 @@ app.post('/admin/plans/delete', adminAuth, async (req, res) => {
     // Permanently delete the plan
     await db.run(`DELETE FROM plans WHERE id=$1`, [req.body.id]);
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/plan/update-count', adminAuth, async (req, res) => {
@@ -1668,14 +1617,14 @@ app.post('/admin/plan/update-count', adminAuth, async (req, res) => {
     if (count > 100000) count = 100000;
     await db.run(`UPDATE plans SET buy_count = $1 WHERE id = $2`, [count, plan_id]);
     res.json({success:true, count});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.get('/admin/settings', adminAuth, async (req, res) => {
   try {
     const rows = await db.all(`SELECT * FROM settings`);
     res.json(rows.reduce((a,r) => ({...a,[r.key]:r.value}), {}));
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/settings', adminAuth, async (req, res) => {
@@ -1685,24 +1634,20 @@ app.post('/admin/settings', adminAuth, async (req, res) => {
       await db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2`, [k,String(v)]);
     }
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/admin/maintenance', adminAuth, async (req, res) => {
   try {
     await db.run(`INSERT INTO settings (key,value) VALUES ('maintenance',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [req.body.on?'1':'0']);
     res.json({success:true});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ══════════════════════════════════════════
 // REFERRAL STATS (per-level breakdown)
 // ══════════════════════════════════════════
-app.get('/api/referral-stats/:id', userAuth, async (req, res) => {
-  // ✅ FIX: Must be authenticated and can only see own referral stats
-  if (String(req.tgUser.id) !== String(req.params.id)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+app.get('/api/referral-stats/:id', async (req, res) => {
   try {
     const uid = parseInt(req.params.id);
     if (!uid) return res.status(400).json({ error: 'Invalid id' });
@@ -1748,7 +1693,7 @@ app.get('/api/referral-stats/:id', userAuth, async (req, res) => {
       lvl2: { total: lvl2ids.length, active: act2 },
       lvl3: { total: lvl3ids.length, active: act3 },
     });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error: "Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // ══════════════════════════════════════════
@@ -1803,7 +1748,7 @@ app.post('/api/deposit/create', depositLimit, userAuth, async (req, res) => {
     );
 
     res.json({ id: dep.id, unique_amount: dep.unique_amt, address: DEPOSIT_WALLET, network: 'BEP20', expires_at: dep.expires_at });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error: "Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // Semi-auto deposit routes removed
@@ -1822,7 +1767,7 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
       return res.json({ status: 'expired' });
     }
     res.json({ status: dep.status, tx_hash: dep.tx_hash, amount: dep.unique_amt });
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error: "Server error. Please try again."}); }
+  } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // ══════════════════════════════════════════
@@ -1960,7 +1905,7 @@ app.get('/admin/deposit-stats', adminAuth, async (req, res) => {
       ORDER BY MIN(created_at) ASC
     `);
     res.json(rows.map(r => ({ time: r.time, total: parseFloat(r.total) })));
-  } catch(e) { log("ERROR", e.message); res.status(500).json({ error: "Server error. Please try again." }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/leaderboard', async (req, res) => {
@@ -1981,7 +1926,7 @@ app.get('/leaderboard', async (req, res) => {
       rank:         getUserRank(u.active_refs)
     }));
     res.json({ leaderboard: board });
-  } catch(e) { log('ERROR', e.message); res.status(500).json({error: 'Server error. Please try again.'}); }
+  } catch(e) { res.status(500).json({error: e.message}); }
 });
 
 // ══ TOP EARNERS (top 20) ══
@@ -2003,7 +1948,7 @@ app.get('/api/top-earners', async (req, res) => {
       badge:        getUserRank(u.active_refs)
     }));
     res.json({ earners });
-  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ REFERRALS BY LEVEL ══
@@ -2038,7 +1983,7 @@ app.get('/api/referrals/:userId', userAuth, async (req, res) => {
       `, [userId]),
     ]);
     res.json({ level1, level2, level3 });
-  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ ADMIN REFERRAL DETAILS ══
@@ -2080,7 +2025,7 @@ app.get('/admin/referral-details/:userId', adminAuth, async (req, res) => {
       level2: level2.filter(filterFn),
       level3: level3.filter(filterFn),
     });
-  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ══ COLLECT COMMISSION ══
@@ -2091,20 +2036,11 @@ app.post('/api/collect-commission', authLimit, userAuth, async (req, res) => {
     if (!user) return res.status(404).json({error:'Not found'});
     const pending = parseFloat(user.pending_commission || 0);
     if (pending <= 0) return res.status(400).json({error:'No pending commission'});
-    // ✅ FIX: Atomic — only collect if pending_commission still > 0 (race condition guard)
-    const commResult = await pool.query(
-      `UPDATE users SET balance=balance+pending_commission, pending_commission=0
-       WHERE id=$1 AND pending_commission > 0 RETURNING pending_commission as collected`,
-      [u.id]
-    );
-    if (commResult.rowCount === 0) return res.status(400).json({error:'No pending commission'});
-    const actualCollected = parseFloat(commResult.rows[0].collected || pending);
-    // override pending with actual DB value
-    const collectedAmt = actualCollected > 0 ? actualCollected : pending;
+    await db.run(`UPDATE users SET balance=balance+$1, pending_commission=0 WHERE id=$2`, [pending, u.id]);
     await db.run(`UPDATE commissions SET status='collected' WHERE user_id=$1 AND status='pending'`, [u.id]);
-    await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',collectedAmt,'completed','Referral commission collected']);
-    res.json({success:true, collected:collectedAmt});
-  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+    await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',pending,'completed','Referral commission collected']);
+    res.json({success:true, collected:pending});
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // ══════════════════════════════════════════
@@ -2117,7 +2053,6 @@ app.use((err, req, res, next) => {
   }
   log('ERROR', `${req.method} ${req.path} — ${err.message}`);
   if (!res.headersSent) {
-    // ✅ FIX: Never expose internal error details to client
     res.status(500).json({ error: 'Internal server error' });
   }
 });
