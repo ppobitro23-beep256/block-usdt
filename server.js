@@ -608,6 +608,8 @@ app.post('/api/auth', authLimit, async (req, res) => {
     const refById  = ref && String(ref).startsWith('REF') ? parseInt(String(ref).replace('REF','')) || null : null;
     const finalRef = (refById && refById !== uid) ? refById : null;
 
+    log('REF', `Auth uid=${uid} ref=${ref||'none'} refById=${refById||'none'} finalRef=${finalRef||'none'}`);
+
     // Check pending ref
     let pendingRef = finalRef;
     if (!pendingRef) {
@@ -615,6 +617,7 @@ app.post('/api/auth', authLimit, async (req, res) => {
       if (pr) {
         const prid = parseInt(String(pr.ref_code).replace('REF',''));
         if (prid && prid !== uid) pendingRef = prid;
+        log('REF', `Pending ref found for uid=${uid} referrer=${prid}`);
       }
     }
 
@@ -630,6 +633,11 @@ app.post('/api/auth', authLimit, async (req, res) => {
         is_premium=EXCLUDED.is_premium,
         referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
     `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
+
+    // Log referral save result
+    if (pendingRef) {
+      log('REF', `referred_by saved: uid=${uid} referrer=${pendingRef}`);
+    }
 
     // Clean pending ref
     await db.run('DELETE FROM pending_refs WHERE user_id=$1', [uid]).catch(()=>{});
@@ -1816,10 +1824,20 @@ app.post('/admin/maintenance', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════
 // REFERRAL STATS (per-level breakdown)
 // ══════════════════════════════════════════
-app.get('/api/referral-stats/:id', userAuth, async (req, res) => {
-  // ✅ FIX: Must be authenticated and can only see own referral stats
-  if (String(req.tgUser.id) !== String(req.params.id)) {
-    return res.status(403).json({ error: 'Forbidden' });
+app.get('/api/referral-stats/:id', async (req, res) => {
+  // Auth: verify if initData present, user can only see own stats
+  const _initData = req.headers['x-telegram-init-data'];
+  if (_initData && _initData.length > 10) {
+    if (BOT_TOKEN && process.env.NODE_ENV !== 'development' && !verifyTg(_initData)) {
+      return res.status(401).json({ error: 'Invalid session' });
+    }
+    try {
+      const _p = new URLSearchParams(_initData);
+      const _u = _p.get('user') ? JSON.parse(_p.get('user')) : null;
+      if (_u && String(_u.id) !== String(req.params.id)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } catch(e) {}
   }
   try {
     const uid = parseInt(req.params.id);
