@@ -783,16 +783,16 @@ app.post('/api/invest', userAuth, async (req, res) => {
         const row = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [currentId]);
         if (!row || !row.referred_by) break;
         const referrerId = row.referred_by;
-        // [COMMISSION GATE] Only pay commission if referrer has made at least one investment
-        const referrerRow = await db.one(`SELECT is_active_ref FROM users WHERE id=$1`, [referrerId]);
-        if (!referrerRow || !referrerRow.is_active_ref) {
-          log('COMM', `Skipped level ${lvl+1} commission for user ${referrerId} — not an active investor`);
+        // Referrer must not be banned
+        const referrerRow = await db.one(`SELECT is_banned FROM users WHERE id=$1`, [referrerId]);
+        if (!referrerRow || referrerRow.is_banned) {
           currentId = referrerId;
           continue;
         }
         const comm = +(amount * pcts[lvl]).toFixed(4);
         await db.run(`UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`, [comm, referrerId]);
         await db.run(`INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1,$2,$3,$4)`, [referrerId, u.id, lvl+1, comm]);
+        log('COMM', `Level ${lvl+1} commission $${comm} → user ${referrerId} (from ${u.id})`);
         currentId = referrerId;
       }
     } catch(e) { console.log('Commission error:', e.message); }
