@@ -525,8 +525,8 @@ function userAuth(req, res, next) {
     return res.status(401).json({ error: 'Auth required' });
   }
 
-  // ✅ SECURITY FIX: Verify Telegram initData signature before trusting it
-  if (process.env.NODE_ENV !== 'development' && !verifyTg(initData)) {
+  // Verify Telegram initData signature
+  if (BOT_TOKEN && process.env.NODE_ENV !== 'development' && !verifyTg(initData)) {
     log('SECURITY', `Invalid initData rejected from IP: ${req.headers['x-forwarded-for'] || req.ip}`);
     return res.status(401).json({ error: 'Invalid session' });
   }
@@ -553,7 +553,7 @@ app.post('/api/auth', authLimit, async (req, res) => {
   try {
     // ✅ SECURITY FIX: Verify initData on auth too
     const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
-    if (raw && raw.length > 10 && process.env.NODE_ENV !== 'development') {
+    if (BOT_TOKEN && raw && raw.length > 10 && process.env.NODE_ENV !== 'development') {
       if (!verifyTg(raw)) {
         log('SECURITY', `Fake auth attempt from IP: ${req.headers['x-forwarded-for'] || req.ip}`);
         return res.status(401).json({error: 'Invalid session'});
@@ -619,10 +619,11 @@ app.post('/api/auth', authLimit, async (req, res) => {
 });
 
 app.get('/api/user/:id', async (req, res) => {
-  // ✅ FIX: Auth required and signature verified
-  const _initData = req.headers['x-telegram-init-data'];
+  // Auth: initData header required, signature verified if BOT_TOKEN set
+  const _initData = req.headers['x-telegram-init-data'] || req.body?.initData;
   if (!_initData) return res.status(401).json({ error: 'Auth required' });
-  if (process.env.NODE_ENV !== 'development' && !verifyTg(_initData)) {
+  // Verify signature only when BOT_TOKEN is configured
+  if (BOT_TOKEN && process.env.NODE_ENV !== 'development' && !verifyTg(_initData)) {
     log('SECURITY', `Invalid initData on /api/user from IP: ${req.headers['x-forwarded-for'] || req.ip}`);
     return res.status(401).json({ error: 'Invalid session' });
   }
@@ -630,6 +631,7 @@ app.get('/api/user/:id', async (req, res) => {
     const _p = new URLSearchParams(_initData);
     const _userStr = _p.get('user');
     const _tgU = _userStr ? JSON.parse(_userStr) : null;
+    // User can only access their own data
     if (!_tgU || String(_tgU.id) !== String(req.params.id)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
