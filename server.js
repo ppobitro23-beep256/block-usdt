@@ -529,17 +529,20 @@ function adminAuth(req, res, next) {
 // ══════════════════════════════════════════
 app.post('/api/auth', async (req, res) => {
   try {
-    // Get user from any source
-    let u = req.body?.tgUser || req.body?.user || null;
-    if (!u) {
-      const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
-      if (raw && raw.length > 10) {
-        try {
-          const p = new URLSearchParams(raw);
-          const us = p.get('user');
-          if (us) u = JSON.parse(us);
-        } catch(e) {}
-      }
+    // Priority: parse from initData header first (always fresh from Telegram)
+    // Fallback to body.tgUser (may be stale cached data from WebApp)
+    let u = null;
+    const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
+    if (raw && raw.length > 10) {
+      try {
+        const p = new URLSearchParams(raw);
+        const us = p.get('user');
+        if (us) u = JSON.parse(us);
+      } catch(e) {}
+    }
+    // Fallback to body if initData parse failed
+    if (!u || !u.id) {
+      u = req.body?.tgUser || req.body?.user || null;
     }
     if (!u || !u.id) return res.status(400).json({error:'No user data'});
 
@@ -564,9 +567,9 @@ app.post('/api/auth', async (req, res) => {
       INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
       ON CONFLICT (id) DO UPDATE SET
-        first_name=EXCLUDED.first_name,
-        last_name=EXCLUDED.last_name,
-        username=EXCLUDED.username,
+        first_name=CASE WHEN EXCLUDED.first_name != '' THEN EXCLUDED.first_name ELSE users.first_name END,
+        last_name=CASE WHEN EXCLUDED.last_name != '' THEN EXCLUDED.last_name ELSE users.last_name END,
+        username=CASE WHEN EXCLUDED.username != '' THEN EXCLUDED.username ELSE users.username END,
         language=EXCLUDED.language,
         is_premium=EXCLUDED.is_premium,
         referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
