@@ -2088,27 +2088,27 @@ app.get('/api/referral-stats/:id', async (req, res) => {
     const uid = parseInt(req.params.id);
     if (!uid) return res.status(400).json({ error: 'Invalid id' });
 
-    // Level 1 — direct referrals
-    const lvl1rows = await db.all(`SELECT id FROM users WHERE referred_by=$1`, [uid]);
-    const lvl1ids  = lvl1rows.map(r => r.id);
+    // Get user VIP to know how many levels to scan
+    const { vip } = await getUserVipStatus(uid, 4);
+    const maxLvl = vip.maxLevels || 3;
 
-    // Level 2
-    let lvl2ids = [];
-    if (lvl1ids.length > 0) {
-      const lvl2rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl1ids]);
-      lvl2ids = lvl2rows.map(r => r.id);
+    // BFS up to maxLvl levels
+    const lvlIds = [];
+    let currentIds = [uid];
+    for (let lvl = 0; lvl < maxLvl; lvl++) {
+      if (!currentIds.length) { lvlIds.push([]); continue; }
+      const rows = await db.all(
+        `SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`,
+        [currentIds]
+      );
+      const nextIds = rows.map(r => parseInt(r.id));
+      lvlIds.push(nextIds);
+      currentIds = nextIds;
     }
 
-    // Level 3
-    let lvl3ids = [];
-    if (lvl2ids.length > 0) {
-      const lvl3rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl2ids]);
-      lvl3ids = lvl3rows.map(r => r.id);
-    }
-
-    // Active = has at least one active investment (strict rule, same as plan section)
+    // Count active per level
     const countActive = async (ids) => {
-      if (!ids.length) return 0;
+      if (!ids || !ids.length) return 0;
       const r = await db.one(
         `SELECT COUNT(DISTINCT user_id) as cnt FROM investments WHERE user_id = ANY($1::bigint[]) AND status='active'`,
         [ids]
@@ -2116,19 +2116,17 @@ app.get('/api/referral-stats/:id', async (req, res) => {
       return parseInt(r.cnt) || 0;
     };
 
-    const [act1, act2, act3] = await Promise.all([
-      countActive(lvl1ids),
-      countActive(lvl2ids),
-      countActive(lvl3ids),
-    ]);
+    const activePerLvl = await Promise.all(lvlIds.map(function(ids) { return countActive(ids); }));
 
-    res.json({
-      total: lvl1ids.length + lvl2ids.length + lvl3ids.length,
-      total_active: act1 + act2 + act3,
-      lvl1: { total: lvl1ids.length, active: act1 },
-      lvl2: { total: lvl2ids.length, active: act2 },
-      lvl3: { total: lvl3ids.length, active: act3 },
-    });
+    const totalAll    = lvlIds.reduce(function(s, ids) { return s + ids.length; }, 0);
+    const totalActive = activePerLvl.reduce(function(s, n) { return s + n; }, 0);
+
+    const result = { total: totalAll, total_active: totalActive, max_levels: maxLvl };
+    for (let i = 0; i < lvlIds.length; i++) {
+      result['lvl' + (i + 1)] = { total: lvlIds[i].length, active: activePerLvl[i] };
+    }
+
+    res.json(result);
   } catch(e) { log("ERROR", e.message); res.status(500).json({error: "Server error. Please try again."}); }
 });
 
