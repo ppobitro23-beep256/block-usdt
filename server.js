@@ -151,7 +151,7 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 // Safety check — crash early if critical env vars missing
 if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.exit(1); }
 if (!ADMIN_SECRET) { console.error('❌ ADMIN_SECRET env var missing'); process.exit(1); }
-if (!BOT_TOKEN)    { console.error('❌ BOT_TOKEN env var missing'); process.exit(1); }
+if (!BOT_TOKEN)    { console.warn('⚠️ BOT_TOKEN env var missing — Telegram auth verification disabled'); }
 if (!process.env.WEBAPP_URL) { console.warn('⚠️ WEBAPP_URL not set — using default https://myusdtapp.xyz/'); }
 
 // ── CORS — allow Cloudflare Pages frontend + all Telegram origins ──────
