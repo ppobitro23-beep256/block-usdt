@@ -2461,7 +2461,7 @@ app.post('/admin/broadcasts', adminAuth, async (req, res) => {
     if (!title || !message) return res.status(400).json({error:'Title and message required'});
 
     // Count total users
-    const totalRow = await db.one(`SELECT COUNT(*) as cnt FROM users WHERE is_banned = FALSE OR is_banned IS NULL`);
+    const totalRow = await db.one(`SELECT COUNT(*) as cnt FROM users WHERE is_banned != 1 OR is_banned IS NULL`);
     const total = parseInt(totalRow?.cnt || 0);
 
     const r = await pool.query(
@@ -2512,7 +2512,7 @@ async function sendBroadcastNow(broadcastId) {
   log('BROADCAST', `Starting broadcast id=${broadcastId} title="${bc.title}"`);
 
   // Get all users
-  const users = await db.all(`SELECT id FROM users WHERE is_banned = FALSE OR is_banned IS NULL`);
+  const users = await db.all(`SELECT id FROM users WHERE is_banned != 1 OR is_banned IS NULL`);
   const total = users.length;
 
   let sent = 0, failed = 0;
