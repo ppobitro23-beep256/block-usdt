@@ -152,6 +152,7 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.exit(1); }
 if (!ADMIN_SECRET) { console.error('❌ ADMIN_SECRET env var missing'); process.exit(1); }
 if (!BOT_TOKEN)    { console.error('❌ BOT_TOKEN env var missing'); process.exit(1); }
+if (!process.env.WEBAPP_URL) { console.warn('⚠️ WEBAPP_URL not set — using default https://myusdtapp.xyz/'); }
 
 // ── CORS — allow Cloudflare Pages frontend + all Telegram origins ──────
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'https://block-usdt.pages.dev';
@@ -442,6 +443,47 @@ async function setupDB() {
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS chat_id TEXT DEFAULT ''`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS app_language VARCHAR(10) DEFAULT ''`),
     db.run(`CREATE INDEX IF NOT EXISTS idx_pending_refs_user ON pending_refs (user_id)`),
+    // Broadcast system
+    db.run(`CREATE TABLE IF NOT EXISTS broadcasts (
+      id           SERIAL PRIMARY KEY,
+      title        TEXT NOT NULL,
+      message      TEXT NOT NULL,
+      emoji        TEXT DEFAULT '📢',
+      btn_text     TEXT DEFAULT 'Open App',
+      status       TEXT DEFAULT 'pending',
+      schedule_at  TIMESTAMP DEFAULT NULL,
+      started_at   TIMESTAMP DEFAULT NULL,
+      finished_at  TIMESTAMP DEFAULT NULL,
+      total        INT DEFAULT 0,
+      sent         INT DEFAULT 0,
+      failed       INT DEFAULT 0,
+      created_at   TIMESTAMP DEFAULT NOW()
+    )`),
+    // Notice/Broadcast system
+    db.run(`CREATE TABLE IF NOT EXISTS notices (
+      id           SERIAL PRIMARY KEY,
+      title        TEXT NOT NULL,
+      message      TEXT NOT NULL,
+      emoji        TEXT DEFAULT '📢',
+      btn_text     TEXT DEFAULT '',
+      btn_link     TEXT DEFAULT '',
+      is_active    BOOLEAN DEFAULT FALSE,
+      repeat_mode  TEXT DEFAULT 'once',
+      schedule_at  TIMESTAMP DEFAULT NULL,
+      expire_at    TIMESTAMP DEFAULT NULL,
+      poster_image TEXT DEFAULT NULL,
+      created_at   TIMESTAMP DEFAULT NOW(),
+      updated_at   TIMESTAMP DEFAULT NOW()
+    )`),
+    db.run(`ALTER TABLE notices ADD COLUMN IF NOT EXISTS poster_image TEXT DEFAULT NULL`),
+    db.run(`CREATE TABLE IF NOT EXISTS notice_stats (
+      id          SERIAL PRIMARY KEY,
+      notice_id   INT NOT NULL,
+      user_id     BIGINT NOT NULL,
+      action      TEXT NOT NULL,
+      created_at  TIMESTAMP DEFAULT NOW(),
+      UNIQUE(notice_id, user_id, action)
+    )`),
     // Wallet address bind system
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS withdraw_address TEXT DEFAULT NULL`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_locked BOOLEAN DEFAULT FALSE`),
@@ -2395,6 +2437,343 @@ app.get('/admin/address-logs', adminAuth, async (req, res) => {
     params.push(limit); q += ` ORDER BY l.created_at DESC LIMIT $${params.length}`;
     const logs = await db.all(q, params);
     res.json({logs});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+
+
+// ══════════════════════════════════════════
+// TELEGRAM BOT BROADCAST SYSTEM
+// ══════════════════════════════════════════
+
+// GET all broadcasts
+app.get('/admin/broadcasts', adminAuth, async (req, res) => {
+  try {
+    const rows = await db.all(`SELECT * FROM broadcasts ORDER BY created_at DESC LIMIT 20`);
+    res.json({broadcasts: rows || []});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// POST create broadcast
+app.post('/admin/broadcasts', adminAuth, async (req, res) => {
+  try {
+    const { title, message, emoji, btn_text, schedule_at } = req.body;
+    if (!title || !message) return res.status(400).json({error:'Title and message required'});
+
+    // Count total users
+    const totalRow = await db.one(`SELECT COUNT(*) as cnt FROM users WHERE is_banned = FALSE OR is_banned IS NULL`);
+    const total = parseInt(totalRow?.cnt || 0);
+
+    const r = await pool.query(
+      `INSERT INTO broadcasts (title, message, emoji, btn_text, total, schedule_at, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [title, message, emoji||'📢', btn_text||'Open App', total,
+       schedule_at || null, schedule_at ? 'scheduled' : 'pending']
+    );
+    const id = r.rows[0].id;
+    log('ADMIN', `Broadcast created id=${id} total=${total}`);
+
+    // If no schedule, send immediately
+    if (!schedule_at) {
+      sendBroadcastNow(id).catch(e => log('BROADCAST', 'Error: ' + e.message));
+    }
+
+    res.json({success:true, id, total});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// DELETE broadcast
+app.delete('/admin/broadcasts/:id', adminAuth, async (req, res) => {
+  try {
+    await db.run(`DELETE FROM broadcasts WHERE id=$1`, [req.params.id]);
+    res.json({success:true});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// POST send now (manual trigger)
+app.post('/admin/broadcasts/:id/send', adminAuth, async (req, res) => {
+  try {
+    const bc = await db.one(`SELECT * FROM broadcasts WHERE id=$1`, [req.params.id]);
+    if (!bc) return res.status(404).json({error:'Not found'});
+    if (bc.status === 'sending') return res.status(400).json({error:'Already sending'});
+    if (bc.status === 'done') return res.status(400).json({error:'Already sent'});
+    res.json({success:true, message:'Broadcast started'});
+    sendBroadcastNow(req.params.id).catch(e => log('BROADCAST', 'Error: ' + e.message));
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// Background broadcast sender
+async function sendBroadcastNow(broadcastId) {
+  const bc = await db.one(`SELECT * FROM broadcasts WHERE id=$1`, [broadcastId]);
+  if (!bc) return;
+
+  // Mark as sending
+  await db.run(`UPDATE broadcasts SET status='sending', started_at=NOW() WHERE id=$1`, [broadcastId]);
+  log('BROADCAST', `Starting broadcast id=${broadcastId} title="${bc.title}"`);
+
+  // Get all users
+  const users = await db.all(`SELECT id FROM users WHERE is_banned = FALSE OR is_banned IS NULL`);
+  const total = users.length;
+
+  let sent = 0, failed = 0;
+
+  const WEBAPP_URL = process.env.WEBAPP_URL || 'https://myusdtapp.xyz/';
+
+  for (const user of users) {
+    try {
+      const keyboard = {
+        inline_keyboard: [[
+          { text: '🚀 ' + (bc.btn_text || 'Open App'), web_app: { url: WEBAPP_URL } }
+        ]]
+      };
+
+      const text = (bc.emoji || '📢') + ' <b>' + bc.title + '</b>\n\n' + bc.message;
+
+      // Use Node built-in https (works on all Node versions)
+      const postData = JSON.stringify({
+        chat_id: user.id, text, parse_mode: 'HTML', reply_markup: keyboard
+      });
+      await new Promise((resolve) => {
+        const https = require('https');
+        const req = https.request({
+          hostname: 'api.telegram.org',
+          path: `/bot${BOT_TOKEN}/sendMessage`,
+          method: 'POST',
+          headers: {'Content-Type':'application/json','Content-Length':Buffer.byteLength(postData)}
+        }, (res) => {
+          let body = '';
+          res.on('data', d => body += d);
+          res.on('end', () => {
+            try { const d = JSON.parse(body); if (d.ok) sent++; else failed++; }
+            catch(e) { failed++; }
+            resolve();
+          });
+        });
+        req.on('error', () => { failed++; resolve(); });
+        req.write(postData);
+        req.end();
+      });
+    } catch(e) { failed++; }
+
+    // Update progress every 20 users
+    if ((sent + failed) % 20 === 0) {
+      await db.run(
+        `UPDATE broadcasts SET sent=$1, failed=$2 WHERE id=$3`,
+        [sent, failed, broadcastId]
+      ).catch(()=>{});
+    }
+
+    // Rate limit — Telegram allows ~30 msg/sec
+    await new Promise(r => setTimeout(r, 40));
+  }
+
+  // Final update
+  await db.run(
+    `UPDATE broadcasts SET status='done', finished_at=NOW(), sent=$1, failed=$2, total=$3 WHERE id=$4`,
+    [sent, failed, total, broadcastId]
+  );
+  log('BROADCAST', `Done id=${broadcastId} sent=${sent} failed=${failed} total=${total}`);
+}
+
+// Cron: check scheduled broadcasts every minute
+setInterval(async () => {
+  try {
+    // Atomic claim: only pick up if still 'scheduled' — prevents double-send
+    const claimed = await pool.query(
+      `UPDATE broadcasts SET status='sending', started_at=NOW()
+       WHERE status='scheduled' AND schedule_at <= NOW()
+       RETURNING id`
+    );
+    for (const b of (claimed.rows||[])) {
+      sendBroadcastNow(b.id).catch(e => log('BROADCAST', 'Scheduled error: ' + e.message));
+    }
+  } catch(e) {}
+}, 60000);
+
+// ══════════════════════════════════════════
+// NOTICE / BROADCAST SYSTEM
+// ══════════════════════════════════════════
+
+// GET active notice for user
+app.get('/api/notice', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const now = new Date().toISOString();
+
+    // Get active notice (scheduled and not expired)
+    const notice = await db.one(`
+      SELECT * FROM notices
+      WHERE is_active = TRUE
+        AND (schedule_at IS NULL OR schedule_at <= NOW())
+        AND (expire_at IS NULL OR expire_at > NOW())
+      ORDER BY created_at DESC LIMIT 1
+    `);
+    if (!notice) return res.json({ notice: null });
+
+    // Check repeat mode
+    if (notice.repeat_mode === 'once') {
+      const seen = await db.one(
+        `SELECT id FROM notice_stats WHERE notice_id=$1 AND user_id=$2 AND action='seen'`,
+        [notice.id, u.id]
+      );
+      if (seen) return res.json({ notice: null }); // already seen once
+    } else if (notice.repeat_mode === 'daily') {
+      const seen = await db.one(
+        `SELECT id FROM notice_stats WHERE notice_id=$1 AND user_id=$2 AND action='seen' AND created_at > NOW() - INTERVAL '24 hours'`,
+        [notice.id, u.id]
+      );
+      if (seen) return res.json({ notice: null });
+    }
+    // 'every_login' = always show
+
+    res.json({ notice });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// POST track notice action (seen/click/dismiss)
+app.post('/api/notice/track', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { notice_id, action } = req.body;
+    if (!notice_id || !action) return res.status(400).json({error:'Invalid'});
+    await pool.query(
+      `INSERT INTO notice_stats (notice_id, user_id, action) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+      [notice_id, u.id, action]
+    );
+    res.json({success:true});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// ── ADMIN NOTICE ROUTES ──
+
+// GET all notices
+app.get('/admin/notices', adminAuth, async (req, res) => {
+  try {
+    const notices = await db.all(`SELECT * FROM notices ORDER BY created_at DESC`);
+    // Get stats for each
+    const withStats = await Promise.all((notices||[]).map(async (n) => {
+      const stats = await pool.query(
+        `SELECT action, COUNT(*) as cnt FROM notice_stats WHERE notice_id=$1 GROUP BY action`,
+        [n.id]
+      );
+      const s = {};
+      (stats.rows||[]).forEach(r => { s[r.action] = parseInt(r.cnt); });
+      return { ...n, stats: { seen: s.seen||0, click: s.click||0, dismiss: s.dismiss||0 } };
+    }));
+    res.json({notices: withStats});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// POST create notice
+app.post('/admin/notices', adminAuth, async (req, res) => {
+  try {
+    const { title, message, emoji, btn_text, btn_link, is_active, repeat_mode, schedule_at, expire_at, poster_image } = req.body;
+    if (!title || !message) return res.status(400).json({error:'Title and message required'});
+
+    // Validate poster_image if provided (must be base64 data URL, max 2MB)
+    if (poster_image && poster_image.length > 2 * 1024 * 1024 * 1.37) {
+      return res.status(400).json({error:'Poster image too large (max 2MB)'});
+    }
+    if (poster_image && !poster_image.startsWith('data:image/')) {
+      return res.status(400).json({error:'Invalid image format'});
+    }
+
+    // Only one active notice at a time
+    if (is_active) {
+      await db.run(`UPDATE notices SET is_active=FALSE`);
+    }
+
+    const r = await pool.query(
+      `INSERT INTO notices (title, message, emoji, btn_text, btn_link, is_active, repeat_mode, schedule_at, expire_at, poster_image)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+      [title, message, emoji||'📢', btn_text||'', btn_link||'', !!is_active,
+       repeat_mode||'once',
+       schedule_at || null,
+       expire_at || null,
+       poster_image || null]
+    );
+    log('ADMIN', `Notice created id=${r.rows[0].id} title="${title}" active=${is_active}`);
+    res.json({success:true, id: r.rows[0].id});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// PUT update notice
+app.put('/admin/notices/:id', adminAuth, async (req, res) => {
+  try {
+    const { title, message, emoji, btn_text, btn_link, is_active, repeat_mode, schedule_at, expire_at, poster_image } = req.body;
+    const id = req.params.id;
+
+    // Validate poster if provided
+    if (poster_image && poster_image.length > 2 * 1024 * 1024 * 1.37) {
+      return res.status(400).json({error:'Poster image too large (max 2MB)'});
+    }
+    if (poster_image && !poster_image.startsWith('data:image/')) {
+      return res.status(400).json({error:'Invalid image format'});
+    }
+
+    if (is_active) {
+      await db.run(`UPDATE notices SET is_active=FALSE WHERE id!=$1`, [id]);
+    }
+
+    // Only update poster_image if provided (null = keep existing, '' = clear)
+    const posterClause = poster_image !== undefined
+      ? ', poster_image=$10'
+      : '';
+    const params = [title, message, emoji||'📢', btn_text||'', btn_link||'', !!is_active,
+       repeat_mode||'once', schedule_at||null, expire_at||null];
+    if (poster_image !== undefined) params.push(poster_image || null);
+    params.push(id);
+
+    await pool.query(
+      `UPDATE notices SET title=$1, message=$2, emoji=$3, btn_text=$4, btn_link=$5,
+       is_active=$6, repeat_mode=$7, schedule_at=$8, expire_at=$9${posterClause}, updated_at=NOW()
+       WHERE id=$${params.length}`,
+      params
+    );
+    log('ADMIN', `Notice updated id=${id}`);
+    res.json({success:true});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// DELETE notice
+app.delete('/admin/notices/:id', adminAuth, async (req, res) => {
+  try {
+    await db.run(`DELETE FROM notice_stats WHERE notice_id=$1`, [req.params.id]);
+    await db.run(`DELETE FROM notices WHERE id=$1`, [req.params.id]);
+    log('ADMIN', `Notice deleted id=${req.params.id}`);
+    res.json({success:true});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// PATCH toggle active
+app.patch('/admin/notices/:id/toggle', adminAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const notice = await db.one(`SELECT is_active FROM notices WHERE id=$1`, [id]);
+    if (!notice) return res.status(404).json({error:'Not found'});
+    const newState = !notice.is_active;
+    if (newState) await db.run(`UPDATE notices SET is_active=FALSE`);
+    await db.run(`UPDATE notices SET is_active=$1, updated_at=NOW() WHERE id=$2`, [newState, id]);
+    res.json({success:true, is_active: newState});
+  } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// GET notice stats
+app.get('/admin/notices/:id/stats', adminAuth, async (req, res) => {
+  try {
+    const totalUsers = await db.one(`SELECT COUNT(*) as cnt FROM users`);
+    const stats = await pool.query(
+      `SELECT action, COUNT(DISTINCT user_id) as cnt FROM notice_stats WHERE notice_id=$1 GROUP BY action`,
+      [req.params.id]
+    );
+    const s = {};
+    (stats.rows||[]).forEach(r => { s[r.action] = parseInt(r.cnt); });
+    res.json({
+      total_users: parseInt(totalUsers?.cnt||0),
+      seen: s.seen||0,
+      click: s.click||0,
+      dismiss: s.dismiss||0
+    });
   } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
 });
 
