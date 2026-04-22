@@ -2375,56 +2375,125 @@ app.get('/api/vip-status', userAuth, async (req, res) => {
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
 });
 
-// GET /api/team-deposit — team deposit breakdown per level
+// GET /api/team-deposit — paginated, searchable, level-filtered team deposit
+// Query params: level (1-7), page (default 1), limit (default 15), search (username/name/uid)
 app.get('/api/team-deposit', userAuth, async (req, res) => {
   try {
-    const u = req.tgUser;
-    const { vip } = await getUserVipStatus(u.id);
-    const maxLvl = vip.maxLevels;
+    const u       = req.tgUser;
+    const { vip } = await getUserVipStatus(u.id, 4);
+    const maxLvl  = vip.maxLevels || 3;
 
-    // BFS tree: up to maxLevels deep
-    let byLevel = [];
+    const filterLvl = parseInt(req.query.level) || 0;   // 0 = all
+    const page      = Math.max(1, parseInt(req.query.page) || 1);
+    const limit     = Math.min(50, parseInt(req.query.limit) || 15);
+    const offset    = (page - 1) * limit;
+    const search    = (req.query.search || '').trim().toLowerCase();
+
+    // BFS to build level id maps
+    const lvlIds = [];
     let currentIds = [parseInt(u.id)];
-
-    for (let lvl = 1; lvl <= maxLvl; lvl++) {
-      if (!currentIds.length) break;
+    for (let lvl = 0; lvl < maxLvl; lvl++) {
+      if (!currentIds.length) { lvlIds.push([]); continue; }
       const rows = await db.all(
-        `SELECT u.id, u.first_name, u.username, u.uid,
-                COALESCE(SUM(CASE WHEN i.status IN ('active','completed') THEN i.amount ELSE 0 END),0) as invested,
-                (SELECT plan_name FROM investments
-                 WHERE user_id=u.id AND status='active'
-                 ORDER BY id DESC LIMIT 1) as top_plan
-         FROM users u
-         LEFT JOIN investments i ON i.user_id=u.id
-         WHERE u.referred_by = ANY($1::bigint[])
-         GROUP BY u.id, u.first_name, u.username, u.uid`,
-        [currentIds]
+        `SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [currentIds]
       );
-      byLevel.push({ level: lvl, members: rows });
-      currentIds = rows.map(r => r.id);
+      const nextIds = rows.map(r => parseInt(r.id));
+      lvlIds.push(nextIds);
+      currentIds = nextIds;
     }
 
-    // Totals
-    const totalDeposit = byLevel.reduce((sum, lvl) => {
-      return sum + lvl.members.reduce((s, m) => s + parseFloat(m.invested || 0), 0);
-    }, 0);
+    // Summary: totals per level
+    const levelSummary = [];
+    let grandTotal = 0;
+    let grandMembers = 0;
+    let grandActive = 0;
+
+    for (let i = 0; i < lvlIds.length; i++) {
+      const ids = lvlIds[i];
+      if (!ids.length) {
+        levelSummary.push({ level: i+1, count: 0, total: 0, active: 0 });
+        continue;
+      }
+      const r = await db.one(
+        `SELECT COALESCE(SUM(CASE WHEN i.status IN ('active','completed') THEN i.amount ELSE 0 END),0) as total,
+                COUNT(DISTINCT CASE WHEN i.status='active' THEN i.user_id END) as active
+         FROM investments i WHERE i.user_id = ANY($1::bigint[])`,
+        [ids]
+      );
+      const total  = parseFloat(r.total) || 0;
+      const active = parseInt(r.active) || 0;
+      levelSummary.push({ level: i+1, count: ids.length, total: +total.toFixed(2), active });
+      grandTotal   += total;
+      grandMembers += ids.length;
+      grandActive  += active;
+    }
+
+    // Determine which level(s) to fetch members for
+    const fetchLevels = filterLvl > 0 && filterLvl <= maxLvl
+      ? [filterLvl - 1]          // 0-indexed
+      : lvlIds.map((_, i) => i); // all levels
+
+    // Build combined member list with level tag
+    let memberRows = [];
+    for (const li of fetchLevels) {
+      const ids = lvlIds[li];
+      if (!ids || !ids.length) continue;
+
+      // Build search filter
+      let whereExtra = '';
+      const params = [ids];
+      if (search) {
+        whereExtra = ` AND (LOWER(u.first_name) LIKE $2 OR LOWER(u.username) LIKE $2 OR CAST(u.uid AS TEXT) LIKE $2)`;
+        params.push('%' + search + '%');
+      }
+
+      const rows = await db.all(
+        `SELECT u.id, u.first_name, u.username, u.uid, u.created_at,
+                COALESCE(SUM(CASE WHEN i.status IN ('active','completed') THEN i.amount ELSE 0 END),0) as invested,
+                COUNT(CASE WHEN i.status='active' THEN 1 END) as active_plans,
+                (SELECT plan_name FROM investments WHERE user_id=u.id AND status='active' ORDER BY id DESC LIMIT 1) as top_plan
+         FROM users u
+         LEFT JOIN investments i ON i.user_id=u.id
+         WHERE u.id = ANY($1::bigint[])${whereExtra}
+         GROUP BY u.id, u.first_name, u.username, u.uid, u.created_at
+         ORDER BY invested DESC`,
+        params
+      );
+      rows.forEach(r => { r._level = li + 1; memberRows.push(r); });
+    }
+
+    // Sort by invested desc across levels, then paginate
+    memberRows.sort((a, b) => parseFloat(b.invested||0) - parseFloat(a.invested||0));
+    const totalFiltered = memberRows.length;
+    const paginatedRows = memberRows.slice(offset, offset + limit);
 
     res.json({
-      total_deposit: +totalDeposit.toFixed(2),
-      max_levels:    maxLvl,
-      levels:        byLevel.map(l => ({
-        level:   l.level,
-        count:   l.members.length,
-        total:   +l.members.reduce((s, m) => s + parseFloat(m.invested||0), 0).toFixed(2),
-        members: l.members.map(m => ({
-          id:        m.id,
-          name:      m.first_name || 'User',
-          username:  m.username || null,
-          uid:       m.uid || null,
-          invested:  +parseFloat(m.invested||0).toFixed(2),
-          top_plan:  m.top_plan || null,
-        }))
-      }))
+      summary: {
+        total_deposit: +grandTotal.toFixed(2),
+        total_members: grandMembers,
+        active_investors: grandActive,
+        max_levels: maxLvl,
+        vip_name: vip.name,
+      },
+      level_summary: levelSummary,
+      members: paginatedRows.map(m => ({
+        id:          m.id,
+        name:        m.first_name || 'User',
+        username:    m.username   || null,
+        uid:         m.uid        || null,
+        level:       m._level,
+        invested:    +parseFloat(m.invested||0).toFixed(2),
+        active_plans: parseInt(m.active_plans)||0,
+        top_plan:    m.top_plan   || null,
+        joined:      m.created_at ? String(m.created_at).split('T')[0] : null,
+      })),
+      pagination: {
+        page, limit,
+        total: totalFiltered,
+        pages: Math.ceil(totalFiltered / limit),
+        has_more: offset + limit < totalFiltered,
+      },
+      filter_level: filterLvl,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
 });
