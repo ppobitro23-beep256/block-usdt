@@ -490,6 +490,11 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_updated_at TIMESTAMP DEFAULT NULL`),
     // Unique index: one address per account (NULL allowed for unbound users)
     db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_withdraw_address ON users (withdraw_address) WHERE withdraw_address IS NOT NULL`),
+    // VIP system migrations
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_level TEXT DEFAULT 'Member'`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_updated_at TIMESTAMP DEFAULT NULL`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_investments_user_status ON investments (user_id, status)`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users (referred_by)`),
   ]);
 
   // Audit log table for address changes
@@ -524,12 +529,139 @@ async function getSetting(key) {
 
 
 // ── Rank + UID helpers ────────────────────
+
+// Plan tier order (lowest → highest)
+const PLAN_TIER_ORDER = ['bronze','silver','gold','platinum','diamond','titanium','quantum'];
+
+function getPlanTier(planName) {
+  const n = (planName || '').toLowerCase();
+  for (const tier of [...PLAN_TIER_ORDER].reverse()) {
+    if (n.includes(tier)) return tier;
+  }
+  return 'bronze';
+}
+
+function planTierIndex(planName) {
+  return PLAN_TIER_ORDER.indexOf(getPlanTier(planName));
+}
+
+// VIP REQUIREMENTS
+const VIP_LEVELS = [
+  // Member (base — no VIP)
+  { name: 'Member',          minPlanTier: null,       minRefs: 0,  minTeamDep: 0,    maxLevels: 3,
+    rates: [3, 2, 1, 0, 0, 0, 0] }, // fallback = Bronze rates
+  // Bronze plan active
+  { name: 'Bronze',          minPlanTier: 'bronze',   minRefs: 0,  minTeamDep: 0,    maxLevels: 3,
+    rates: [3, 2, 1, 0, 0, 0, 0] },
+  // Silver plan active
+  { name: 'Silver',          minPlanTier: 'silver',   minRefs: 0,  minTeamDep: 0,    maxLevels: 3,
+    rates: [4, 2, 1, 0, 0, 0, 0] },
+  // Gold plan active
+  { name: 'Gold',            minPlanTier: 'gold',     minRefs: 0,  minTeamDep: 0,    maxLevels: 3,
+    rates: [5, 3, 1, 0, 0, 0, 0] },
+  // VIP 1 — Platinum
+  { name: 'VIP 1',           minPlanTier: 'platinum', minRefs: 2,  minTeamDep: 100,  maxLevels: 4,
+    rates: [8, 3, 1, 1, 0, 0, 0] },
+  // VIP 2 — Diamond
+  { name: 'VIP 2',           minPlanTier: 'diamond',  minRefs: 5,  minTeamDep: 500,  maxLevels: 5,
+    rates: [8, 3, 1, 1, 1, 0, 0] },
+  // VIP 3 — Titanium
+  { name: 'VIP 3',           minPlanTier: 'titanium', minRefs: 10, minTeamDep: 1000, maxLevels: 6,
+    rates: [8, 3, 1, 1, 1, 1, 0] },
+  // VIP 4 — Quantum
+  { name: 'VIP 4',           minPlanTier: 'quantum',  minRefs: 20, minTeamDep: 2000, maxLevels: 7,
+    rates: [8, 3, 1, 1, 1, 1, 1] },
+];
+
+// Compute user's VIP level given their stats
+function computeVipLevel(highestPlanTier, activeRefs, teamDeposit) {
+  const tierIdx = highestPlanTier ? PLAN_TIER_ORDER.indexOf(highestPlanTier) : -1;
+  let bestLevel = VIP_LEVELS[0]; // Member default
+
+  for (const vip of VIP_LEVELS) {
+    if (!vip.minPlanTier) continue; // skip Member entry
+    const reqTierIdx = PLAN_TIER_ORDER.indexOf(vip.minPlanTier);
+    if (tierIdx < reqTierIdx) continue;
+    if (activeRefs < vip.minRefs) continue;
+    if (teamDeposit < vip.minTeamDep) continue;
+    bestLevel = vip;
+  }
+  return bestLevel;
+}
+
+// Get highest active plan tier for a user (server-side)
+async function getHighestActivePlanTier(userId) {
+  const rows = await db.all(
+    `SELECT plan_name FROM investments WHERE user_id=$1 AND status='active'`,
+    [userId]
+  );
+  if (!rows || !rows.length) return null;
+  let best = -1;
+  for (const r of rows) {
+    const idx = planTierIndex(r.plan_name);
+    if (idx > best) best = idx;
+  }
+  return best >= 0 ? PLAN_TIER_ORDER[best] : null;
+}
+
+// Get team deposit total for N levels deep
+async function getTeamDeposit(userId, maxLevels) {
+  // BFS across referral tree up to maxLevels
+  // Always use numeric bigint-safe id
+  let currentIds = [parseInt(userId)];
+  let allDownlineIds = [];
+  for (let lvl = 0; lvl < maxLevels; lvl++) {
+    if (!currentIds.length) break;
+    const rows = await db.all(
+      `SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`,
+      [currentIds]
+    );
+    const nextIds = rows.map(r => r.id);
+    allDownlineIds = allDownlineIds.concat(nextIds);
+    currentIds = nextIds;
+  }
+  if (!allDownlineIds.length) return 0;
+  const r = await db.one(
+    `SELECT COALESCE(SUM(i.amount), 0) as total
+     FROM investments i
+     WHERE i.user_id = ANY($1::bigint[]) AND i.status IN ('active','completed')`,
+    [allDownlineIds]
+  );
+  return parseFloat(r.total) || 0;
+}
+
+// Get active referral count (direct L1 only for VIP gate)
+async function getActiveReferralCount(userId) {
+  const r = await db.one(
+    `SELECT COUNT(DISTINCT u.id) as cnt
+     FROM users u
+     JOIN investments i ON u.id = i.user_id
+     WHERE u.referred_by = $1 AND i.status = 'active'`,
+    [userId]
+  );
+  return parseInt(r.cnt) || 0;
+}
+
+// Full VIP status for a user — used in /api/vip-status and commission calc
+// reqMaxLevels: cap BFS depth to avoid scanning deeper than needed
+async function getUserVipStatus(userId, reqMaxLevels) {
+  const [highestTier, activeRefs] = await Promise.all([
+    getHighestActivePlanTier(userId),
+    getActiveReferralCount(userId),
+  ]);
+  // Use reqMaxLevels if provided; default 7 (full scan for VIP status page)
+  const scanDepth = reqMaxLevels || 7;
+  const teamDep = await getTeamDeposit(userId, scanDepth);
+  const vip = computeVipLevel(highestTier, activeRefs, teamDep);
+  return { vip, highestTier, activeRefs, teamDep };
+}
+
+// Legacy rank name (kept for leaderboard badge compatibility)
 function getUserRank(activeRefs) {
   const n = parseInt(activeRefs) || 0;
-  if (n >= 20) return 'VIP 5';
-  if (n >= 10) return 'VIP 4';
-  if (n >= 5)  return 'VIP 3';
-  if (n >= 3)  return 'VIP 2';
+  if (n >= 20) return 'VIP 4';
+  if (n >= 10) return 'VIP 3';
+  if (n >= 5)  return 'VIP 2';
   if (n >= 1)  return 'VIP 1';
   return 'Member';
 }
@@ -825,7 +957,23 @@ app.get('/api/user/:id', async (req, res) => {
     };
     userWithComm.rank   = getUserRank(activeReferrals);
     userWithComm.active_referrals = activeReferrals;
-    res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals});
+
+    // Compute VIP status (lightweight — uses cached highest plan query)
+    let vipData = null;
+    try {
+      const vs = await getUserVipStatus(req.params.id);
+      vipData = {
+        vip_name:     vs.vip.name,
+        vip_rates:    vs.vip.rates,
+        max_levels:   vs.vip.maxLevels,
+        highest_tier: vs.highestTier || null,
+        team_deposit: +vs.teamDep.toFixed(2),
+      };
+      // Cache vip_level on user row (async, non-blocking)
+      db.run(`UPDATE users SET vip_level=$1, vip_updated_at=NOW() WHERE id=$2`, [vs.vip.name, req.params.id]).catch(()=>{});
+    } catch(e) { log('WARN', 'VIP calc skipped: ' + e.message); }
+
+    res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals, vip: vipData});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
@@ -926,30 +1074,45 @@ app.post('/api/invest', userAuth, async (req, res) => {
       log('REF', `User ${user.id} marked as active referral of ${user.referred_by}`);
     }
 
-    // Distribute referral commissions (3 levels)
+    // Distribute referral commissions — VIP-based dynamic rates
     try {
-      const settingRows = await db.all(`SELECT * FROM settings`);
-      const sMap = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
-      const pcts = [
-        parseFloat(sMap.ref_lvl1_pct || 8) / 100,
-        parseFloat(sMap.ref_lvl2_pct || 3) / 100,
-        parseFloat(sMap.ref_lvl3_pct || 1) / 100
-      ];
       let currentId = u.id;
-      for (let lvl = 0; lvl < 3; lvl++) {
-        const row = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [currentId]);
+      const vipCache = new Map(); // per-invest cache: referrerId → vip object
+      for (let lvl = 0; lvl < 7; lvl++) {
+        const row = await db.one(`SELECT referred_by, is_banned FROM users WHERE id=$1`, [currentId]);
         if (!row || !row.referred_by) break;
         const referrerId = row.referred_by;
-        // Referrer must not be banned
-        const referrerRow = await db.one(`SELECT is_banned FROM users WHERE id=$1`, [referrerId]);
-        if (!referrerRow || referrerRow.is_banned) {
-          currentId = referrerId;
-          continue;
+
+        // Referrer must not be banned (already fetched above)
+        if (row.is_banned) { currentId = referrerId; continue; }
+
+        // Compute referrer VIP — use cache to avoid repeat DB calls
+        let refVip;
+        if (vipCache.has(referrerId)) {
+          refVip = vipCache.get(referrerId);
+        } else {
+          // Use scanDepth = 4 max for commission calc (VIP 4 needs L7 but teamDep is pre-qualified)
+          const refVipData = await getUserVipStatus(referrerId, 4);
+          refVip = refVipData.vip;
+          vipCache.set(referrerId, refVip);
         }
-        const comm = +(amount * pcts[lvl]).toFixed(4);
-        await db.run(`UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`, [comm, referrerId]);
-        await db.run(`INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1,$2,$3,$4)`, [referrerId, u.id, lvl+1, comm]);
-        log('COMM', `Level ${lvl+1} commission $${comm} → user ${referrerId} (from ${u.id})`);
+
+        // Stop if this level is beyond referrer's unlocked levels
+        if (lvl >= refVip.maxLevels) { currentId = referrerId; continue; }
+
+        const pct = (refVip.rates[lvl] || 0) / 100;
+        if (pct <= 0) { currentId = referrerId; continue; }
+
+        const comm = +(amount * pct).toFixed(4);
+        await db.run(
+          `UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`,
+          [comm, referrerId]
+        );
+        await db.run(
+          `INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1,$2,$3,$4)`,
+          [referrerId, u.id, lvl+1, comm]
+        );
+        log('COMM', `L${lvl+1} ${refVip.name} ${pct*100}% $${comm} → user ${referrerId}`);
         currentId = referrerId;
       }
     } catch(e) { console.log('Commission error:', e.message); }
@@ -2160,6 +2323,112 @@ function startScanners() {
 // ══════════════════════════════════════════
 // START
 // ══════════════════════════════════════════
+
+// ══════════════════════════════════════════
+// VIP STATUS API
+// ══════════════════════════════════════════
+
+// GET /api/vip-status — full VIP status + progress for current user
+app.get('/api/vip-status', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { vip, highestTier, activeRefs, teamDep } = await getUserVipStatus(u.id);
+
+    // Build next VIP target
+    const currentIdx = VIP_LEVELS.indexOf(vip);
+    let nextVip = null;
+    let nextProgress = null;
+
+    if (currentIdx < VIP_LEVELS.length - 1) {
+      // Find next true VIP target (VIP 1 through VIP 4 only, index >= 4)
+      for (let i = currentIdx + 1; i < VIP_LEVELS.length; i++) {
+        if (VIP_LEVELS[i].name.startsWith('VIP')) {
+          nextVip = VIP_LEVELS[i];
+          break;
+        }
+      }
+      // If current is already a VIP, next is the next VIP tier
+      if (!nextVip && currentIdx >= 4) {
+        // already handled — no next VIP
+      }
+      if (nextVip) {
+        const reqTier = nextVip.minPlanTier;
+        const reqTierIdx = PLAN_TIER_ORDER.indexOf(reqTier);
+        const curTierIdx = highestTier ? PLAN_TIER_ORDER.indexOf(highestTier) : -1;
+        nextProgress = {
+          plan:       { current: highestTier || 'none', required: reqTier, met: curTierIdx >= reqTierIdx },
+          refs:       { current: activeRefs,  required: nextVip.minRefs,    met: activeRefs >= nextVip.minRefs },
+          teamDep:    { current: +teamDep.toFixed(2), required: nextVip.minTeamDep, met: teamDep >= nextVip.minTeamDep },
+        };
+      }
+    }
+
+    res.json({
+      vip_name:     vip.name,
+      vip_rates:    vip.rates,
+      max_levels:   vip.maxLevels,
+      highest_tier: highestTier || null,
+      active_refs:  activeRefs,
+      team_deposit: +teamDep.toFixed(2),
+      next_vip:     nextVip ? { name: nextVip.name, minPlanTier: nextVip.minPlanTier, minRefs: nextVip.minRefs, minTeamDep: nextVip.minTeamDep, maxLevels: nextVip.maxLevels, rates: nextVip.rates } : null,
+      next_progress: nextProgress,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+});
+
+// GET /api/team-deposit — team deposit breakdown per level
+app.get('/api/team-deposit', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { vip } = await getUserVipStatus(u.id);
+    const maxLvl = vip.maxLevels;
+
+    // BFS tree: up to maxLevels deep
+    let byLevel = [];
+    let currentIds = [parseInt(u.id)];
+
+    for (let lvl = 1; lvl <= maxLvl; lvl++) {
+      if (!currentIds.length) break;
+      const rows = await db.all(
+        `SELECT u.id, u.first_name, u.username, u.uid,
+                COALESCE(SUM(CASE WHEN i.status IN ('active','completed') THEN i.amount ELSE 0 END),0) as invested,
+                (SELECT plan_name FROM investments
+                 WHERE user_id=u.id AND status='active'
+                 ORDER BY id DESC LIMIT 1) as top_plan
+         FROM users u
+         LEFT JOIN investments i ON i.user_id=u.id
+         WHERE u.referred_by = ANY($1::bigint[])
+         GROUP BY u.id, u.first_name, u.username, u.uid`,
+        [currentIds]
+      );
+      byLevel.push({ level: lvl, members: rows });
+      currentIds = rows.map(r => r.id);
+    }
+
+    // Totals
+    const totalDeposit = byLevel.reduce((sum, lvl) => {
+      return sum + lvl.members.reduce((s, m) => s + parseFloat(m.invested || 0), 0);
+    }, 0);
+
+    res.json({
+      total_deposit: +totalDeposit.toFixed(2),
+      max_levels:    maxLvl,
+      levels:        byLevel.map(l => ({
+        level:   l.level,
+        count:   l.members.length,
+        total:   +l.members.reduce((s, m) => s + parseFloat(m.invested||0), 0).toFixed(2),
+        members: l.members.map(m => ({
+          id:        m.id,
+          name:      m.first_name || 'User',
+          username:  m.username || null,
+          uid:       m.uid || null,
+          invested:  +parseFloat(m.invested||0).toFixed(2),
+          top_plan:  m.top_plan || null,
+        }))
+      }))
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+});
 
 // ══════════════════════════════════════════
 // LEADERBOARD
