@@ -676,11 +676,12 @@ function generateUID() {
 
 // ── Plan unlock: active referral requirements ──
 function getPlanReferralReq(planName) {
+  // Must match VIP_LEVELS requirements exactly
   const n = (planName || '').toLowerCase();
   if (n.includes('quantum'))  return 20;
   if (n.includes('titanium')) return 10;
-  if (n.includes('diamond'))  return 3;
-  if (n.includes('platinum')) return 1;
+  if (n.includes('diamond'))  return 5;
+  if (n.includes('platinum')) return 2;
   return 0; // bronze, silver, gold — always open
 }
 
