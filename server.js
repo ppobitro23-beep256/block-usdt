@@ -643,15 +643,36 @@ async function getActiveReferralCount(userId) {
 }
 
 // Full VIP status for a user — used in /api/vip-status and commission calc
-// reqMaxLevels: cap BFS depth to avoid scanning deeper than needed
+// Strategy: first compute candidate VIP from plan+refs only (no team dep),
+// then scan teamDep using that candidate's maxLevels for consistency.
+// reqMaxLevels: hard cap for commission calc to limit DB queries.
 async function getUserVipStatus(userId, reqMaxLevels) {
   const [highestTier, activeRefs] = await Promise.all([
     getHighestActivePlanTier(userId),
     getActiveReferralCount(userId),
   ]);
-  // Use reqMaxLevels if provided; default 7 (full scan for VIP status page)
-  const scanDepth = reqMaxLevels || 7;
+
+  // Step 1: find highest VIP tier user COULD reach based on plan+refs only
+  // (ignoring teamDep requirement for now — just to know scan depth)
+  const tierIdx = highestTier ? PLAN_TIER_ORDER.indexOf(highestTier) : -1;
+  let candidateMaxLevels = 3; // default Member/Bronze/Silver/Gold
+  for (const v of VIP_LEVELS) {
+    if (!v.minPlanTier) continue;
+    const reqTierIdx = PLAN_TIER_ORDER.indexOf(v.minPlanTier);
+    if (tierIdx < reqTierIdx) continue;
+    if (activeRefs < v.minRefs) continue;
+    // plan+refs qualify — use this VIP's maxLevels as scan depth
+    candidateMaxLevels = v.maxLevels;
+  }
+
+  // Step 2: scan teamDep using candidateMaxLevels (or reqMaxLevels hard cap)
+  const scanDepth = reqMaxLevels
+    ? Math.min(reqMaxLevels, candidateMaxLevels)
+    : candidateMaxLevels;
+
   const teamDep = await getTeamDeposit(userId, scanDepth);
+
+  // Step 3: final VIP determination using all 3 factors
   const vip = computeVipLevel(highestTier, activeRefs, teamDep);
   return { vip, highestTier, activeRefs, teamDep };
 }
@@ -2331,7 +2352,11 @@ function startScanners() {
 app.get('/api/vip-status', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
-    const { vip, highestTier, activeRefs, teamDep } = await getUserVipStatus(u.id);
+    // First pass: compute VIP (uses scanDepth=7 for gate check)
+    const { vip, highestTier, activeRefs } = await getUserVipStatus(u.id);
+    // Second pass: recompute teamDep using ONLY user's current unlocked levels
+    // so it matches what Team Deposit Dashboard shows
+    const teamDep = await getTeamDeposit(u.id, vip.maxLevels);
 
     // Build next VIP target
     const currentIdx = VIP_LEVELS.indexOf(vip);
@@ -2380,7 +2405,7 @@ app.get('/api/vip-status', userAuth, async (req, res) => {
 app.get('/api/team-deposit', userAuth, async (req, res) => {
   try {
     const u       = req.tgUser;
-    const { vip } = await getUserVipStatus(u.id, 4);
+    const { vip } = await getUserVipStatus(u.id);
     const maxLvl  = vip.maxLevels || 3;
 
     const filterLvl = parseInt(req.query.level) || 0;   // 0 = all
