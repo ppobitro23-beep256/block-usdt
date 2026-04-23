@@ -46,16 +46,15 @@ const DEPOSIT_WALLET      = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396
 const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF775485246999027B3197955').toLowerCase();
 const BEP20_WALLET        = DEPOSIT_WALLET;
 const BEP20_USDT_CONTRACT = USDT_CONTRACT;
+const WITHDRAWAL_WALLET   = (process.env.WITHDRAWAL_WALLET || '').toLowerCase();
 
 // Simple HTTPS GET helper
 function httpsGet(url, headers) {
   return new Promise((resolve) => {
-    // Use URL only for hostname extraction; keep raw path+search to avoid bracket re-encoding
-    const parsed = new URL(url);
-    const rawPath = url.slice(url.indexOf(parsed.pathname)); // preserves raw [...] in query string
+    const opts = new URL(url);
     const options = {
-      hostname: parsed.hostname,
-      path: rawPath,
+      hostname: opts.hostname,
+      path: opts.pathname + opts.search,
       method: 'GET',
       headers: Object.assign({ 'User-Agent': 'BlockUSDT/1.0' }, headers || {}),
     };
@@ -66,8 +65,8 @@ function httpsGet(url, headers) {
         try { resolve(JSON.parse(data)); } catch(_) { resolve({}); }
       });
     });
-    req.on('error', (e) => { console.error('[httpsGet error]', e.message); resolve({}); });
-    req.setTimeout(12000, () => { req.destroy(); resolve({}); });
+    req.on('error', () => resolve({}));
+    req.setTimeout(10000, () => { req.destroy(); resolve({}); });
     req.end();
   });
 }
@@ -155,6 +154,128 @@ if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.
 if (!ADMIN_SECRET) { console.error('❌ ADMIN_SECRET env var missing'); process.exit(1); }
 if (!BOT_TOKEN)    { console.warn('⚠️ BOT_TOKEN env var missing — Telegram auth verification disabled'); }
 if (!process.env.WEBAPP_URL) { console.warn('⚠️ WEBAPP_URL not set — using default https://myusdtapp.xyz/'); }
+
+// ══════════════════════════════════════════
+// TELEGRAM GROUP PROOF MODULE
+// ══════════════════════════════════════════
+
+// Low-level Telegram Bot API caller (server-side only, token never exposed)
+async function tgBotApi(method, payload) {
+  if (!BOT_TOKEN) return { ok: false, error: 'BOT_TOKEN missing' };
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const options = {
+      hostname: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/${method}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { resolve({ ok: false, error: 'parse_error' }); }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.setTimeout(10000, () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// Get tg group settings from DB
+async function getTgGroupSettings() {
+  try {
+    const rows = await db.all(`SELECT key, value FROM settings WHERE key IN ('tg_group_chat_id','tg_group_topic_id','tg_group_enabled')`);
+    const s = {};
+    rows.forEach(r => { s[r.key] = r.value; });
+    return {
+      chatId:   s.tg_group_chat_id  || '',
+      topicId:  s.tg_group_topic_id || '',
+      enabled:  s.tg_group_enabled  === '1'
+    };
+  } catch(e) { return { chatId:'', topicId:'', enabled:false }; }
+}
+
+// Send withdrawal proof to Telegram group topic (non-blocking — never fails the main flow)
+// Escape HTML special chars to prevent broken parse_mode=HTML messages
+function tgEscape(str) {
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function sendWithdrawProof(txData) {
+  try {
+    const cfg = await getTgGroupSettings();
+    log('TG_PROOF', `cfg: enabled=${cfg.enabled} chatId=${cfg.chatId} topicId=${cfg.topicId} wd=${txData.withdraw_id}`);
+    if (!cfg.enabled || !cfg.chatId) {
+      log('TG_PROOF', `SKIP: enabled=${cfg.enabled} chatId="${cfg.chatId}"`);
+      return;
+    }
+
+    const { withdraw_id, username, first_name, user_id, amount, address, bsc_tx_hash } = txData;
+
+    // Duplicate guard — if already sent successfully, skip (unless this call has a tx_hash and previous didn't)
+    const existing = await db.all(
+      `SELECT sent_status, error_msg FROM tg_proof_logs WHERE withdraw_id=$1 ORDER BY id DESC LIMIT 1`,
+      [withdraw_id]
+    );
+    if (existing.length > 0 && existing[0].sent_status === 'sent') {
+      // Already sent successfully — only re-send if now we have a tx_hash that wasn't there before
+      if (!bsc_tx_hash || !bsc_tx_hash.trim()) return;
+      // Check if previously sent version had no tx_hash (error_msg stores context)
+      // We allow one re-send with tx_hash for better proof
+      const alreadyHasTx = await db.all(
+        `SELECT id FROM tg_proof_logs WHERE withdraw_id=$1 AND sent_status='sent' AND error_msg LIKE '%has_tx%'`,
+        [withdraw_id]
+      );
+      if (alreadyHasTx.length > 0) return; // already sent with tx_hash
+    }
+    // HTML-escape user-supplied strings to prevent broken Telegram HTML
+    const safeName    = username ? '@' + tgEscape(username) : tgEscape(first_name || 'No Username');
+    const safeAddr    = address ? address.slice(0,8) + '...' + address.slice(-6) : 'N/A';
+    const now         = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka', hour12: false });
+
+    let msg =
+      `💸 <b>Withdrawal Paid</b>\n` +
+      `👤 Username: <b>${safeName}</b>\n` +
+      `🆔 User ID: <code>${user_id}</code>\n` +
+      `💰 Amount: <b>${parseFloat(amount).toFixed(2)} USDT</b>\n` +
+      `🌐 Network: BEP20 (BSC)\n` +
+      `🏦 Wallet: <code>${safeAddr}</code>\n` +
+      `⏰ Time: ${now}`;
+
+    if (bsc_tx_hash && bsc_tx_hash.trim()) {
+      msg += `\n🔗 Verify on BscScan:\nhttps://bscscan.com/tx/${bsc_tx_hash.trim()}`;
+    }
+    msg += `\n\n✅ Successfully Sent`;
+
+    const payload = {
+      chat_id:    cfg.chatId,
+      text:       msg,
+      parse_mode: 'HTML'
+    };
+    // FIX: parseInt('') = NaN — guard with parsedId check before assigning
+    const parsedTopicId = cfg.topicId ? parseInt(cfg.topicId, 10) : NaN;
+    if (!isNaN(parsedTopicId) && parsedTopicId > 0) payload.message_thread_id = parsedTopicId;
+
+    const result = await tgBotApi('sendMessage', payload);
+
+    // Log result to DB — use simple INSERT (no ON CONFLICT needed, each proof gets own row)
+    const status  = result.ok ? 'sent' : 'failed';
+    const errMsg  = result.ok
+      ? (bsc_tx_hash && bsc_tx_hash.trim() ? 'has_tx' : null)
+      : (result.description || result.error || 'unknown');
+    await db.run(
+      `INSERT INTO tg_proof_logs (withdraw_id, sent_status, error_msg) VALUES ($1,$2,$3)`,
+      [withdraw_id, status, errMsg]
+    );
+    if (!result.ok) log('TG_PROOF', `Failed to send proof for tx=${withdraw_id}: ${errMsg}`);
+  } catch(e) {
+    log('TG_PROOF', `sendWithdrawProof error: ${e.message}`);
+  }
+}
 
 // ── CORS — allow Cloudflare Pages frontend + all Telegram origins ──────
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'https://block-usdt.pages.dev';
@@ -323,7 +444,7 @@ async function setupDB() {
       status     TEXT DEFAULT 'pending',
       tx_hash    TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
-      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '15 minutes')
+      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '30 minutes')
     )
   `);
   await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_dep_txhash ON auto_deposits (tx_hash) WHERE tx_hash IS NOT NULL`);
@@ -526,6 +647,31 @@ async function setupDB() {
       action       TEXT DEFAULT 'change',
       created_at   TIMESTAMP DEFAULT NOW()
     )
+  `);
+
+  // Telegram Group proof log table
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS tg_proof_logs (
+      id          SERIAL PRIMARY KEY,
+      withdraw_id INTEGER NOT NULL,
+      sent_status TEXT    DEFAULT 'pending',
+      error_msg   TEXT    DEFAULT NULL,
+      retry_count INTEGER DEFAULT 0,
+      created_at  TIMESTAMP DEFAULT NOW(),
+      updated_at  TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS bsc_tx_hash TEXT DEFAULT NULL`);
+
+  // Mark all pre-existing approved withdrawals as 'skipped' in proof logs
+  // so fallback scanner never re-posts old withdrawals after deploy
+  await db.run(`
+    INSERT INTO tg_proof_logs (withdraw_id, sent_status, error_msg)
+    SELECT t.id, 'skipped', 'pre-existing before TG proof feature'
+    FROM transactions t
+    WHERE t.type = 'withdraw'
+      AND t.status = 'approved'
+      AND NOT EXISTS (SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id)
   `);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
@@ -2013,9 +2159,9 @@ app.post('/admin/deposit/reject', adminAuth, async (req, res) => {
 
 app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
   try {
-    const {tx_id, admin_note} = req.body;
+    const {tx_id, admin_note, bsc_tx_hash} = req.body;
     if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
-    const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='withdraw'`, [tx_id]);
+    const tx = await db.one(`SELECT t.*, u.username, u.first_name FROM transactions t LEFT JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.type='withdraw'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
 
     // [ATOMIC] Only approve if still pending — rowCount=0 means already processed
@@ -2025,10 +2171,27 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
     );
     if (result.rowCount === 0) return res.status(400).json({error:'Already processed'});
 
+    // Save bsc_tx_hash AFTER atomic approval confirmed (not before — avoids saving on already-processed)
+    if (bsc_tx_hash && bsc_tx_hash.trim()) {
+      await db.run(`UPDATE transactions SET bsc_tx_hash=$1 WHERE id=$2`, [bsc_tx_hash.trim(), tx_id]);
+    }
+
     const {user_id, amount} = result.rows[0];
     log('WITHDRAW', `APPROVED tx=${tx_id} user=${user_id} amt=$${amount} addr=${(tx.address||'').slice(0,16)}`);
     logSecurity('WITHDRAW_APPROVED', {tx_id, user_id, amount, address: (tx.address||'').slice(0,20)});
     res.json({success:true});
+
+    // Fire Telegram proof immediately after approve (non-blocking)
+    // Scanner will try to add TX hash separately if Moralis detects it
+    setImmediate(() => sendWithdrawProof({
+      withdraw_id: tx_id,
+      username:    tx.username    || '',
+      first_name:  tx.first_name  || '',
+      user_id:     user_id,
+      amount:      amount,
+      address:     tx.address     || '',
+      bsc_tx_hash: (bsc_tx_hash && bsc_tx_hash.trim()) ? bsc_tx_hash.trim() : ''
+    }));
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
@@ -2164,6 +2327,106 @@ app.post('/admin/maintenance', adminAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// TELEGRAM GROUP INTEGRATION — ADMIN ROUTES
+// ══════════════════════════════════════════
+
+// GET current tg group settings + bot status + today's sent count
+app.get('/admin/tg-group/status', adminAuth, async (req, res) => {
+  try {
+    const cfg = await getTgGroupSettings();
+
+    // Count today's sent proofs
+    const todayRow = await db.one(
+      `SELECT COUNT(*) as c FROM tg_proof_logs WHERE sent_status='sent' AND created_at >= NOW() - INTERVAL '24 hours'`
+    );
+    // Last log entry — use db.all + take first to avoid crash on empty table
+    const lastLogs = await db.all(
+      `SELECT sent_status, error_msg, updated_at FROM tg_proof_logs ORDER BY id DESC LIMIT 1`
+    );
+    const lastLog = lastLogs && lastLogs.length > 0 ? lastLogs[0] : null;
+
+    // Check bot alive
+    let botOk = false;
+    let botUsername = '';
+    if (BOT_TOKEN) {
+      const me = await tgBotApi('getMe', {});
+      botOk = !!me.ok;
+      botUsername = me.result && me.result.username ? '@' + me.result.username : '';
+    }
+
+    res.json({
+      bot_ok:        botOk,
+      bot_username:  botUsername,
+      chat_id:       cfg.chatId,
+      topic_id:      cfg.topicId,
+      enabled:       cfg.enabled,
+      sent_today:    parseInt(todayRow.c || 0),
+      last_status:   lastLog ? lastLog.sent_status  : null,
+      last_error:    lastLog ? lastLog.error_msg     : null,
+      last_time:     lastLog ? lastLog.updated_at    : null
+    });
+  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// Save tg group settings
+app.post('/admin/tg-group/settings', adminAuth, async (req, res) => {
+  try {
+    const { chat_id, topic_id, enabled } = req.body;
+    await db.run(`INSERT INTO settings (key,value) VALUES ('tg_group_chat_id',$1)  ON CONFLICT (key) DO UPDATE SET value=$1`, [String(chat_id||'')]);
+    await db.run(`INSERT INTO settings (key,value) VALUES ('tg_group_topic_id',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [String(topic_id||'')]);
+    await db.run(`INSERT INTO settings (key,value) VALUES ('tg_group_enabled',$1)  ON CONFLICT (key) DO UPDATE SET value=$1`, [enabled?'1':'0']);
+    res.json({success:true});
+  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// Test connection — send test message to configured topic
+app.post('/admin/tg-group/test', adminAuth, async (req, res) => {
+  try {
+    const cfg = await getTgGroupSettings();
+    if (!BOT_TOKEN)   return res.status(400).json({error:'BOT_TOKEN not configured on server'});
+    if (!cfg.chatId)  return res.status(400).json({error:'Group Chat ID not set'});
+
+    const payload = {
+      chat_id:    cfg.chatId,
+      text:       '💸 <b>Block USDT Proof Feed Connected Successfully</b>',
+      parse_mode: 'HTML'
+    };
+    if (cfg.topicId) {
+      const tid = parseInt(cfg.topicId, 10);
+      if (!isNaN(tid) && tid > 0) payload.message_thread_id = tid;
+    }
+
+    const result = await tgBotApi('sendMessage', payload);
+    if (!result.ok) return res.status(400).json({error: result.description || 'Send failed — check Chat ID / Topic ID and bot admin permissions'});
+    res.json({success:true, message_id: result.result && result.result.message_id});
+  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// Check bot permissions in group
+app.post('/admin/tg-group/check-permissions', adminAuth, async (req, res) => {
+  try {
+    const cfg = await getTgGroupSettings();
+    if (!BOT_TOKEN)  return res.status(400).json({error:'BOT_TOKEN not set'});
+    if (!cfg.chatId) return res.status(400).json({error:'Chat ID not configured'});
+
+    const me = await tgBotApi('getMe', {});
+    if (!me.ok || !me.result || !me.result.id) return res.status(400).json({error:'Cannot reach Telegram API'});
+
+    const member = await tgBotApi('getChatMember', { chat_id: cfg.chatId, user_id: me.result.id });
+    if (!member.ok) return res.status(400).json({error: member.description || 'Bot is not in the group'});
+
+    const status = member.result && member.result.status;
+    const canPost = status === 'administrator' || status === 'creator';
+    res.json({
+      ok: canPost,
+      status,
+      can_send_messages: canPost,
+      warning: canPost ? null : 'Bot is not an admin — cannot post messages'
+    });
+  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// ══════════════════════════════════════════
 // REFERRAL STATS (per-level breakdown)
 // ══════════════════════════════════════════
 app.get('/api/referral-stats/:id', async (req, res) => {
@@ -2231,9 +2494,10 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 // AUTO DEPOSIT — Generate unique amount
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
-  for (let i = 0; i < 50; i++) {
-    // 1-5 → 0.01-0.05 (2 decimal places, 5 possible values)
-    const dec  = (Math.floor(Math.random() * 5) + 1);
+  // ✅ FIX: expanded from 5 → 99 possible suffix values (0.01–0.99)
+  // This dramatically reduces collision chance when many deposits are pending
+  for (let i = 0; i < 99; i++) {
+    const dec  = (Math.floor(Math.random() * 99) + 1); // 1–99
     const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
@@ -2302,85 +2566,29 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// ══════════════════════════════════════════
-// AUTO DEPOSIT — BscScan HTTP helper
-// ══════════════════════════════════════════
-
-const BSCSCAN_KEY = process.env.BSCSCAN_API_KEY || 'IYF1QR2JMF9VDC9CCYPW629Y4CMMERGN74';
-
-function bscscanGet(params) {
-  return new Promise((resolve) => {
-    const qs = Object.entries(params).map(([k,v]) => k + '=' + encodeURIComponent(v)).join('&');
-    const path = '/v2/api?chainid=56&' + qs;
-
-    const options = {
-      hostname: 'api.etherscan.io',
-      port: 443,
-      path: path,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'BlockUSDT/1.0',
-        'Accept': 'application/json',
-      },
-    };
-
-    log('SCANNER', '[BSCSCAN] GET https://api.etherscan.io' + path.slice(0, 120));
-
-    const req = https.request(options, (res) => {
-      let raw = '';
-      res.on('data', chunk => { raw += chunk; });
-      res.on('end', () => {
-        log('SCANNER', '[BSCSCAN] HTTP status: ' + res.statusCode);
-        log('SCANNER', '[BSCSCAN] Raw response: ' + raw.slice(0, 300));
-        try {
-          resolve({ statusCode: res.statusCode, body: JSON.parse(raw) });
-        } catch(e) {
-          resolve({ statusCode: res.statusCode, body: {} });
-        }
-      });
-    });
-
-    req.on('error', (e) => {
-      log('SCANNER', '[BSCSCAN] Request error: ' + e.message);
-      resolve({ statusCode: 0, body: {} });
-    });
-
-    req.setTimeout(12000, () => {
-      log('SCANNER', '[BSCSCAN] Request timeout');
-      req.destroy();
-      resolve({ statusCode: 0, body: {} });
-    });
-
-    req.end();
-  });
-}
-
-// ══════════════════════════════════════════
 // AUTO DEPOSIT — Credit helper
 // ══════════════════════════════════════════
 async function creditAutoDeposit(dep, txHash) {
   try {
-    // [DUPLICATE GUARD] Atomic UPDATE — only proceeds if status is still 'pending'
+    // [RACE GUARD] Only credit if this UPDATE actually changed a row
+    // If another process already completed this deposit, rowCount = 0 → skip
     const result = await pool.query(
       `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
       [txHash, dep.id]
     );
     if (result.rowCount === 0) {
-      log('SCANNER', '[DUPLICATE SKIPPED] dep=' + dep.id + ' tx=' + txHash.slice(0,20) + '... already processed');
+      console.log(`[SKIP] Deposit ${dep.id} already processed (race guard)`);
       return;
     }
-
-    // Credit base amount (not unique_amt which has random suffix)
-    await db.run('UPDATE users SET balance=balance+$1 WHERE id=$2', [dep.amount, dep.user_id]);
-
-    // Transaction record
+    // Credit balance only after confirmed row lock
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]); // credit base amount, not unique_amt (which has suffix)
+    // Transaction log
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id, 'deposit', dep.amount, 'BEP20', txHash, 'approved', 'Auto-detected BEP20']
+      [dep.user_id,'deposit',dep.amount,'BEP20',txHash,'approved','Auto-detected']
     );
-
-    // Mark first_deposit task if not already done
+    // Mark first_deposit task as completed (NO balance reward — exact deposit amount only)
     const taskDone = await db.one(
       `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
     );
@@ -2391,150 +2599,275 @@ async function creditAutoDeposit(dep, txHash) {
         [dep.user_id]
       );
     }
-
-    log('SCANNER', '[CREDITED USER] user=' + dep.user_id + ' amount=$' + dep.amount + ' USDT unique=' + dep.unique_amt + ' tx=' + txHash);
-    logSecurity('AUTO_DEPOSIT_CREDITED', { user_id: dep.user_id, amount: dep.amount, unique_amt: dep.unique_amt, tx: txHash });
-
+    console.log(`✅ Auto deposit: user=${dep.user_id} base_amt=${dep.amount} unique_amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
   } catch(e) {
-    if (e.message && (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash'))) {
-      log('SCANNER', '[DUPLICATE SKIPPED] tx=' + txHash.slice(0,20) + '... unique constraint');
+    // Gracefully handle unique constraint (tx_hash duplicate = already credited)
+    if (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash')) {
+      console.log(`[SAFE] TX ${txHash.slice(0,16)} already processed — skipping`);
     } else {
-      log('SCANNER', '[CREDIT ERROR] dep=' + dep.id + ' user=' + dep.user_id + ' err=' + e.message);
+      console.error('[creditAutoDeposit] error:', e.message);
     }
   }
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER — BscScan (Etherscan V2)
+// BEP20 AUTO SCANNER (BscScan)
 // ══════════════════════════════════════════
 async function scanBEP20() {
+  // ✅ FIX: MORALIS_KEY guard — skip silently if key not configured
+  if (!MORALIS_KEY) {
+    console.warn('[BEP20] MORALIS_API_KEY not set — scanner skipped');
+    return;
+  }
+
   try {
-    // Step 1: load pending deposits
     const pending = await db.all(
       `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
-    if (!pending.length) return; // nothing to do — silent
+    if (!pending.length) return;
 
-    log('SCANNER', '[SCAN] ' + pending.length + ' pending deposit(s) — querying BscScan...');
+    // ✅ FIX: limit 20 → 50 to avoid missing txs on busy wallets
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=50&order=DESC`;
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
-    const wallet   = DEPOSIT_WALLET.toLowerCase();
-    const contract = USDT_CONTRACT.toLowerCase();
-
-    // Step 2: fetch latest USDT token transfers to deposit wallet
-    const { statusCode, body } = await bscscanGet({
-      module:          'account',
-      action:          'tokentx',
-      contractaddress: contract,
-      address:         wallet,
-      page:            '1',
-      offset:          '25',
-      sort:            'desc',
-      apikey:          BSCSCAN_KEY,
-    });
-
-    // Step 3: validate response
-    if (statusCode !== 200 || !body || body.status === '0') {
-      const msg = (body && body.message) ? body.message : JSON.stringify(body).slice(0, 200);
-      // status=0 with "No transactions found" is normal — not an error
-      if (body && body.message === 'No transactions found') {
-        log('SCANNER', '[BSCSCAN] No USDT txs found for wallet yet — waiting');
-      } else {
-        log('SCANNER', '[BSCSCAN] Error: ' + msg + ' — will retry next cycle');
-      }
+    if (!data.result || !Array.isArray(data.result)) {
+      console.log('[BEP20] Moralis error:', JSON.stringify(data).slice(0, 200));
       return;
     }
 
-    const txs = body.result || [];
-    log('SCANNER', '[BSCSCAN] Connected OK — ' + txs.length + ' USDT tx(s) returned');
+    const txs = data.result;
+    console.log(`[BEP20] Moralis: ${txs.length} txs | pending auto: ${pending.length}`);
 
-    // Step 4: match each pending deposit
     for (const dep of pending) {
-      const depTs = Math.floor(new Date(dep.created_at).getTime() / 1000) - 60; // unix ts with 1-min grace
+      const depTs = new Date(dep.created_at).getTime() - 60000;
       let matched = false;
 
       for (const tx of txs) {
-        // Must be incoming to our wallet
-        if ((tx.to || '').toLowerCase() !== wallet) continue;
-        // Must be USDT contract
-        if ((tx.contractAddress || '').toLowerCase() !== contract) continue;
-        // Must not be older than deposit creation
-        if (parseInt(tx.timeStamp) < depTs) continue;
+        if (!tx.to_address || tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
+        if (new Date(tx.block_timestamp).getTime() < depTs) continue;
 
-        // BscScan returns value in token decimals (USDT = 18 decimals on BSC)
-        const txAmt = parseFloat(tx.value) / 1e18;
+        // ✅ FIX: value_decimal may be null/undefined on some Moralis responses — fallback to raw value
+        let txAmt;
+        if (tx.value_decimal != null && tx.value_decimal !== '') {
+          txAmt = parseFloat(tx.value_decimal);
+        } else if (tx.value != null) {
+          // USDT on BSC is 18 decimals
+          txAmt = parseFloat(tx.value) / 1e18;
+        } else {
+          continue; // no usable amount field — skip this tx
+        }
+
+        // ✅ FIX: NaN guard — if parsing still fails, skip
+        if (isNaN(txAmt)) continue;
+
         const diff  = Math.abs(txAmt - dep.unique_amt);
+        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
 
-        log('SCANNER', '[TX FOUND] hash=' + tx.hash.slice(0,20) + '... got=' + txAmt.toFixed(4) + ' exp=' + dep.unique_amt + ' diff=' + diff.toFixed(4));
-
-        if (diff <= 0.01) {
+        // ✅ FIX: tolerance 0.01 → 0.02 to handle floating point precision issues
+        if (diff <= 0.02) {
+          // [STRICT] Double-check expiry before crediting
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-            log('SCANNER', '[EXPIRED] dep=' + dep.id + ' user=' + dep.user_id + ' expired before credit');
-            matched = true;
+            log('EXPIRY', `Auto deposit ${dep.id} expired before match user=${dep.user_id}`);
+            matched = true; // stop searching for this dep
             break;
           }
-          log('SCANNER', '[MATCH] dep=' + dep.id + ' user=' + dep.user_id + ' amt=' + dep.unique_amt + ' tx=' + tx.hash);
-          await creditAutoDeposit(dep, tx.hash);
+          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+          await creditAutoDeposit(dep, tx.transaction_hash);
           matched = true;
           break;
         }
       }
-
+      // [REDUCED LOG] Only log no-match for very recent deposits (< 5 min)
       if (!matched) {
         const age = (Date.now() - new Date(dep.created_at).getTime()) / 60000;
-        if (age < 10) {
-          log('SCANNER', '[WAITING] dep=' + dep.id + ' user=' + dep.user_id + ' expect=' + dep.unique_amt + ' USDT age=' + age.toFixed(1) + 'm');
-        }
+        if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
       }
     }
-
-  } catch(e) {
-    log('SCANNER', '[EXCEPTION] ' + e.message + ' | ' + (e.stack || '').split('\n')[1]);
-  }
+  } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
 }
 
 // ══════════════════════════════════════════
 // START SCANNERS
 // ══════════════════════════════════════════
-let _scannerRunning = false;
+// ══════════════════════════════════════════
+// WITHDRAWAL TX AUTO-DETECTOR (Moralis)
+// ══════════════════════════════════════════
+// Scans WITHDRAWAL_WALLET outgoing USDT transfers on BSC
+// Matches against approved withdrawals that have no tx_hash yet
+// On match → saves tx_hash → fires Telegram proof
+// ══════════════════════════════════════════
 
-async function scanBEP20Safe() {
-  if (_scannerRunning) return;
-  _scannerRunning = true;
-  try { await scanBEP20(); }
-  catch(e) { log('SCANNER', '[SAFE WRAPPER ERROR] ' + e.message); }
-  finally { _scannerRunning = false; }
+async function scanWithdrawalTx() {
+  try {
+    if (!MORALIS_KEY) return;
+
+    // Get all approved withdrawals with no tx_hash, approved in last 24h
+    const pending = await db.all(`
+      SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
+             u.username, u.first_name
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE t.type    = 'withdraw'
+        AND t.status  = 'approved'
+        AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
+        AND t.approved_at IS NOT NULL
+        AND t.approved_at >= NOW() - INTERVAL '2 hours'
+    `);
+
+    if (!pending.length) return; // nothing to match — skip Moralis call entirely
+
+    // Use WITHDRAWAL_WALLET if set and different from DEPOSIT_WALLET,
+    // otherwise reuse DEPOSIT_WALLET (same wallet handles both deposit & withdrawal)
+    const scanWallet = (WITHDRAWAL_WALLET && WITHDRAWAL_WALLET !== DEPOSIT_WALLET)
+      ? WITHDRAWAL_WALLET
+      : DEPOSIT_WALLET;
+
+    const url  = `https://deep-index.moralis.io/api/v2.2/${scanWallet}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=50&order=DESC`;
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
+
+    if (!data || !data.result || !Array.isArray(data.result)) {
+      // Generic Moralis error (wallet has no history or API limit) — fallback will handle proof after 30 min
+      // Only log unexpected errors, not the generic "Something went wrong"
+      const errMsg = data && data.message ? data.message : 'no result';
+      if (errMsg !== 'Something went wrong') {
+        log('WITH_SCAN', `Moralis error: ${errMsg}`);
+      }
+      return;
+    }
+
+    // Only outgoing transfers (from = scanWallet → to = user address)
+    const outgoing = data.result.filter(tx =>
+      tx.from_address && tx.from_address.toLowerCase() === scanWallet
+    );
+
+    if (!outgoing.length) return;
+
+    log('WITH_SCAN', `Moralis: ${outgoing.length} outgoing txs | unmatched approvals: ${pending.length}`);
+
+    for (const wd of pending) {
+      const approvedAt = new Date(wd.approved_at).getTime();
+      const toAddr     = (wd.address || '').toLowerCase().trim();
+
+      for (const tx of outgoing) {
+        // Must go TO user's registered withdraw address
+        if (!tx.to_address || tx.to_address.toLowerCase() !== toAddr) continue;
+        // Must happen AFTER or within 10 min before approval (clock skew buffer)
+        const txTime = new Date(tx.block_timestamp).getTime();
+        if (txTime < approvedAt - 600000) continue;
+
+        // ✅ FIX: value_decimal null/undefined guard — same fix as scanBEP20
+        let txAmt;
+        if (tx.value_decimal != null && tx.value_decimal !== '') {
+          txAmt = parseFloat(tx.value_decimal);
+        } else if (tx.value != null) {
+          txAmt = parseFloat(tx.value) / 1e18;
+        } else {
+          continue;
+        }
+        if (isNaN(txAmt)) continue;
+
+        const wdAmt  = parseFloat(wd.amount);
+        if (Math.abs(txAmt - wdAmt) > 1.0) continue;
+
+        // ✅ MATCH FOUND
+        const txHash = tx.transaction_hash;
+        log('WITH_SCAN', `✅ Matched wd=${wd.id} user=${wd.user_id} amt=${wdAmt} tx=${txHash.slice(0,16)}`);
+
+        // Save tx_hash to DB
+        await db.run(
+          `UPDATE transactions SET bsc_tx_hash=$1 WHERE id=$2 AND (bsc_tx_hash IS NULL OR bsc_tx_hash='')`,
+          [txHash, wd.id]
+        );
+
+        // Fire Telegram proof with tx_hash
+        setImmediate(() => sendWithdrawProof({
+          withdraw_id: wd.id,
+          username:    wd.username   || '',
+          first_name:  wd.first_name || '',
+          user_id:     wd.user_id,
+          amount:      wd.amount,
+          address:     wd.address    || '',
+          bsc_tx_hash: txHash
+        }));
+
+        break; // stop checking txs for this withdrawal
+      }
+    }
+  } catch(e) {
+    log('WITH_SCAN', 'Scanner error: ' + e.message);
+  }
+}
+
+// Fallback: if approved withdrawal still has no tx_hash after 30 min,
+// post Telegram proof WITHOUT tx_hash so group always gets notified
+async function scanWithdrawalFallback() {
+  try {
+    const stale = await db.all(`
+      SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
+             u.username, u.first_name
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE t.type    = 'withdraw'
+        AND t.status  = 'approved'
+        AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
+        AND t.approved_at IS NOT NULL
+        AND t.approved_at >= NOW() - INTERVAL '2 hours'
+        AND t.approved_at <= NOW() - INTERVAL '5 minutes'
+        AND NOT EXISTS (
+          SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id
+        )
+    `);
+
+    for (const wd of stale) {
+      log('WITH_SCAN', `Fallback proof (no tx_hash) wd=${wd.id} user=${wd.user_id}`);
+      setImmediate(() => sendWithdrawProof({
+        withdraw_id: wd.id,
+        username:    wd.username   || '',
+        first_name:  wd.first_name || '',
+        user_id:     wd.user_id,
+        amount:      wd.amount,
+        address:     wd.address    || '',
+        bsc_tx_hash: ''
+      }));
+    }
+  } catch(e) {
+    log('WITH_SCAN', 'Fallback error: ' + e.message);
+  }
 }
 
 function startScanners() {
-  log('SCANNER', '==============================');
-  log('SCANNER', '[SCANNER STARTED] BEP20 BscScan auto-deposit scanner');
-  log('SCANNER', '[CONFIG] wallet        = ' + DEPOSIT_WALLET);
-  log('SCANNER', '[CONFIG] usdt_contract = ' + USDT_CONTRACT);
-  log('SCANNER', '[CONFIG] bscscan_key   = ' + (BSCSCAN_KEY ? 'SET (' + BSCSCAN_KEY.slice(0,8) + '...)' : 'MISSING!'));
-  log('SCANNER', '[CONFIG] interval      = 15 seconds');
-  log('SCANNER', '==============================');
+  if (!MORALIS_KEY) {
+    console.warn('⚠️ MORALIS_API_KEY not set — auto deposit scanner & withdrawal TX scanner disabled');
+    // Still run expiry cleanup even without Moralis key
+    setInterval(async () => {
+      await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
+    }, 60000);
+    return;
+  }
 
-  // First scan after 8 seconds
-  setTimeout(() => {
-    log('SCANNER', '[SCANNER] Initial scan starting...');
-    scanBEP20Safe();
-  }, 8000);
+  console.log('🔍 BEP20 Moralis scanner started (10s interval)');
+  setTimeout(scanBEP20, 5000);
+  setInterval(scanBEP20, 10000);
 
-  // Poll every 15 seconds — BscScan free tier allows 5 calls/sec
-  setInterval(scanBEP20Safe, 15000);
+  // Withdrawal TX auto-detector — runs every 30s (no rush, Moralis rate limit friendly)
+  if (MORALIS_KEY) {
+    const scanWalletLabel = WITHDRAWAL_WALLET || DEPOSIT_WALLET;
+    console.log('🔍 Withdrawal TX scanner started (30s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
+    setTimeout(scanWithdrawalTx, 15000); // first run after 15s
+    setInterval(scanWithdrawalTx, 30000);
+    // Fallback proof sender — first run after 3 min (startup migration needs time), then every 2 min
+    setTimeout(scanWithdrawalFallback, 180000);
+    setInterval(scanWithdrawalFallback, 120000);
+  } else {
+    console.warn('⚠️ MORALIS_API_KEY not set — withdrawal TX auto-detection disabled');
+  }
 
-  // Auto-expire stale pending deposits every 60 seconds
+  // Auto-expire old pending deposits every minute
   setInterval(async () => {
-    try {
-      const r = await pool.query(
-        `UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW() RETURNING id, user_id`
-      );
-      if (r.rowCount > 0) {
-        log('SCANNER', '[AUTO-EXPIRE] ' + r.rowCount + ' deposit(s) expired: ids=' + r.rows.map(x => x.id).join(','));
-      }
-    } catch(e) { log('SCANNER', '[EXPIRE ERROR] ' + e.message); }
+    await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
   }, 60000);
+  // today_earned is reset per-user in GET /api/user/:id when last_earn_date changes (no bulk reset needed)
 }
 
 // ══════════════════════════════════════════
