@@ -659,6 +659,17 @@ async function setupDB() {
   `);
   await db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS bsc_tx_hash TEXT DEFAULT NULL`);
 
+  // Mark all pre-existing approved withdrawals as 'skipped' in proof logs
+  // so fallback scanner never re-posts old withdrawals after deploy
+  await db.run(`
+    INSERT INTO tg_proof_logs (withdraw_id, sent_status, error_msg)
+    SELECT t.id, 'skipped', 'pre-existing before TG proof feature'
+    FROM transactions t
+    WHERE t.type = 'withdraw'
+      AND t.status = 'approved'
+      AND NOT EXISTS (SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id)
+  `);
+
   console.log('✅ Database ready (Neon PostgreSQL)');
 }
 
@@ -2679,7 +2690,7 @@ async function scanWithdrawalTx() {
         AND t.status  = 'approved'
         AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
         AND t.approved_at IS NOT NULL
-        AND t.approved_at >= NOW() - INTERVAL '24 hours'
+        AND t.approved_at >= NOW() - INTERVAL '2 hours'
     `);
 
     if (!pending.length) return; // nothing to match — skip Moralis call entirely
@@ -2770,10 +2781,10 @@ async function scanWithdrawalFallback() {
         AND t.status  = 'approved'
         AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
         AND t.approved_at IS NOT NULL
+        AND t.approved_at >= NOW() - INTERVAL '2 hours'
         AND t.approved_at <= NOW() - INTERVAL '5 minutes'
-        AND t.approved_at >= NOW() - INTERVAL '25 hours'
         AND NOT EXISTS (
-          SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id AND pl.sent_status = 'sent'
+          SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id
         )
     `);
 
