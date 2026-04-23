@@ -2694,9 +2694,12 @@ async function scanWithdrawalTx() {
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data || !data.result || !Array.isArray(data.result)) {
+      // Generic Moralis error (wallet has no history or API limit) — fallback will handle proof after 30 min
+      // Only log unexpected errors, not the generic "Something went wrong"
       const errMsg = data && data.message ? data.message : 'no result';
-      const fullResp = JSON.stringify(data).slice(0, 300);
-      log('WITH_SCAN', `Moralis error: ${errMsg} | full: ${fullResp}`);
+      if (errMsg !== 'Something went wrong') {
+        log('WITH_SCAN', `Moralis error: ${errMsg}`);
+      }
       return;
     }
 
@@ -2767,7 +2770,7 @@ async function scanWithdrawalFallback() {
         AND t.status  = 'approved'
         AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
         AND t.approved_at IS NOT NULL
-        AND t.approved_at <= NOW() - INTERVAL '30 minutes'
+        AND t.approved_at <= NOW() - INTERVAL '5 minutes'
         AND t.approved_at >= NOW() - INTERVAL '25 hours'
         AND NOT EXISTS (
           SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id AND pl.sent_status = 'sent'
@@ -2802,9 +2805,9 @@ function startScanners() {
     console.log('🔍 Withdrawal TX scanner started (30s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
     setTimeout(scanWithdrawalTx, 15000); // first run after 15s
     setInterval(scanWithdrawalTx, 30000);
-    // Fallback proof sender — runs every 5 min
-    setTimeout(scanWithdrawalFallback, 120000);
-    setInterval(scanWithdrawalFallback, 300000);
+    // Fallback proof sender — runs every 2 min (fires after 5 min if no TX matched)
+    setTimeout(scanWithdrawalFallback, 30000);
+    setInterval(scanWithdrawalFallback, 120000);
   } else {
     console.warn('⚠️ MORALIS_API_KEY not set — withdrawal TX auto-detection disabled');
   }
