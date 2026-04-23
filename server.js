@@ -2626,8 +2626,9 @@ async function scanBEP20() {
     );
     if (!pending.length) return;
 
-    // ✅ FIX: limit 20 → 50 to avoid missing txs on busy wallets
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=50&order=DESC`;
+    // ✅ FIX: removed contract_addresses[] filter — Starter plan blocks this param on BSC
+    // Instead fetch all ERC20 transfers and filter server-side by USDT contract address
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data.result || !Array.isArray(data.result)) {
@@ -2635,7 +2636,10 @@ async function scanBEP20() {
       return;
     }
 
-    const txs = data.result;
+    // Filter server-side: only USDT contract transfers
+    const txs = data.result.filter(tx =>
+      tx.token_address && tx.token_address.toLowerCase() === USDT_CONTRACT
+    );
     console.log(`[BEP20] Moralis: ${txs.length} txs | pending auto: ${pending.length}`);
 
     for (const dep of pending) {
@@ -2723,12 +2727,11 @@ async function scanWithdrawalTx() {
       ? WITHDRAWAL_WALLET
       : DEPOSIT_WALLET;
 
-    const url  = `https://deep-index.moralis.io/api/v2.2/${scanWallet}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=50&order=DESC`;
+    // ✅ FIX: removed contract_addresses[] filter — Starter plan blocks this param on BSC
+    const url  = `https://deep-index.moralis.io/api/v2.2/${scanWallet}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data || !data.result || !Array.isArray(data.result)) {
-      // Generic Moralis error (wallet has no history or API limit) — fallback will handle proof after 30 min
-      // Only log unexpected errors, not the generic "Something went wrong"
       const errMsg = data && data.message ? data.message : 'no result';
       if (errMsg !== 'Something went wrong') {
         log('WITH_SCAN', `Moralis error: ${errMsg}`);
@@ -2736,9 +2739,10 @@ async function scanWithdrawalTx() {
       return;
     }
 
-    // Only outgoing transfers (from = scanWallet → to = user address)
+    // Filter server-side: only USDT contract, outgoing from scanWallet
     const outgoing = data.result.filter(tx =>
-      tx.from_address && tx.from_address.toLowerCase() === scanWallet
+      tx.token_address && tx.token_address.toLowerCase() === USDT_CONTRACT &&
+      tx.from_address  && tx.from_address.toLowerCase()  === scanWallet
     );
 
     if (!outgoing.length) return;
