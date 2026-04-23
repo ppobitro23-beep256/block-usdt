@@ -2420,14 +2420,28 @@ async function scanBEP20() {
       return;
     }
 
-    // ── Fetch recent ERC20 transfers for wallet via Moralis ──
-    // NOTE: Do NOT include contract_addresses param — it causes 500 on some Moralis plans.
-    // We filter by USDT contract address client-side instead.
-    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=100&order=DESC`;
-    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' });
+    // ── Fetch via Moralis: try v2.2 first, fallback to v2 ──
+    // chain=0x38 = BSC mainnet (more explicit than 'bsc')
+    // No order/contract_addresses params — they cause 500 on some plans
+    let data = null;
+    const MORALIS_WALLET = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148');
+    for (const apiVer of ['v2.2', 'v2']) {
+      for (const chainId of ['0x38', 'bsc', '56']) {
+        const tryUrl = `https://deep-index.moralis.io/api/${apiVer}/${MORALIS_WALLET}/erc20/transfers?chain=${chainId}&limit=50`;
+        const tryData = await httpsGet(tryUrl, { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' });
+        console.log(`[BEP20] Trying ${apiVer} chain=${chainId} → HTTP ${tryData._http_status}`);
+        if (tryData._ok && Array.isArray(tryData.result)) {
+          data = tryData;
+          console.log(`[BEP20] ✅ Moralis OK with ${apiVer} chain=${chainId}`);
+          break;
+        }
+        console.log(`[BEP20] ❌ ${apiVer} chain=${chainId} failed: ${String(tryData.message||tryData.error||tryData._raw||'').slice(0,150)}`);
+      }
+      if (data) break;
+    }
 
-    if (!data._ok || !Array.isArray(data.result)) {
-      console.log(`[BEP20] Moralis error HTTP=${data._http_status} msg=${String(data.message || data.error || '').slice(0,200)} raw=${(data._raw||'').slice(0,200)}`);
+    if (!data || !Array.isArray(data.result)) {
+      console.log('[BEP20] All Moralis URL formats failed — check API key and plan at moralis.io');
       return;
     }
 
