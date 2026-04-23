@@ -2229,17 +2229,36 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 // AUTO DEPOSIT — Generate unique amount
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
-  for (let i = 0; i < 50; i++) {
-    // 1-5 → 0.01-0.05 (2 decimal places, 5 possible values)
-    const dec  = (Math.floor(Math.random() * 5) + 1);
-    const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
-    const ex   = await db.one(
+  const baseAmt = +parseFloat(base).toFixed(2);
+  if (!Number.isFinite(baseAmt) || baseAmt <= 0) {
+    throw new Error('Invalid deposit amount');
+  }
+
+  // Use a larger suffix range to avoid collisions during busy periods.
+  const tried = new Set();
+  for (let i = 0; i < 99; i++) {
+    const dec = Math.floor(Math.random() * 99) + 1; // 0.01 .. 0.99
+    if (tried.has(dec)) continue;
+    tried.add(dec);
+    const uAmt = +(baseAmt + dec / 100).toFixed(2);
+    const ex = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
       [uAmt]
     );
     if (!ex) return uAmt;
   }
-  throw new Error('Cannot generate unique amount — try again');
+
+  // Deterministic fallback in case all random tries are exhausted.
+  for (let dec = 1; dec <= 99; dec++) {
+    const uAmt = +(baseAmt + dec / 100).toFixed(2);
+    const ex = await db.one(
+      `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
+      [uAmt]
+    );
+    if (!ex) return uAmt;
+  }
+
+  throw new Error('Cannot generate unique amount right now — please retry');
 }
 
 // ── POST /api/deposit/create ──────────────
@@ -2370,10 +2389,12 @@ async function scanBEP20() {
       let matched = false;
 
       for (const tx of txs) {
+        if (!tx || !tx.to_address || !tx.transaction_hash) continue;
         if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
         if (new Date(tx.block_timestamp).getTime() < depTs) continue;
 
         const txAmt = parseFloat(tx.value_decimal);
+        if (!Number.isFinite(txAmt)) continue;
         const diff  = Math.abs(txAmt - dep.unique_amt);
         console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
 
