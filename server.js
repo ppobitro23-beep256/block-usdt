@@ -2303,31 +2303,35 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
 
 // ══════════════════════════════════════════
 // ══════════════════════════════════════════
-// AUTO DEPOSIT — Moralis HTTP helper (raw, no URL re-encoding)
+// AUTO DEPOSIT — BscScan HTTP helper
 // ══════════════════════════════════════════
 
-function moralisGet(path, apiKey) {
+const BSCSCAN_KEY = process.env.BSCSCAN_API_KEY || 'IYF1QR2JMF9VDC9CCYPW629Y4CMMERGN74';
+
+function bscscanGet(params) {
   return new Promise((resolve) => {
+    const qs = Object.entries(params).map(([k,v]) => k + '=' + encodeURIComponent(v)).join('&');
+    const path = '/v2/api?chainid=56&' + qs;
+
     const options = {
-      hostname: 'deep-index.moralis.io',
+      hostname: 'api.etherscan.io',
       port: 443,
       path: path,
       method: 'GET',
       headers: {
-        'X-API-Key': apiKey,
-        'Accept': 'application/json',
         'User-Agent': 'BlockUSDT/1.0',
+        'Accept': 'application/json',
       },
     };
 
-    log('SCANNER', '[MORALIS] Request → https://deep-index.moralis.io' + path.slice(0, 120));
+    log('SCANNER', '[BSCSCAN] GET https://api.etherscan.io' + path.slice(0, 120));
 
     const req = https.request(options, (res) => {
       let raw = '';
       res.on('data', chunk => { raw += chunk; });
       res.on('end', () => {
-        log('SCANNER', '[MORALIS] HTTP status: ' + res.statusCode);
-        log('SCANNER', '[MORALIS] Raw response: ' + raw.slice(0, 400));
+        log('SCANNER', '[BSCSCAN] HTTP status: ' + res.statusCode);
+        log('SCANNER', '[BSCSCAN] Raw response: ' + raw.slice(0, 300));
         try {
           resolve({ statusCode: res.statusCode, body: JSON.parse(raw) });
         } catch(e) {
@@ -2337,12 +2341,12 @@ function moralisGet(path, apiKey) {
     });
 
     req.on('error', (e) => {
-      log('SCANNER', '[MORALIS] Request error: ' + e.message);
+      log('SCANNER', '[BSCSCAN] Request error: ' + e.message);
       resolve({ statusCode: 0, body: {} });
     });
 
     req.setTimeout(12000, () => {
-      log('SCANNER', '[MORALIS] Request timeout — aborting');
+      log('SCANNER', '[BSCSCAN] Request timeout');
       req.destroy();
       resolve({ statusCode: 0, body: {} });
     });
@@ -2388,12 +2392,12 @@ async function creditAutoDeposit(dep, txHash) {
       );
     }
 
-    log('SCANNER', '[CREDITED USER] user=' + dep.user_id + ' amount=' + dep.amount + ' USDT unique=' + dep.unique_amt + ' tx=' + txHash);
+    log('SCANNER', '[CREDITED USER] user=' + dep.user_id + ' amount=$' + dep.amount + ' USDT unique=' + dep.unique_amt + ' tx=' + txHash);
     logSecurity('AUTO_DEPOSIT_CREDITED', { user_id: dep.user_id, amount: dep.amount, unique_amt: dep.unique_amt, tx: txHash });
 
   } catch(e) {
     if (e.message && (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash'))) {
-      log('SCANNER', '[DUPLICATE SKIPPED] tx=' + txHash.slice(0,20) + '... unique constraint — already credited');
+      log('SCANNER', '[DUPLICATE SKIPPED] tx=' + txHash.slice(0,20) + '... unique constraint');
     } else {
       log('SCANNER', '[CREDIT ERROR] dep=' + dep.id + ' user=' + dep.user_id + ' err=' + e.message);
     }
@@ -2401,8 +2405,7 @@ async function creditAutoDeposit(dep, txHash) {
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER — Moralis BSC
-// Tries v2.2 first, falls back to v2 on error
+// BEP20 AUTO SCANNER — BscScan (Etherscan V2)
 // ══════════════════════════════════════════
 async function scanBEP20() {
   try {
@@ -2412,78 +2415,66 @@ async function scanBEP20() {
     );
     if (!pending.length) return; // nothing to do — silent
 
-    log('SCANNER', '[SCAN] ' + pending.length + ' pending deposit(s) — querying Moralis BSC...');
+    log('SCANNER', '[SCAN] ' + pending.length + ' pending deposit(s) — querying BscScan...');
 
-    // Step 2: validate API key
-    if (!MORALIS_KEY) {
-      log('SCANNER', '[ERROR] MORALIS_API_KEY is missing! Set it in Render → Environment Variables.');
-      return;
-    }
-
-    // Step 3: build query path — use 0x38 chain id (most reliable for BSC on Moralis)
-    // Try v2.2 endpoint; if it errors, auto-retry with v2 endpoint
     const wallet   = DEPOSIT_WALLET.toLowerCase();
     const contract = USDT_CONTRACT.toLowerCase();
 
-    const ENDPOINTS = [
-      '/api/v2.2/' + wallet + '/erc20/transfers?chain=0x38&limit=25&order=DESC',
-      '/api/v2/'   + wallet + '/erc20/transfers?chain=0x38&limit=25&order=DESC',
-    ];
+    // Step 2: fetch latest USDT token transfers to deposit wallet
+    const { statusCode, body } = await bscscanGet({
+      module:          'account',
+      action:          'tokentx',
+      contractaddress: contract,
+      address:         wallet,
+      page:            '1',
+      offset:          '25',
+      sort:            'desc',
+      apikey:          BSCSCAN_KEY,
+    });
 
-    let txs = null;
-
-    for (let i = 0; i < ENDPOINTS.length; i++) {
-      const path = ENDPOINTS[i];
-      log('SCANNER', '[MORALIS] Trying endpoint ' + (i+1) + '/' + ENDPOINTS.length + ': ' + path.slice(0,80));
-
-      const { statusCode, body } = await moralisGet(path, MORALIS_KEY);
-
-      // Success
-      if (statusCode === 200 && body.result && Array.isArray(body.result)) {
-        log('SCANNER', '[MORALIS] Connected OK — ' + body.result.length + ' tx(s) returned');
-        txs = body.result;
-        break;
+    // Step 3: validate response
+    if (statusCode !== 200 || !body || body.status === '0') {
+      const msg = (body && body.message) ? body.message : JSON.stringify(body).slice(0, 200);
+      // status=0 with "No transactions found" is normal — not an error
+      if (body && body.message === 'No transactions found') {
+        log('SCANNER', '[BSCSCAN] No USDT txs found for wallet yet — waiting');
+      } else {
+        log('SCANNER', '[BSCSCAN] Error: ' + msg + ' — will retry next cycle');
       }
-
-      // Error — log and try next endpoint
-      const errMsg = (body && body.message) ? body.message : JSON.stringify(body).slice(0, 200);
-      log('SCANNER', '[MORALIS] Endpoint ' + (i+1) + ' failed (HTTP ' + statusCode + '): ' + errMsg);
-    }
-
-    if (!txs) {
-      log('SCANNER', '[ERROR] All Moralis endpoints failed — will retry next cycle (10s)');
       return;
     }
 
-    // Step 4: filter ONLY incoming USDT transfers to our deposit wallet
-    const usdtTxs = txs.filter(tx =>
-      (tx.address         || '').toLowerCase() === contract &&
-      (tx.to_address      || '').toLowerCase() === wallet
-    );
-    log('SCANNER', '[TX FOUND] ' + txs.length + ' total ERC20 txs | ' + usdtTxs.length + ' USDT incoming to deposit wallet');
+    const txs = body.result || [];
+    log('SCANNER', '[BSCSCAN] Connected OK — ' + txs.length + ' USDT tx(s) returned');
 
-    // Step 5: match each pending deposit
+    // Step 4: match each pending deposit
     for (const dep of pending) {
-      const depTs = new Date(dep.created_at).getTime() - 60000; // 1-min grace window
+      const depTs = Math.floor(new Date(dep.created_at).getTime() / 1000) - 60; // unix ts with 1-min grace
       let matched = false;
 
-      for (const tx of usdtTxs) {
-        if (new Date(tx.block_timestamp).getTime() < depTs) continue;
+      for (const tx of txs) {
+        // Must be incoming to our wallet
+        if ((tx.to || '').toLowerCase() !== wallet) continue;
+        // Must be USDT contract
+        if ((tx.contractAddress || '').toLowerCase() !== contract) continue;
+        // Must not be older than deposit creation
+        if (parseInt(tx.timeStamp) < depTs) continue;
 
-        const txAmt = parseFloat(tx.value_decimal);
+        // BscScan returns value in token decimals (USDT = 18 decimals on BSC)
+        const txAmt = parseFloat(tx.value) / 1e18;
         const diff  = Math.abs(txAmt - dep.unique_amt);
 
-        log('SCANNER', '[TX FOUND] hash=' + tx.transaction_hash.slice(0,20) + '... got=' + txAmt + ' exp=' + dep.unique_amt + ' diff=' + diff.toFixed(4));
+        log('SCANNER', '[TX FOUND] hash=' + tx.hash.slice(0,20) + '... got=' + txAmt.toFixed(4) + ' exp=' + dep.unique_amt + ' diff=' + diff.toFixed(4));
 
         if (diff <= 0.01) {
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-            log('SCANNER', '[EXPIRED] dep=' + dep.id + ' user=' + dep.user_id + ' — expired before credit');
+            log('SCANNER', '[EXPIRED] dep=' + dep.id + ' user=' + dep.user_id + ' expired before credit');
             matched = true;
             break;
           }
-          log('SCANNER', '[MATCH] dep=' + dep.id + ' user=' + dep.user_id + ' amt=' + dep.unique_amt + ' tx=' + tx.transaction_hash);
-          await creditAutoDeposit(dep, tx.transaction_hash);
+          log('SCANNER', '[MATCH] dep=' + dep.id + ' user=' + dep.user_id + ' amt=' + dep.unique_amt + ' tx=' + tx.hash);
+          await creditAutoDeposit(dep, tx.hash);
           matched = true;
           break;
         }
@@ -2505,29 +2496,23 @@ async function scanBEP20() {
 // ══════════════════════════════════════════
 // START SCANNERS
 // ══════════════════════════════════════════
-let _scannerBackoff = 0; // consecutive Moralis failures
-let _scannerRunning = false; // prevent overlapping scans
+let _scannerRunning = false;
 
 async function scanBEP20Safe() {
-  if (_scannerRunning) return; // skip if previous scan still running
+  if (_scannerRunning) return;
   _scannerRunning = true;
-  try {
-    await scanBEP20();
-    _scannerBackoff = 0; // reset backoff on success
-  } catch(e) {
-    _scannerBackoff = Math.min(_scannerBackoff + 1, 6);
-  } finally {
-    _scannerRunning = false;
-  }
+  try { await scanBEP20(); }
+  catch(e) { log('SCANNER', '[SAFE WRAPPER ERROR] ' + e.message); }
+  finally { _scannerRunning = false; }
 }
 
 function startScanners() {
   log('SCANNER', '==============================');
-  log('SCANNER', '[SCANNER STARTED] BEP20 Moralis auto-deposit scanner');
-  log('SCANNER', '[CONFIG] wallet       = ' + DEPOSIT_WALLET);
-  log('SCANNER', '[CONFIG] usdt         = ' + USDT_CONTRACT);
-  log('SCANNER', '[CONFIG] moralis_key  = ' + (MORALIS_KEY ? 'SET (' + MORALIS_KEY.slice(0,8) + '...)' : 'MISSING!'));
-  log('SCANNER', '[CONFIG] interval     = 30 seconds (CU-safe)');
+  log('SCANNER', '[SCANNER STARTED] BEP20 BscScan auto-deposit scanner');
+  log('SCANNER', '[CONFIG] wallet        = ' + DEPOSIT_WALLET);
+  log('SCANNER', '[CONFIG] usdt_contract = ' + USDT_CONTRACT);
+  log('SCANNER', '[CONFIG] bscscan_key   = ' + (BSCSCAN_KEY ? 'SET (' + BSCSCAN_KEY.slice(0,8) + '...)' : 'MISSING!'));
+  log('SCANNER', '[CONFIG] interval      = 15 seconds');
   log('SCANNER', '==============================');
 
   // First scan after 8 seconds
@@ -2536,8 +2521,8 @@ function startScanners() {
     scanBEP20Safe();
   }, 8000);
 
-  // Poll every 30 seconds — saves CU, still fast enough for deposits
-  setInterval(scanBEP20Safe, 30000);
+  // Poll every 15 seconds — BscScan free tier allows 5 calls/sec
+  setInterval(scanBEP20Safe, 15000);
 
   // Auto-expire stale pending deposits every 60 seconds
   setInterval(async () => {
@@ -2546,7 +2531,7 @@ function startScanners() {
         `UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW() RETURNING id, user_id`
       );
       if (r.rowCount > 0) {
-        log('SCANNER', '[AUTO-EXPIRE] ' + r.rowCount + ' expired deposit(s): ids=' + r.rows.map(x => x.id).join(','));
+        log('SCANNER', '[AUTO-EXPIRE] ' + r.rowCount + ' deposit(s) expired: ids=' + r.rows.map(x => x.id).join(','));
       }
     } catch(e) { log('SCANNER', '[EXPIRE ERROR] ' + e.message); }
   }, 60000);
