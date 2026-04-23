@@ -2718,9 +2718,9 @@ async function scanBEP20() {
 
     // 2. Determine scan range
     // BSC ~3s/block → 10s interval = ~3-4 new blocks per cycle
-    // Cap at 500 blocks max per cycle — free BSC RPCs reject larger ranges
-    const MAX_BACK     = 200; // on first start, go back 200 blocks (~10 min)
-    const MAX_PER_SCAN = 500; // hard cap per cycle to avoid RPC "block range too large" error
+    // Free BSC RPC (bsc-dataseed) limit: ~100 blocks per eth_getLogs call
+    const MAX_BACK     = 50;  // on first start, go back 50 blocks (~2.5 min)
+    const MAX_PER_SCAN = 50;  // hard cap — free RPC rejects >~100 blocks
     const rawFrom  = rpcLastBlock > 0 ? rpcLastBlock + 1 : latestBlock - MAX_BACK;
     // BUG FIX: fromBlock must never be negative or zero
     const fromBlock = Math.max(1, rawFrom);
@@ -2989,7 +2989,7 @@ async function startScanners() {
   if (rpcLastBlock > 0) {
     log('RPC', `Resuming from saved block: ${rpcLastBlock}`);
   } else {
-    log('RPC', 'No saved block found — will start from latest - 200');
+    log('RPC', 'No saved block found — will start from latest - 50');
   }
 
   log('RPC', 'Scanner started (10s polling interval)');
