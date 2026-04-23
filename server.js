@@ -61,44 +61,13 @@ function httpsGet(url, headers) {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        let parsed = {};
-        try { parsed = JSON.parse(data); } catch(_) {}
-        resolve({
-          ...parsed,
-          _http_status: res.statusCode || 0,
-          _ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
-          _raw: data ? String(data).slice(0, 2000) : '',  // increased for better diagnostics
-        });
+        try { resolve(JSON.parse(data)); } catch(_) { resolve({}); }
       });
     });
-    req.on('error', (err) => resolve({ _http_status: 0, _ok: false, message: err.message || 'request failed' }));
-    req.setTimeout(15000, () => { req.destroy(); resolve({ _http_status: 0, _ok: false, message: 'request timeout' }); });
+    req.on('error', () => resolve({}));
+    req.setTimeout(10000, () => { req.destroy(); resolve({}); });
     req.end();
   });
-}
-
-// ── Token amount normalizer ─────────────────────────────────────────
-// Moralis returns value as raw integer string (e.g. "10000000000000000000")
-// and token_decimals as string (e.g. "18"). This converts safely using BigInt.
-function normalizeTokenAmount(rawValue, tokenDecimals) {
-  try {
-    const decimals = parseInt(tokenDecimals !== undefined && tokenDecimals !== null ? tokenDecimals : 18);
-    if (!Number.isFinite(decimals) || decimals < 0 || decimals > 36) return NaN;
-    const raw = String(rawValue || '0').trim();
-    // If already a decimal number (contains '.'), parse directly
-    if (raw.includes('.')) return parseFloat(raw);
-    // Pure integer string — use BigInt for precision
-    if (/^\d+$/.test(raw)) {
-      const factor = BigInt(10) ** BigInt(decimals);
-      const bigRaw  = BigInt(raw);
-      const intPart = bigRaw / factor;
-      const fracRaw = bigRaw % factor;
-      // Build fractional part as string with leading zeros
-      const fracStr = fracRaw.toString().padStart(decimals, '0');
-      return parseFloat(`${intPart}.${fracStr}`);
-    }
-    return parseFloat(raw);
-  } catch(_) { return NaN; }
 }
 
 const app  = express();
@@ -2260,52 +2229,17 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 // AUTO DEPOSIT — Generate unique amount
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
-  const baseAmt = +parseFloat(base).toFixed(2);
-  if (!Number.isFinite(baseAmt) || baseAmt <= 0) {
-    throw new Error('Invalid deposit amount');
-  }
-
-  // Keep user-facing amount close (0.01..0.05), then expand only if needed.
-  const preferred = [1, 2, 3, 4, 5];
-  for (let i = preferred.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const tmp = preferred[i];
-    preferred[i] = preferred[j];
-    preferred[j] = tmp;
-  }
-  for (const dec of preferred) {
-    const uAmt = +(baseAmt + dec / 100).toFixed(2);
-    const ex = await db.one(
+  for (let i = 0; i < 50; i++) {
+    // 1-5 → 0.01-0.05 (2 decimal places, 5 possible values)
+    const dec  = (Math.floor(Math.random() * 5) + 1);
+    const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
+    const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
       [uAmt]
     );
     if (!ex) return uAmt;
   }
-
-  const tried = new Set(preferred);
-  for (let i = 0; i < 94; i++) {
-    const dec = Math.floor(Math.random() * 99) + 1;
-    if (tried.has(dec)) continue;
-    tried.add(dec);
-    const uAmt = +(baseAmt + dec / 100).toFixed(2);
-    const ex = await db.one(
-      `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
-      [uAmt]
-    );
-    if (!ex) return uAmt;
-  }
-
-  // Deterministic fallback in case all random tries are exhausted.
-  for (let dec = 1; dec <= 99; dec++) {
-    const uAmt = +(baseAmt + dec / 100).toFixed(2);
-    const ex = await db.one(
-      `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
-      [uAmt]
-    );
-    if (!ex) return uAmt;
-  }
-
-  throw new Error('Cannot generate unique amount right now — please retry');
+  throw new Error('Cannot generate unique amount — try again');
 }
 
 // ── POST /api/deposit/create ──────────────
@@ -2371,42 +2305,47 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
 async function creditAutoDeposit(dep, txHash) {
   try {
     // [RACE GUARD] Only credit if this UPDATE actually changed a row
+    // If another process already completed this deposit, rowCount = 0 → skip
     const result = await pool.query(
-      `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending' RETURNING id`,
+      `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
       [txHash, dep.id]
     );
     if (result.rowCount === 0) {
       console.log(`[SKIP] Deposit ${dep.id} already processed (race guard)`);
       return;
     }
-    // Credit balance (base amount, not unique_amt which has tiny suffix)
-    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]);
+    // Credit balance only after confirmed row lock
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]); // credit base amount, not unique_amt (which has suffix)
     // Transaction log
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id, 'deposit', dep.amount, 'BEP20', txHash, 'approved', 'Auto-detected']
+      [dep.user_id,'deposit',dep.amount,'BEP20',txHash,'approved','Auto-detected']
     );
-    // Mark first_deposit task completed (no extra balance reward)
-    await db.run(
-      `INSERT INTO tasks (user_id, task_key, completed, completed_at)
-       VALUES ($1,'first_deposit',1,NOW()) ON CONFLICT DO NOTHING`,
-      [dep.user_id]
+    // Mark first_deposit task as completed (NO balance reward — exact deposit amount only)
+    const taskDone = await db.one(
+      `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
     );
-    console.log(`✅ Auto deposit CREDITED: user=${dep.user_id} amount=$${dep.amount} unique_amt=${dep.unique_amt} tx=${txHash}`);
-    log('DEPOSIT', `CREDITED user=${dep.user_id} amount=${dep.amount} tx=${txHash.slice(0,16)}`);
+    if (!taskDone) {
+      await db.run(
+        `INSERT INTO tasks (user_id, task_key, completed, completed_at)
+         VALUES ($1,'first_deposit',1,NOW()) ON CONFLICT DO NOTHING`,
+        [dep.user_id]
+      );
+    }
+    console.log(`✅ Auto deposit: user=${dep.user_id} base_amt=${dep.amount} unique_amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
   } catch(e) {
     // Gracefully handle unique constraint (tx_hash duplicate = already credited)
-    if (e.message && (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash'))) {
-      console.log(`[SAFE] TX ${(txHash||'').slice(0,16)} already processed — skipping`);
+    if (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash')) {
+      console.log(`[SAFE] TX ${txHash.slice(0,16)} already processed — skipping`);
     } else {
-      console.error('[creditAutoDeposit] ERROR:', e.message);
+      console.error('[creditAutoDeposit] error:', e.message);
     }
   }
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER (Moralis only)
+// BEP20 AUTO SCANNER (BscScan)
 // ══════════════════════════════════════════
 async function scanBEP20() {
   try {
@@ -2415,159 +2354,55 @@ async function scanBEP20() {
     );
     if (!pending.length) return;
 
-    if (!MORALIS_KEY) {
-      console.log('[BEP20] MORALIS_API_KEY not set — scanner disabled');
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
+
+    if (!data.result || !Array.isArray(data.result)) {
+      console.log('[BEP20] Moralis error:', JSON.stringify(data).slice(0, 200));
       return;
     }
 
-    // ── Diagnostic: show partial key so user can verify it's correct ──
-    console.log(`[BEP20] API key: "${MORALIS_KEY.slice(0,12)}..." len=${MORALIS_KEY.length}`);
+    const txs = data.result;
+    console.log(`[BEP20] Moralis: ${txs.length} txs | pending auto: ${pending.length}`);
 
-    // ── Quick ping: test if key is valid at all ──
-    const pingData = await httpsGet(
-      `https://deep-index.moralis.io/api/v2.2/discovery/block?chain=0x38&block_number_or_hash=1`,
-      { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' }
-    );
-    if (pingData._http_status === 401) {
-      console.log('[BEP20] ❌ MORALIS KEY INVALID — 401 Unauthorized. Go to admin.moralis.io and copy the Web3 API key.');
-      return;
-    }
-    console.log(`[BEP20] Ping HTTP=${pingData._http_status} (401=bad key, 200/400/404=key OK)`);
-
-    // ── Fetch via Moralis: try v2.2 first, fallback to v2 ──
-    // chain=0x38 = BSC mainnet (more explicit than 'bsc')
-    // No order/contract_addresses params — they cause 500 on some plans
-    let data = null;
-    const MORALIS_WALLET = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148');
-    for (const apiVer of ['v2.2', 'v2']) {
-      for (const chainId of ['0x38', 'bsc', '56']) {
-        const tryUrl = `https://deep-index.moralis.io/api/${apiVer}/${MORALIS_WALLET}/erc20/transfers?chain=${chainId}&limit=50`;
-        const tryData = await httpsGet(tryUrl, { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' });
-        console.log(`[BEP20] Trying ${apiVer} chain=${chainId} → HTTP ${tryData._http_status}`);
-        if (tryData._ok && Array.isArray(tryData.result)) {
-          data = tryData;
-          console.log(`[BEP20] ✅ Moralis OK with ${apiVer} chain=${chainId}`);
-          break;
-        }
-        console.log(`[BEP20] ❌ ${apiVer} chain=${chainId} failed: ${String(tryData.message||tryData.error||tryData._raw||'').slice(0,150)}`);
-      }
-      if (data) break;
-    }
-
-    if (!data || !Array.isArray(data.result)) {
-      console.log('[BEP20] All Moralis URL formats failed — check API key and plan at moralis.io');
-      return;
-    }
-
-    // Filter: only USDT token transfers INTO our wallet
-    // Moralis ERC20 transfer fields:
-    //   tx.address        = token contract address
-    //   tx.to_address     = recipient wallet
-    //   tx.from_address   = sender wallet
-    //   tx.value          = raw integer amount (e.g. "10000000000000000000")
-    //   tx.token_decimals = decimals string (e.g. "18")
-    const incoming = data.result
-      .filter(tx =>
-        tx &&
-        tx.transaction_hash &&
-        // Must be incoming to our deposit wallet
-        tx.to_address && tx.to_address.toLowerCase() === DEPOSIT_WALLET &&
-        // Must be the USDT contract
-        tx.address && tx.address.toLowerCase() === USDT_CONTRACT
-      )
-      .map(tx => ({
-        hash:      tx.transaction_hash,
-        amount:    normalizeTokenAmount(tx.value, tx.token_decimals),
-        timestamp: tx.block_timestamp ? new Date(tx.block_timestamp).getTime() : 0,
-        from:      (tx.from_address || '').toLowerCase(),
-      }))
-      .filter(tx => Number.isFinite(tx.amount) && tx.amount > 0);
-
-    console.log(`[BEP20] Moralis OK: ${data.result.length} ERC20 txs, ${incoming.length} incoming USDT | pending: ${pending.length}`);
-
-    if (incoming.length === 0) {
-      console.log(`[BEP20] No incoming USDT transfers found. wallet=${DEPOSIT_WALLET} usdt=${USDT_CONTRACT}`);
-      return;
-    }
-
-    // Log top 3 for diagnostics
-    incoming.slice(0, 3).forEach(tx => {
-      console.log(`[BEP20] tx: hash=${tx.hash.slice(0,16)} amount=${tx.amount} USDT time=${new Date(tx.timestamp).toISOString()}`);
-    });
-
-    // Match each pending deposit
     for (const dep of pending) {
-      // Accept txs up to 5 min before deposit was created (handles clock drift)
-      const depTs = new Date(dep.created_at).getTime() - 5 * 60 * 1000;
+      const depTs = new Date(dep.created_at).getTime() - 60000;
       let matched = false;
 
-      for (const tx of incoming) {
-        if (tx.timestamp > 0 && tx.timestamp < depTs) continue;
+      for (const tx of txs) {
+        if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
+        if (new Date(tx.block_timestamp).getTime() < depTs) continue;
 
-        const diff = Math.abs(tx.amount - dep.unique_amt);
-        console.log(`[BEP20] compare: dep=${dep.id} expected=${dep.unique_amt} got=${tx.amount} diff=${diff.toFixed(4)} hash=${tx.hash.slice(0,14)}`);
+        const txAmt = parseFloat(tx.value_decimal);
+        const diff  = Math.abs(txAmt - dep.unique_amt);
+        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
 
-        if (diff <= 0.015) {
+        if (diff <= 0.01) {
+          // [STRICT] Double-check expiry before crediting
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-            log('EXPIRY', `Deposit ${dep.id} expired before match user=${dep.user_id}`);
-            matched = true;
+            log('EXPIRY', `Auto deposit ${dep.id} expired before match user=${dep.user_id}`);
+            matched = true; // stop searching for this dep
             break;
           }
-          log('DEPOSIT', `MATCH dep=${dep.id} user=${dep.user_id} expected=${dep.unique_amt} got=${tx.amount} tx=${tx.hash.slice(0,20)}`);
-          await creditAutoDeposit(dep, tx.hash);
+          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+          await creditAutoDeposit(dep, tx.transaction_hash);
           matched = true;
           break;
         }
       }
-
+      // [REDUCED LOG] Only log no-match for very recent deposits (< 5 min)
       if (!matched) {
         const age = (Date.now() - new Date(dep.created_at).getTime()) / 60000;
-        if (age < 15) {
-          console.log(`[BEP20] Waiting for payment: dep=${dep.id} expected=${dep.unique_amt} USDT age=${age.toFixed(1)}m`);
-        }
+        if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
       }
     }
-  } catch(e) {
-    console.error('[BEP20] Scanner error:', e.message, e.stack ? e.stack.slice(0, 400) : '');
-  }
+  } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
 }
 
 // ══════════════════════════════════════════
 // START SCANNERS
 // ══════════════════════════════════════════
-
-// Admin diagnostic: test Moralis connection
-app.get('/admin/test-moralis', adminAuth, async (req, res) => {
-  try {
-    if (!MORALIS_KEY) return res.json({ ok: false, error: 'MORALIS_API_KEY not set in environment' });
-    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=5&order=DESC`;
-    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' });
-    const txSample = Array.isArray(data.result) ? data.result.slice(0, 2).map(tx => ({
-      hash: tx.transaction_hash,
-      to: tx.to_address,
-      from: tx.from_address,
-      value: tx.value,
-      token_decimals: tx.token_decimals,
-      token_symbol: tx.token_symbol,
-      token_address: tx.address,
-      block_timestamp: tx.block_timestamp,
-      computed_amount: normalizeTokenAmount(tx.value, tx.token_decimals),
-    })) : [];
-    res.json({
-      ok: data._ok,
-      http_status: data._http_status,
-      result_count: Array.isArray(data.result) ? data.result.length : null,
-      error: data.message || data.error || null,
-      raw_preview: data._raw ? data._raw.slice(0, 500) : null,
-      tx_sample: txSample,
-      deposit_wallet: DEPOSIT_WALLET,
-      usdt_contract: USDT_CONTRACT,
-      moralis_key_set: !!MORALIS_KEY,
-    });
-  } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
 function startScanners() {
   console.log('🔍 BEP20 Moralis scanner started (10s interval)');
   setTimeout(scanBEP20, 5000);
