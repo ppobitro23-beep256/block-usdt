@@ -2371,28 +2371,33 @@ async function scanBEP20() {
       return;
     }
 
-    // Step 3: call Moralis v2.2 BSC endpoint
-    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses%5B0%5D=${USDT_CONTRACT}&limit=25&order=DESC`;
-    log('SCANNER', `📡 [MORALIS] GET ${url.slice(0, 90)}...`);
+    // Step 3: call Moralis v2.2 BSC endpoint (no contract_addresses[] filter — causes errors on some plans)
+    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
+    log('SCANNER', `📡 [MORALIS] GET ${url.slice(0, 100)}...`);
 
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     // Step 4: handle API errors with full details
     if (!data || typeof data !== 'object') {
-      log('SCANNER', `❌ [API ERROR] Moralis returned non-object response: ${JSON.stringify(data).slice(0, 300)}`);
+      log('SCANNER', `❌ [API ERROR] Moralis returned non-object: ${JSON.stringify(data).slice(0, 300)}`);
       return;
     }
     if (data.message || data.error || data.status === '0') {
-      log('SCANNER', `❌ [API ERROR] Moralis error response: ${JSON.stringify(data).slice(0, 400)}`);
+      log('SCANNER', `❌ [API ERROR] Moralis error: ${JSON.stringify(data).slice(0, 400)}`);
       return;
     }
     if (!data.result || !Array.isArray(data.result)) {
-      log('SCANNER', `❌ [API ERROR] Moralis missing result array. Full response: ${JSON.stringify(data).slice(0, 400)}`);
+      log('SCANNER', `❌ [API ERROR] No result array. Full: ${JSON.stringify(data).slice(0, 400)}`);
       return;
     }
 
-    const txs = data.result;
-    log('SCANNER', `✅ [MORALIS CONNECTED] ${txs.length} tx(s) returned from BSC for wallet ${DEPOSIT_WALLET.slice(0,12)}...`);
+    // Filter: only incoming USDT transfers to our deposit wallet
+    const allTxs = data.result;
+    const txs = allTxs.filter(tx =>
+      (tx.address || '').toLowerCase() === USDT_CONTRACT &&
+      (tx.to_address || '').toLowerCase() === DEPOSIT_WALLET
+    );
+    log('SCANNER', `✅ [MORALIS CONNECTED] ${allTxs.length} total | ${txs.length} USDT incoming matched`);
 
     // Step 5: match each pending deposit against blockchain txs
     for (const dep of pending) {
