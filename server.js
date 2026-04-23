@@ -208,11 +208,7 @@ function tgEscape(str) {
 async function sendWithdrawProof(txData) {
   try {
     const cfg = await getTgGroupSettings();
-    log('TG_PROOF', `cfg: enabled=${cfg.enabled} chatId=${cfg.chatId} topicId=${cfg.topicId} wd=${txData.withdraw_id}`);
-    if (!cfg.enabled || !cfg.chatId) {
-      log('TG_PROOF', `SKIP: enabled=${cfg.enabled} chatId="${cfg.chatId}"`);
-      return;
-    }
+    if (!cfg.enabled || !cfg.chatId) return;
 
     const { withdraw_id, username, first_name, user_id, amount, address, bsc_tx_hash } = txData;
 
@@ -2181,17 +2177,21 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
     logSecurity('WITHDRAW_APPROVED', {tx_id, user_id, amount, address: (tx.address||'').slice(0,20)});
     res.json({success:true});
 
-    // Fire Telegram proof immediately after approve (non-blocking)
-    // Scanner will try to add TX hash separately if Moralis detects it
-    setImmediate(() => sendWithdrawProof({
-      withdraw_id: tx_id,
-      username:    tx.username    || '',
-      first_name:  tx.first_name  || '',
-      user_id:     user_id,
-      amount:      amount,
-      address:     tx.address     || '',
-      bsc_tx_hash: (bsc_tx_hash && bsc_tx_hash.trim()) ? bsc_tx_hash.trim() : ''
-    }));
+    // If admin manually entered a tx_hash → fire proof immediately
+    // If no tx_hash → withdrawal TX scanner will auto-detect and post proof (within 30s–30min)
+    // If scanner fails → fallback sends proof after 30 min without tx_hash
+    if (bsc_tx_hash && bsc_tx_hash.trim()) {
+      setImmediate(() => sendWithdrawProof({
+        withdraw_id: tx_id,
+        username:    tx.username    || '',
+        first_name:  tx.first_name  || '',
+        user_id:     user_id,
+        amount:      amount,
+        address:     tx.address     || '',
+        bsc_tx_hash: bsc_tx_hash.trim()
+      }));
+    }
+    // else: scanner (scanWithdrawalTx) will detect tx_hash and fire proof automatically
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
@@ -2816,8 +2816,8 @@ function startScanners() {
     console.log('🔍 Withdrawal TX scanner started (30s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
     setTimeout(scanWithdrawalTx, 15000); // first run after 15s
     setInterval(scanWithdrawalTx, 30000);
-    // Fallback proof sender — first run after 3 min (startup migration needs time), then every 2 min
-    setTimeout(scanWithdrawalFallback, 180000);
+    // Fallback proof sender — runs every 2 min (fires after 5 min if no TX matched)
+    setTimeout(scanWithdrawalFallback, 30000);
     setInterval(scanWithdrawalFallback, 120000);
   } else {
     console.warn('⚠️ MORALIS_API_KEY not set — withdrawal TX auto-detection disabled');
