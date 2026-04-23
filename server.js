@@ -2678,6 +2678,7 @@ async function scanWithdrawalTx() {
       WHERE t.type    = 'withdraw'
         AND t.status  = 'approved'
         AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
+        AND t.approved_at IS NOT NULL
         AND t.approved_at >= NOW() - INTERVAL '24 hours'
     `);
 
@@ -2694,7 +2695,8 @@ async function scanWithdrawalTx() {
 
     if (!data || !data.result || !Array.isArray(data.result)) {
       const errMsg = data && data.message ? data.message : 'no result';
-      log('WITH_SCAN', 'Moralis error: ' + errMsg);
+      const fullResp = JSON.stringify(data).slice(0, 300);
+      log('WITH_SCAN', `Moralis error: ${errMsg} | full: ${fullResp}`);
       return;
     }
 
@@ -2764,6 +2766,7 @@ async function scanWithdrawalFallback() {
       WHERE t.type    = 'withdraw'
         AND t.status  = 'approved'
         AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
+        AND t.approved_at IS NOT NULL
         AND t.approved_at <= NOW() - INTERVAL '30 minutes'
         AND t.approved_at >= NOW() - INTERVAL '25 hours'
         AND NOT EXISTS (
