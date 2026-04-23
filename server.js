@@ -2661,33 +2661,33 @@ app.get('/api/referrals/:userId', userAuth, async (req, res) => {
   if (String(req.tgUser.id) !== String(req.params.userId)) return res.status(403).json({ error: 'Forbidden' });
   try {
     const userId = req.params.userId;
-    const [level1, level2, level3] = await Promise.all([
-      db.all(`
-        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
-          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
-        FROM users u WHERE u.referred_by=$1 ORDER BY u.created_at DESC
-      `, [userId]),
-      db.all(`
-        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
-          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
-        FROM users u
-        WHERE u.referred_by IN (SELECT id FROM users WHERE referred_by=$1)
-        ORDER BY u.created_at DESC
-      `, [userId]),
-      db.all(`
-        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
-          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
-        FROM users u
-        WHERE u.referred_by IN (
-          SELECT id FROM users WHERE referred_by IN (SELECT id FROM users WHERE referred_by=$1)
-        )
-        ORDER BY u.created_at DESC
-      `, [userId]),
-    ]);
-    res.json({ level1, level2, level3 });
+
+    // Get user's real max levels (respects admin override)
+    const { vip } = await getUserVipStatus(userId);
+    const maxLevels = vip.maxLevels || 3;
+
+    // Build level queries dynamically up to maxLevels
+    // Level 1: direct referrals
+    // Level N: users referred by level N-1 users
+    const refQuery = `
+      SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
+        COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
+        EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
+      FROM users u WHERE u.referred_by = ANY($2::bigint[]) ORDER BY u.created_at DESC
+    `;
+
+    // Walk the tree level by level
+    const result = { max_levels: maxLevels };
+    let currentIds = [BigInt(userId)];
+
+    for (let lvl = 1; lvl <= maxLevels; lvl++) {
+      const rows = await db.all(refQuery, [userId, currentIds]);
+      result['level' + lvl] = rows;
+      currentIds = rows.map(r => BigInt(r.id));
+      if (currentIds.length === 0) break;
+    }
+
+    res.json(result);
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
 });
 
