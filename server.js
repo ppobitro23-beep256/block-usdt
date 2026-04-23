@@ -50,10 +50,12 @@ const BEP20_USDT_CONTRACT = USDT_CONTRACT;
 // Simple HTTPS GET helper
 function httpsGet(url, headers) {
   return new Promise((resolve) => {
-    const opts = new URL(url);
+    // Use URL only for hostname extraction; keep raw path+search to avoid bracket re-encoding
+    const parsed = new URL(url);
+    const rawPath = url.slice(url.indexOf(parsed.pathname)); // preserves raw [...] in query string
     const options = {
-      hostname: opts.hostname,
-      path: opts.pathname + opts.search,
+      hostname: parsed.hostname,
+      path: rawPath,
       method: 'GET',
       headers: Object.assign({ 'User-Agent': 'BlockUSDT/1.0' }, headers || {}),
     };
@@ -64,8 +66,8 @@ function httpsGet(url, headers) {
         try { resolve(JSON.parse(data)); } catch(_) { resolve({}); }
       });
     });
-    req.on('error', () => resolve({}));
-    req.setTimeout(10000, () => { req.destroy(); resolve({}); });
+    req.on('error', (e) => { console.error('[httpsGet error]', e.message); resolve({}); });
+    req.setTimeout(12000, () => { req.destroy(); resolve({}); });
     req.end();
   });
 }
@@ -2371,8 +2373,8 @@ async function scanBEP20() {
       return;
     }
 
-    // Step 3: call Moralis v2.2 BSC endpoint (no contract_addresses[] filter — causes errors on some plans)
-    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
+    // Step 3: call Moralis v2.2 BSC endpoint — original working format
+    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=25&order=DESC`;
     log('SCANNER', `📡 [MORALIS] GET ${url.slice(0, 100)}...`);
 
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
@@ -2391,13 +2393,8 @@ async function scanBEP20() {
       return;
     }
 
-    // Filter: only incoming USDT transfers to our deposit wallet
-    const allTxs = data.result;
-    const txs = allTxs.filter(tx =>
-      (tx.address || '').toLowerCase() === USDT_CONTRACT &&
-      (tx.to_address || '').toLowerCase() === DEPOSIT_WALLET
-    );
-    log('SCANNER', `✅ [MORALIS CONNECTED] ${allTxs.length} total | ${txs.length} USDT incoming matched`);
+    const txs = data.result;
+    log('SCANNER', `✅ [MORALIS CONNECTED] ${txs.length} tx(s) returned from BSC`);
 
     // Step 5: match each pending deposit against blockchain txs
     for (const dep of pending) {
