@@ -2505,23 +2505,39 @@ async function scanBEP20() {
 // ══════════════════════════════════════════
 // START SCANNERS
 // ══════════════════════════════════════════
+let _scannerBackoff = 0; // consecutive Moralis failures
+let _scannerRunning = false; // prevent overlapping scans
+
+async function scanBEP20Safe() {
+  if (_scannerRunning) return; // skip if previous scan still running
+  _scannerRunning = true;
+  try {
+    await scanBEP20();
+    _scannerBackoff = 0; // reset backoff on success
+  } catch(e) {
+    _scannerBackoff = Math.min(_scannerBackoff + 1, 6);
+  } finally {
+    _scannerRunning = false;
+  }
+}
+
 function startScanners() {
   log('SCANNER', '==============================');
   log('SCANNER', '[SCANNER STARTED] BEP20 Moralis auto-deposit scanner');
   log('SCANNER', '[CONFIG] wallet       = ' + DEPOSIT_WALLET);
   log('SCANNER', '[CONFIG] usdt         = ' + USDT_CONTRACT);
   log('SCANNER', '[CONFIG] moralis_key  = ' + (MORALIS_KEY ? 'SET (' + MORALIS_KEY.slice(0,8) + '...)' : 'MISSING!'));
-  log('SCANNER', '[CONFIG] interval     = 10 seconds');
+  log('SCANNER', '[CONFIG] interval     = 30 seconds (CU-safe)');
   log('SCANNER', '==============================');
 
-  // First scan after 5 seconds (let DB settle after startup)
+  // First scan after 8 seconds
   setTimeout(() => {
     log('SCANNER', '[SCANNER] Initial scan starting...');
-    scanBEP20();
-  }, 5000);
+    scanBEP20Safe();
+  }, 8000);
 
-  // Poll every 10 seconds
-  setInterval(scanBEP20, 10000);
+  // Poll every 30 seconds — saves CU, still fast enough for deposits
+  setInterval(scanBEP20Safe, 30000);
 
   // Auto-expire stale pending deposits every 60 seconds
   setInterval(async () => {
