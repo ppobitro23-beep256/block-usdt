@@ -2420,68 +2420,73 @@ async function scanBEP20() {
       return;
     }
 
-    // ── Fetch recent incoming USDT transfers via Moralis ──
-    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses=${USDT_CONTRACT}&limit=100&order=DESC`;
+    // ── Fetch recent ERC20 transfers for wallet via Moralis ──
+    // NOTE: Do NOT include contract_addresses param — it causes 500 on some Moralis plans.
+    // We filter by USDT contract address client-side instead.
+    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=100&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' });
 
     if (!data._ok || !Array.isArray(data.result)) {
-      console.log(`[BEP20] Moralis error status=${data._http_status}: ${String(data.message || data.error || data._raw || '').slice(0, 300)}`);
+      console.log(`[BEP20] Moralis error HTTP=${data._http_status} msg=${String(data.message || data.error || '').slice(0,200)} raw=${(data._raw||'').slice(0,200)}`);
       return;
     }
 
-    // Normalize all txs: convert raw `value` + `token_decimals` → decimal amount
-    // Moralis returns value as raw integer string e.g. "10000000000000000000" (= 10 USDT @ 18 decimals)
-    const allTxs = data.result
-      .filter(tx => tx && tx.transaction_hash && tx.to_address)
+    // Filter: only USDT token transfers INTO our wallet
+    // Moralis ERC20 transfer fields:
+    //   tx.address        = token contract address
+    //   tx.to_address     = recipient wallet
+    //   tx.from_address   = sender wallet
+    //   tx.value          = raw integer amount (e.g. "10000000000000000000")
+    //   tx.token_decimals = decimals string (e.g. "18")
+    const incoming = data.result
+      .filter(tx =>
+        tx &&
+        tx.transaction_hash &&
+        // Must be incoming to our deposit wallet
+        tx.to_address && tx.to_address.toLowerCase() === DEPOSIT_WALLET &&
+        // Must be the USDT contract
+        tx.address && tx.address.toLowerCase() === USDT_CONTRACT
+      )
       .map(tx => ({
         hash:      tx.transaction_hash,
-        to:        (tx.to_address || '').toLowerCase(),
-        from:      (tx.from_address || '').toLowerCase(),
         amount:    normalizeTokenAmount(tx.value, tx.token_decimals),
         timestamp: tx.block_timestamp ? new Date(tx.block_timestamp).getTime() : 0,
-      }));
+        from:      (tx.from_address || '').toLowerCase(),
+      }))
+      .filter(tx => Number.isFinite(tx.amount) && tx.amount > 0);
 
-    // Only keep incoming transfers to our deposit wallet with valid amounts
-    const incoming = allTxs.filter(tx =>
-      tx.to === DEPOSIT_WALLET &&
-      Number.isFinite(tx.amount) &&
-      tx.amount > 0
-    );
-
-    console.log(`[BEP20] Moralis: ${data.result.length} txs fetched, ${incoming.length} incoming to wallet | pending deposits: ${pending.length}`);
+    console.log(`[BEP20] Moralis OK: ${data.result.length} ERC20 txs, ${incoming.length} incoming USDT | pending: ${pending.length}`);
 
     if (incoming.length === 0) {
-      console.log(`[BEP20] No incoming USDT found for ${DEPOSIT_WALLET}`);
+      console.log(`[BEP20] No incoming USDT transfers found. wallet=${DEPOSIT_WALLET} usdt=${USDT_CONTRACT}`);
       return;
     }
 
-    // Show top 3 incoming txs for diagnostics
+    // Log top 3 for diagnostics
     incoming.slice(0, 3).forEach(tx => {
-      console.log(`[BEP20] incoming: hash=${tx.hash.slice(0,16)} amount=${tx.amount} time=${new Date(tx.timestamp).toISOString()}`);
+      console.log(`[BEP20] tx: hash=${tx.hash.slice(0,16)} amount=${tx.amount} USDT time=${new Date(tx.timestamp).toISOString()}`);
     });
 
-    // Match each pending deposit against incoming txs
+    // Match each pending deposit
     for (const dep of pending) {
-      // Allow txs up to 5 min before deposit was created (handles clock drift)
+      // Accept txs up to 5 min before deposit was created (handles clock drift)
       const depTs = new Date(dep.created_at).getTime() - 5 * 60 * 1000;
       let matched = false;
 
       for (const tx of incoming) {
-        // Skip txs that are clearly too old for this deposit
         if (tx.timestamp > 0 && tx.timestamp < depTs) continue;
 
         const diff = Math.abs(tx.amount - dep.unique_amt);
-        console.log(`[BEP20] dep=${dep.id} exp=${dep.unique_amt} got=${tx.amount} diff=${diff.toFixed(4)} hash=${tx.hash.slice(0,14)}`);
+        console.log(`[BEP20] compare: dep=${dep.id} expected=${dep.unique_amt} got=${tx.amount} diff=${diff.toFixed(4)} hash=${tx.hash.slice(0,14)}`);
 
         if (diff <= 0.015) {
-          // Check expiry before crediting
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
             log('EXPIRY', `Deposit ${dep.id} expired before match user=${dep.user_id}`);
             matched = true;
             break;
           }
-          log('DEPOSIT', `MATCH dep=${dep.id} user=${dep.user_id} exp=${dep.unique_amt} got=${tx.amount} tx=${tx.hash.slice(0,20)}`);
+          log('DEPOSIT', `MATCH dep=${dep.id} user=${dep.user_id} expected=${dep.unique_amt} got=${tx.amount} tx=${tx.hash.slice(0,20)}`);
           await creditAutoDeposit(dep, tx.hash);
           matched = true;
           break;
@@ -2490,19 +2495,51 @@ async function scanBEP20() {
 
       if (!matched) {
         const age = (Date.now() - new Date(dep.created_at).getTime()) / 60000;
-        if (age < 5) {
-          console.log(`[BEP20] Waiting: dep=${dep.id} expected=${dep.unique_amt} USDT, age=${age.toFixed(1)}m`);
+        if (age < 15) {
+          console.log(`[BEP20] Waiting for payment: dep=${dep.id} expected=${dep.unique_amt} USDT age=${age.toFixed(1)}m`);
         }
       }
     }
   } catch(e) {
-    console.error('[BEP20] Scanner error:', e.message, e.stack ? e.stack.slice(0, 300) : '');
+    console.error('[BEP20] Scanner error:', e.message, e.stack ? e.stack.slice(0, 400) : '');
   }
 }
 
 // ══════════════════════════════════════════
 // START SCANNERS
 // ══════════════════════════════════════════
+
+// Admin diagnostic: test Moralis connection
+app.get('/admin/test-moralis', adminAuth, async (req, res) => {
+  try {
+    if (!MORALIS_KEY) return res.json({ ok: false, error: 'MORALIS_API_KEY not set in environment' });
+    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=5&order=DESC`;
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' });
+    const txSample = Array.isArray(data.result) ? data.result.slice(0, 2).map(tx => ({
+      hash: tx.transaction_hash,
+      to: tx.to_address,
+      from: tx.from_address,
+      value: tx.value,
+      token_decimals: tx.token_decimals,
+      token_symbol: tx.token_symbol,
+      token_address: tx.address,
+      block_timestamp: tx.block_timestamp,
+      computed_amount: normalizeTokenAmount(tx.value, tx.token_decimals),
+    })) : [];
+    res.json({
+      ok: data._ok,
+      http_status: data._http_status,
+      result_count: Array.isArray(data.result) ? data.result.length : null,
+      error: data.message || data.error || null,
+      raw_preview: data._raw ? data._raw.slice(0, 500) : null,
+      tx_sample: txSample,
+      deposit_wallet: DEPOSIT_WALLET,
+      usdt_contract: USDT_CONTRACT,
+      moralis_key_set: !!MORALIS_KEY,
+    });
+  } catch(e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 function startScanners() {
   console.log('🔍 BEP20 Moralis scanner started (10s interval)');
   setTimeout(scanBEP20, 5000);
