@@ -67,14 +67,38 @@ function httpsGet(url, headers) {
           ...parsed,
           _http_status: res.statusCode || 0,
           _ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
-          _raw: data ? String(data).slice(0, 500) : '',
+          _raw: data ? String(data).slice(0, 2000) : '',  // increased for better diagnostics
         });
       });
     });
     req.on('error', (err) => resolve({ _http_status: 0, _ok: false, message: err.message || 'request failed' }));
-    req.setTimeout(10000, () => { req.destroy(); resolve({ _http_status: 0, _ok: false, message: 'request timeout' }); });
+    req.setTimeout(15000, () => { req.destroy(); resolve({ _http_status: 0, _ok: false, message: 'request timeout' }); });
     req.end();
   });
+}
+
+// ── Token amount normalizer ─────────────────────────────────────────
+// Moralis returns value as raw integer string (e.g. "10000000000000000000")
+// and token_decimals as string (e.g. "18"). This converts safely using BigInt.
+function normalizeTokenAmount(rawValue, tokenDecimals) {
+  try {
+    const decimals = parseInt(tokenDecimals !== undefined && tokenDecimals !== null ? tokenDecimals : 18);
+    if (!Number.isFinite(decimals) || decimals < 0 || decimals > 36) return NaN;
+    const raw = String(rawValue || '0').trim();
+    // If already a decimal number (contains '.'), parse directly
+    if (raw.includes('.')) return parseFloat(raw);
+    // Pure integer string — use BigInt for precision
+    if (/^\d+$/.test(raw)) {
+      const factor = BigInt(10) ** BigInt(decimals);
+      const bigRaw  = BigInt(raw);
+      const intPart = bigRaw / factor;
+      const fracRaw = bigRaw % factor;
+      // Build fractional part as string with leading zeros
+      const fracStr = fracRaw.toString().padStart(decimals, '0');
+      return parseFloat(`${intPart}.${fracStr}`);
+    }
+    return parseFloat(raw);
+  } catch(_) { return NaN; }
 }
 
 const app  = express();
@@ -2347,47 +2371,42 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
 async function creditAutoDeposit(dep, txHash) {
   try {
     // [RACE GUARD] Only credit if this UPDATE actually changed a row
-    // If another process already completed this deposit, rowCount = 0 → skip
     const result = await pool.query(
-      `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
+      `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending' RETURNING id`,
       [txHash, dep.id]
     );
     if (result.rowCount === 0) {
       console.log(`[SKIP] Deposit ${dep.id} already processed (race guard)`);
       return;
     }
-    // Credit balance only after confirmed row lock
-    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]); // credit base amount, not unique_amt (which has suffix)
+    // Credit balance (base amount, not unique_amt which has tiny suffix)
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]);
     // Transaction log
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id,'deposit',dep.amount,'BEP20',txHash,'approved','Auto-detected']
+      [dep.user_id, 'deposit', dep.amount, 'BEP20', txHash, 'approved', 'Auto-detected']
     );
-    // Mark first_deposit task as completed (NO balance reward — exact deposit amount only)
-    const taskDone = await db.one(
-      `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
+    // Mark first_deposit task completed (no extra balance reward)
+    await db.run(
+      `INSERT INTO tasks (user_id, task_key, completed, completed_at)
+       VALUES ($1,'first_deposit',1,NOW()) ON CONFLICT DO NOTHING`,
+      [dep.user_id]
     );
-    if (!taskDone) {
-      await db.run(
-        `INSERT INTO tasks (user_id, task_key, completed, completed_at)
-         VALUES ($1,'first_deposit',1,NOW()) ON CONFLICT DO NOTHING`,
-        [dep.user_id]
-      );
-    }
-    console.log(`✅ Auto deposit: user=${dep.user_id} base_amt=${dep.amount} unique_amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
+    console.log(`✅ Auto deposit CREDITED: user=${dep.user_id} amount=$${dep.amount} unique_amt=${dep.unique_amt} tx=${txHash}`);
+    log('DEPOSIT', `CREDITED user=${dep.user_id} amount=${dep.amount} tx=${txHash.slice(0,16)}`);
   } catch(e) {
     // Gracefully handle unique constraint (tx_hash duplicate = already credited)
-    if (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash')) {
-      console.log(`[SAFE] TX ${txHash.slice(0,16)} already processed — skipping`);
+    if (e.message && (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash'))) {
+      console.log(`[SAFE] TX ${(txHash||'').slice(0,16)} already processed — skipping`);
     } else {
-      console.error('[creditAutoDeposit] error:', e.message);
+      console.error('[creditAutoDeposit] ERROR:', e.message);
     }
   }
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER (BscScan)
+// BEP20 AUTO SCANNER (Moralis only)
 // ══════════════════════════════════════════
 async function scanBEP20() {
   try {
@@ -2397,79 +2416,88 @@ async function scanBEP20() {
     if (!pending.length) return;
 
     if (!MORALIS_KEY) {
-      console.log('[BEP20] Moralis key missing (MORALIS_API_KEY)');
+      console.log('[BEP20] MORALIS_API_KEY not set — scanner disabled');
       return;
     }
 
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses=${USDT_CONTRACT}&limit=100&order=DESC`;
-    const data = await httpsGet(url, {
-      'X-API-Key': MORALIS_KEY,
-      'accept': 'application/json',
+    // ── Fetch recent incoming USDT transfers via Moralis ──
+    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses=${USDT_CONTRACT}&limit=100&order=DESC`;
+    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' });
+
+    if (!data._ok || !Array.isArray(data.result)) {
+      console.log(`[BEP20] Moralis error status=${data._http_status}: ${String(data.message || data.error || data._raw || '').slice(0, 300)}`);
+      return;
+    }
+
+    // Normalize all txs: convert raw `value` + `token_decimals` → decimal amount
+    // Moralis returns value as raw integer string e.g. "10000000000000000000" (= 10 USDT @ 18 decimals)
+    const allTxs = data.result
+      .filter(tx => tx && tx.transaction_hash && tx.to_address)
+      .map(tx => ({
+        hash:      tx.transaction_hash,
+        to:        (tx.to_address || '').toLowerCase(),
+        from:      (tx.from_address || '').toLowerCase(),
+        amount:    normalizeTokenAmount(tx.value, tx.token_decimals),
+        timestamp: tx.block_timestamp ? new Date(tx.block_timestamp).getTime() : 0,
+      }));
+
+    // Only keep incoming transfers to our deposit wallet with valid amounts
+    const incoming = allTxs.filter(tx =>
+      tx.to === DEPOSIT_WALLET &&
+      Number.isFinite(tx.amount) &&
+      tx.amount > 0
+    );
+
+    console.log(`[BEP20] Moralis: ${data.result.length} txs fetched, ${incoming.length} incoming to wallet | pending deposits: ${pending.length}`);
+
+    if (incoming.length === 0) {
+      console.log(`[BEP20] No incoming USDT found for ${DEPOSIT_WALLET}`);
+      return;
+    }
+
+    // Show top 3 incoming txs for diagnostics
+    incoming.slice(0, 3).forEach(tx => {
+      console.log(`[BEP20] incoming: hash=${tx.hash.slice(0,16)} amount=${tx.amount} time=${new Date(tx.timestamp).toISOString()}`);
     });
 
-    if (!data._ok || !data.result || !Array.isArray(data.result)) {
-      const msg = data.message || data.error || data._raw || 'Unknown Moralis response';
-      console.log(`[BEP20] Moralis error status=${data._http_status || 0}: ${String(msg).slice(0, 220)}`);
-      return;
-    }
-
-    const txs = data.result;
-    console.log(`[BEP20] Moralis: ${txs.length} txs | pending auto: ${pending.length}`);
-
+    // Match each pending deposit against incoming txs
     for (const dep of pending) {
-      const depTs = new Date(dep.created_at).getTime() - 60000;
+      // Allow txs up to 5 min before deposit was created (handles clock drift)
+      const depTs = new Date(dep.created_at).getTime() - 5 * 60 * 1000;
       let matched = false;
 
-      for (const tx of txs) {
-        if (!tx || !tx.to_address || !tx.transaction_hash) continue;
-        if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
-        if (new Date(tx.block_timestamp).getTime() < depTs) continue;
+      for (const tx of incoming) {
+        // Skip txs that are clearly too old for this deposit
+        if (tx.timestamp > 0 && tx.timestamp < depTs) continue;
 
-        // ── FIX: Moralis returns raw integer `value` + `token_decimals`, NOT `value_decimal` ──
-        // Use BigInt math to avoid floating-point precision loss on large integers
-        let txAmt;
-        try {
-          const rawValue    = tx.value || tx.value_decimal || '0';
-          const decimals    = parseInt(tx.token_decimals !== undefined ? tx.token_decimals : 18);
-          if (typeof rawValue === 'string' && /^\d+$/.test(rawValue)) {
-            // Raw integer string from Moralis (e.g. "10000000000000000000")
-            const factor = BigInt(10) ** BigInt(decimals);
-            const intPart = BigInt(rawValue) / factor;
-            const fracRaw = BigInt(rawValue) % factor;
-            txAmt = Number(intPart) + Number(fracRaw) / (10 ** decimals);
-          } else {
-            // Fallback: already a decimal string or number
-            txAmt = parseFloat(rawValue);
-          }
-        } catch(_) {
-          txAmt = NaN;
-        }
-        if (!Number.isFinite(txAmt) || txAmt <= 0) continue;
+        const diff = Math.abs(tx.amount - dep.unique_amt);
+        console.log(`[BEP20] dep=${dep.id} exp=${dep.unique_amt} got=${tx.amount} diff=${diff.toFixed(4)} hash=${tx.hash.slice(0,14)}`);
 
-        const diff  = Math.abs(txAmt - dep.unique_amt);
-        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} from=${(tx.from_address||'?').slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff.toFixed(4)}`);
-
-        if (diff <= 0.01) {
-          // [STRICT] Double-check expiry before crediting
+        if (diff <= 0.015) {
+          // Check expiry before crediting
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-            log('EXPIRY', `Auto deposit ${dep.id} expired before match user=${dep.user_id}`);
-            matched = true; // stop searching for this dep
+            log('EXPIRY', `Deposit ${dep.id} expired before match user=${dep.user_id}`);
+            matched = true;
             break;
           }
-          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt} tx=${tx.transaction_hash.slice(0,16)}`);
-          await creditAutoDeposit(dep, tx.transaction_hash);
+          log('DEPOSIT', `MATCH dep=${dep.id} user=${dep.user_id} exp=${dep.unique_amt} got=${tx.amount} tx=${tx.hash.slice(0,20)}`);
+          await creditAutoDeposit(dep, tx.hash);
           matched = true;
           break;
         }
       }
-      // [REDUCED LOG] Only log no-match for very recent deposits (< 5 min)
+
       if (!matched) {
         const age = (Date.now() - new Date(dep.created_at).getTime()) / 60000;
-        if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
+        if (age < 5) {
+          console.log(`[BEP20] Waiting: dep=${dep.id} expected=${dep.unique_amt} USDT, age=${age.toFixed(1)}m`);
+        }
       }
     }
-  } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
+  } catch(e) {
+    console.error('[BEP20] Scanner error:', e.message, e.stack ? e.stack.slice(0, 300) : '');
+  }
 }
 
 // ══════════════════════════════════════════
