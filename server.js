@@ -208,29 +208,24 @@ function tgEscape(str) {
 async function sendWithdrawProof(txData) {
   try {
     const cfg = await getTgGroupSettings();
-    log('TG_PROOF', `cfg: enabled=${cfg.enabled} chatId=${cfg.chatId} topicId=${cfg.topicId} wd=${txData.withdraw_id}`);
-    if (!cfg.enabled || !cfg.chatId) {
-      log('TG_PROOF', `SKIP: enabled=${cfg.enabled} chatId="${cfg.chatId}"`);
-      return;
-    }
+    if (!cfg.enabled || !cfg.chatId) return;
 
     const { withdraw_id, username, first_name, user_id, amount, address, bsc_tx_hash } = txData;
+    const hasTx = !!(bsc_tx_hash && bsc_tx_hash.trim());
 
-    // Duplicate guard — if already sent successfully, skip (unless this call has a tx_hash and previous didn't)
+    // Duplicate guard:
+    // - If already sent WITH tx_hash → never send again
+    // - If already sent WITHOUT tx_hash and now we have tx_hash → allow re-send once
+    // - If already sent WITHOUT tx_hash and still no tx_hash → skip
     const existing = await db.all(
-      `SELECT sent_status, error_msg FROM tg_proof_logs WHERE withdraw_id=$1 ORDER BY id DESC LIMIT 1`,
+      `SELECT sent_status, error_msg FROM tg_proof_logs WHERE withdraw_id=$1 AND sent_status='sent' ORDER BY id DESC LIMIT 1`,
       [withdraw_id]
     );
-    if (existing.length > 0 && existing[0].sent_status === 'sent') {
-      // Already sent successfully — only re-send if now we have a tx_hash that wasn't there before
-      if (!bsc_tx_hash || !bsc_tx_hash.trim()) return;
-      // Check if previously sent version had no tx_hash (error_msg stores context)
-      // We allow one re-send with tx_hash for better proof
-      const alreadyHasTx = await db.all(
-        `SELECT id FROM tg_proof_logs WHERE withdraw_id=$1 AND sent_status='sent' AND error_msg LIKE '%has_tx%'`,
-        [withdraw_id]
-      );
-      if (alreadyHasTx.length > 0) return; // already sent with tx_hash
+    if (existing.length > 0) {
+      const prevHasTx = existing[0].error_msg === 'has_tx';
+      if (prevHasTx) return;           // already sent with tx_hash — done
+      if (!hasTx) return;              // already sent without tx_hash, still no tx_hash — skip
+      // prevHasTx=false + hasTx=true → re-send with tx_hash (upgrade)
     }
     // HTML-escape user-supplied strings to prevent broken Telegram HTML
     const safeName    = username ? '@' + tgEscape(username) : tgEscape(first_name || 'No Username');
@@ -261,6 +256,7 @@ async function sendWithdrawProof(txData) {
     if (!isNaN(parsedTopicId) && parsedTopicId > 0) payload.message_thread_id = parsedTopicId;
 
     const result = await tgBotApi('sendMessage', payload);
+    if (!result.ok) log('TG_PROOF', `Send failed wd=${withdraw_id}: ${result.description||result.error||'unknown'}`);
 
     // Log result to DB — use simple INSERT (no ON CONFLICT needed, each proof gets own row)
     const status  = result.ok ? 'sent' : 'failed';
@@ -2181,17 +2177,21 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
     logSecurity('WITHDRAW_APPROVED', {tx_id, user_id, amount, address: (tx.address||'').slice(0,20)});
     res.json({success:true});
 
-    // Fire Telegram proof immediately after approve (non-blocking)
-    // Scanner will try to add TX hash separately if Moralis detects it
-    setImmediate(() => sendWithdrawProof({
-      withdraw_id: tx_id,
-      username:    tx.username    || '',
-      first_name:  tx.first_name  || '',
-      user_id:     user_id,
-      amount:      amount,
-      address:     tx.address     || '',
-      bsc_tx_hash: (bsc_tx_hash && bsc_tx_hash.trim()) ? bsc_tx_hash.trim() : ''
-    }));
+    // If admin manually entered bsc_tx_hash → fire proof immediately with hash
+    // Otherwise → scanner will detect TX hash from Moralis within 2 min and send proof with hash
+    // Fallback → if no hash found after 5 min, sends proof without hash
+    if (bsc_tx_hash && bsc_tx_hash.trim()) {
+      setImmediate(() => sendWithdrawProof({
+        withdraw_id: tx_id,
+        username:    tx.username    || '',
+        first_name:  tx.first_name  || '',
+        user_id:     user_id,
+        amount:      amount,
+        address:     tx.address     || '',
+        bsc_tx_hash: bsc_tx_hash.trim()
+      }));
+    }
+    // else: scanWithdrawalTx runs every 30s and will detect + send with hash
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
@@ -2617,7 +2617,14 @@ async function scanBEP20() {
     const pending = await db.all(
       `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
-    if (!pending.length) return;
+
+    // Also check if any withdrawal needs hash detection
+    const pendingWithdrawals = await db.one(
+      `SELECT COUNT(*) as c FROM transactions WHERE type='withdraw' AND status='approved' AND (bsc_tx_hash IS NULL OR bsc_tx_hash='') AND approved_at IS NOT NULL AND approved_at >= NOW() - INTERVAL '2 hours'`
+    );
+    const hasWithdrawalWork = parseInt(pendingWithdrawals.c) > 0;
+
+    if (!pending.length && !hasWithdrawalWork) return;
 
     const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
@@ -2662,6 +2669,56 @@ async function scanBEP20() {
         if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
       }
     }
+
+    // ── WITHDRAWAL HASH DETECTION (piggyback on same Moralis result) ──
+    // outgoing TX = from_address is DEPOSIT_WALLET
+    const outgoingTxs = txs.filter(tx =>
+      tx.from_address && tx.from_address.toLowerCase() === DEPOSIT_WALLET.toLowerCase()
+    );
+    if (outgoingTxs.length > 0) {
+      // Get pending approved withdrawals with no tx_hash (last 2 hours)
+      const pendingWith = await db.all(`
+        SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
+               u.username, u.first_name
+        FROM transactions t
+        LEFT JOIN users u ON u.id = t.user_id
+        WHERE t.type   = 'withdraw'
+          AND t.status = 'approved'
+          AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
+          AND t.approved_at IS NOT NULL
+          AND t.approved_at >= NOW() - INTERVAL '2 hours'
+      `);
+      for (const wd of pendingWith) {
+        const toAddr    = (wd.address || '').toLowerCase().trim();
+        const approvedAt = new Date(wd.approved_at).getTime();
+        for (const tx of outgoingTxs) {
+          if (!tx.to_address || tx.to_address.toLowerCase() !== toAddr) continue;
+          const txTime = new Date(tx.block_timestamp).getTime();
+          if (txTime < approvedAt - 600000) continue;
+          const txAmt = parseFloat(tx.value_decimal || 0);
+          const wdAmt = parseFloat(wd.amount);
+          if (Math.abs(txAmt - wdAmt) > 1.0) continue;
+          // ✅ MATCH
+          const txHash = tx.transaction_hash;
+          log('WITH_SCAN', `✅ Hash matched wd=${wd.id} amt=${wdAmt} tx=${txHash.slice(0,16)}`);
+          await db.run(
+            `UPDATE transactions SET bsc_tx_hash=$1 WHERE id=$2 AND (bsc_tx_hash IS NULL OR bsc_tx_hash='')`,
+            [txHash, wd.id]
+          );
+          setImmediate(() => sendWithdrawProof({
+            withdraw_id: wd.id,
+            username:    wd.username   || '',
+            first_name:  wd.first_name || '',
+            user_id:     wd.user_id,
+            amount:      wd.amount,
+            address:     wd.address    || '',
+            bsc_tx_hash: txHash
+          }));
+          break;
+        }
+      }
+    }
+
   } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
 }
 
@@ -2701,7 +2758,7 @@ async function scanWithdrawalTx() {
       ? WITHDRAWAL_WALLET
       : DEPOSIT_WALLET;
 
-    const url  = `https://deep-index.moralis.io/api/v2.2/${scanWallet}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=50&order=DESC`;
+    const url  = `https://deep-index.moralis.io/api/v2.2/erc20/${USDT_CONTRACT}/transfers?chain=bsc&from_address=${scanWallet}&limit=25&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data || !data.result || !Array.isArray(data.result)) {
@@ -2714,10 +2771,8 @@ async function scanWithdrawalTx() {
       return;
     }
 
-    // Only outgoing transfers (from = scanWallet → to = user address)
-    const outgoing = data.result.filter(tx =>
-      tx.from_address && tx.from_address.toLowerCase() === scanWallet
-    );
+    // All results are already outgoing (from_address=scanWallet in URL)
+    const outgoing = data.result || [];
 
     if (!outgoing.length) return;
 
