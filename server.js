@@ -2302,27 +2302,32 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
 // ══════════════════════════════════════════
 // AUTO DEPOSIT — Credit helper
 // ══════════════════════════════════════════
+// ══════════════════════════════════════════
+// AUTO DEPOSIT — Credit helper
+// ══════════════════════════════════════════
 async function creditAutoDeposit(dep, txHash) {
   try {
-    // [RACE GUARD] Only credit if this UPDATE actually changed a row
-    // If another process already completed this deposit, rowCount = 0 → skip
+    // [DUPLICATE GUARD] Atomic UPDATE — only proceeds if status is still 'pending'
     const result = await pool.query(
       `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
       [txHash, dep.id]
     );
     if (result.rowCount === 0) {
-      console.log(`[SKIP] Deposit ${dep.id} already processed (race guard)`);
+      log('SCANNER', `⚠️ [DUPLICATE SKIPPED] dep=${dep.id} tx=${txHash.slice(0,18)}... already processed`);
       return;
     }
-    // Credit balance only after confirmed row lock
-    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]); // credit base amount, not unique_amt (which has suffix)
-    // Transaction log
+
+    // Credit base amount (not unique_amt which has random suffix)
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]);
+
+    // Transaction record
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id,'deposit',dep.amount,'BEP20',txHash,'approved','Auto-detected']
+      [dep.user_id, 'deposit', dep.amount, 'BEP20', txHash, 'approved', 'Auto-detected BEP20']
     );
-    // Mark first_deposit task as completed (NO balance reward — exact deposit amount only)
+
+    // Mark first_deposit task if not already done
     const taskDone = await db.one(
       `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
     );
@@ -2333,85 +2338,139 @@ async function creditAutoDeposit(dep, txHash) {
         [dep.user_id]
       );
     }
-    console.log(`✅ Auto deposit: user=${dep.user_id} base_amt=${dep.amount} unique_amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
+
+    log('SCANNER', `✅ [DEPOSIT CREDITED] user=${dep.user_id} amount=$${dep.amount} USDT (unique=${dep.unique_amt}) tx=${txHash}`);
+    logSecurity('AUTO_DEPOSIT_CREDITED', { user_id: dep.user_id, amount: dep.amount, unique_amt: dep.unique_amt, tx: txHash });
+
   } catch(e) {
-    // Gracefully handle unique constraint (tx_hash duplicate = already credited)
-    if (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash')) {
-      console.log(`[SAFE] TX ${txHash.slice(0,16)} already processed — skipping`);
+    // Safe: unique constraint = already credited by another process
+    if (e.message && (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash'))) {
+      log('SCANNER', `⚠️ [DUPLICATE SKIPPED] tx=${txHash.slice(0,18)}... unique constraint — already credited`);
     } else {
-      console.error('[creditAutoDeposit] error:', e.message);
+      log('SCANNER', `❌ [CREDIT ERROR] dep=${dep.id} user=${dep.user_id} tx=${txHash.slice(0,18)}... error=${e.message}`);
     }
   }
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER (BscScan)
+// BEP20 AUTO SCANNER — Moralis (BSC)
 // ══════════════════════════════════════════
 async function scanBEP20() {
   try {
+    // Step 1: load pending deposits
     const pending = await db.all(
       `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
-    if (!pending.length) return;
+    if (!pending.length) return; // nothing to check — silent skip
 
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=0x38&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
+    log('SCANNER', `🔎 [SCAN] ${pending.length} pending deposit(s) — querying Moralis BSC...`);
+
+    // Step 2: validate API key
+    if (!MORALIS_KEY) {
+      log('SCANNER', '❌ [API ERROR] MORALIS_API_KEY env var is missing or empty! Set it on Render → Environment.');
+      return;
+    }
+
+    // Step 3: call Moralis v2.2 BSC endpoint
+    const url = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses%5B0%5D=${USDT_CONTRACT}&limit=25&order=DESC`;
+    log('SCANNER', `📡 [MORALIS] GET ${url.slice(0, 90)}...`);
+
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
+    // Step 4: handle API errors with full details
+    if (!data || typeof data !== 'object') {
+      log('SCANNER', `❌ [API ERROR] Moralis returned non-object response: ${JSON.stringify(data).slice(0, 300)}`);
+      return;
+    }
+    if (data.message || data.error || data.status === '0') {
+      log('SCANNER', `❌ [API ERROR] Moralis error response: ${JSON.stringify(data).slice(0, 400)}`);
+      return;
+    }
     if (!data.result || !Array.isArray(data.result)) {
-      console.log('[BEP20] Moralis error:', JSON.stringify(data).slice(0, 200));
+      log('SCANNER', `❌ [API ERROR] Moralis missing result array. Full response: ${JSON.stringify(data).slice(0, 400)}`);
       return;
     }
 
     const txs = data.result;
-    console.log(`[BEP20] Moralis: ${txs.length} txs | pending auto: ${pending.length}`);
+    log('SCANNER', `✅ [MORALIS CONNECTED] ${txs.length} tx(s) returned from BSC for wallet ${DEPOSIT_WALLET.slice(0,12)}...`);
 
+    // Step 5: match each pending deposit against blockchain txs
     for (const dep of pending) {
-      const depTs = new Date(dep.created_at).getTime() - 60000;
+      const depTs = new Date(dep.created_at).getTime() - 60000; // 1 min grace before deposit creation
       let matched = false;
 
       for (const tx of txs) {
-        if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
+        // Must be incoming to our wallet
+        if ((tx.to_address || '').toLowerCase() !== DEPOSIT_WALLET) continue;
+        // Must be USDT contract
+        if ((tx.address || '').toLowerCase() !== USDT_CONTRACT) continue;
+        // Must not be older than deposit creation (minus grace)
         if (new Date(tx.block_timestamp).getTime() < depTs) continue;
 
         const txAmt = parseFloat(tx.value_decimal);
         const diff  = Math.abs(txAmt - dep.unique_amt);
-        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
+
+        log('SCANNER', `🔍 [TX FOUND] hash=${tx.transaction_hash.slice(0,18)}... amount=${txAmt} USDT | dep=${dep.id} expects=${dep.unique_amt} diff=${diff.toFixed(4)}`);
 
         if (diff <= 0.01) {
-          // [STRICT] Double-check expiry before crediting
+          // Check expiry before crediting
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-            log('EXPIRY', `Auto deposit ${dep.id} expired before match user=${dep.user_id}`);
-            matched = true; // stop searching for this dep
+            log('SCANNER', `⏰ [EXPIRED] dep=${dep.id} user=${dep.user_id} expired before match could be credited`);
+            matched = true;
             break;
           }
-          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+
+          log('SCANNER', `✅ [MATCH CONFIRMED] dep=${dep.id} user=${dep.user_id} amount=${dep.unique_amt} USDT tx=${tx.transaction_hash}`);
           await creditAutoDeposit(dep, tx.transaction_hash);
           matched = true;
           break;
         }
       }
-      // [REDUCED LOG] Only log no-match for very recent deposits (< 5 min)
+
       if (!matched) {
         const age = (Date.now() - new Date(dep.created_at).getTime()) / 60000;
-        if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
+        // Only log for deposits under 10 minutes old to reduce noise
+        if (age < 10) {
+          log('SCANNER', `⏳ [WAITING] dep=${dep.id} user=${dep.user_id} waiting for ${dep.unique_amt} USDT | age=${age.toFixed(1)}m`);
+        }
       }
     }
-  } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
+
+  } catch(e) {
+    log('SCANNER', `❌ [SCANNER EXCEPTION] ${e.message} | stack: ${(e.stack||'').split('\n')[1]||''}`);
+  }
 }
 
 // ══════════════════════════════════════════
 // START SCANNERS
 // ══════════════════════════════════════════
 function startScanners() {
-  console.log('🔍 BEP20 Moralis scanner started (10s interval)');
-  setTimeout(scanBEP20, 5000);
+  log('SCANNER', '🚀 [SCANNER STARTED] BEP20 Moralis auto-deposit scanner initializing...');
+  log('SCANNER', `📋 [CONFIG] wallet=${DEPOSIT_WALLET} | usdt_contract=${USDT_CONTRACT}`);
+  log('SCANNER', `🔑 [CONFIG] MORALIS_API_KEY=${MORALIS_KEY ? '✅ set (' + MORALIS_KEY.slice(0,8) + '...)' : '❌ MISSING!'}`);
+  log('SCANNER', '⏱️  [CONFIG] Polling every 10 seconds');
+
+  // First scan after 5 seconds (let DB settle)
+  setTimeout(() => {
+    log('SCANNER', '🔍 [SCANNER] First scan running...');
+    scanBEP20();
+  }, 5000);
+
+  // Then every 10 seconds
   setInterval(scanBEP20, 10000);
-  // Auto-expire old pending deposits every minute
+
+  // Auto-expire old pending deposits every 60 seconds
   setInterval(async () => {
-    await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
+    try {
+      const r = await pool.query(
+        `UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW() RETURNING id, user_id`
+      );
+      if (r.rowCount > 0) {
+        log('SCANNER', `⏰ [AUTO-EXPIRE] ${r.rowCount} deposit(s) expired: ${r.rows.map(x=>x.id).join(', ')}`);
+      }
+    } catch(e) { log('SCANNER', `❌ [EXPIRE ERROR] ${e.message}`); }
   }, 60000);
-  // today_earned is reset per-user in GET /api/user/:id when last_earn_date changes (no bulk reset needed)
 }
 
 // ══════════════════════════════════════════
