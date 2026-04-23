@@ -39,7 +39,7 @@ const authLimit     = rateLimit(20,  60_000);   // 20/min per IP
 const depositLimit  = rateLimit(30,  60_000);   // 30/min
 
 // ══════════════════════════════════════════
-// AUTO DEPOSIT SCANNER CONFIG (BSC RPC)
+// AUTO DEPOSIT SCANNER CONFIG
 // ══════════════════════════════════════════
 const BSC_RPC_URL         = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org/';
 const DEPOSIT_WALLET      = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148').toLowerCase();
@@ -47,6 +47,9 @@ const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF7
 const BEP20_WALLET        = DEPOSIT_WALLET;
 const BEP20_USDT_CONTRACT = USDT_CONTRACT;
 const WITHDRAWAL_WALLET   = (process.env.WITHDRAWAL_WALLET || '').toLowerCase();
+// BscScan free API key (optional but recommended — raises rate limit 1/5s → 5/s)
+// Get free at: https://bscscan.com/myapikey
+const BSCSCAN_API_KEY     = process.env.BSCSCAN_API_KEY || '';
 
 // ── BSC scanner state (in-memory + DB-backed) ────────────────────────────────
 
@@ -2646,15 +2649,18 @@ async function saveLastTxHash(hash) {
 // BscScan free API — fetch latest USDT transfers TO deposit wallet
 // Free tier: 5 calls/sec, no API key needed for basic queries
 async function fetchBscScanTransfers() {
-  // Use BscScan API — free, no key needed, returns token transfers to address
+  // Use BscScan API — free key optional but reduces rate limit errors
+  // Free key at: https://bscscan.com/myapikey (5 calls/sec vs 1/5sec without)
+  const apiKeyParam = BSCSCAN_API_KEY ? `&apikey=${BSCSCAN_API_KEY}` : '';
   const url = `https://api.bscscan.com/api` +
     `?module=account` +
     `&action=tokentx` +
     `&contractaddress=${USDT_CONTRACT}` +
     `&address=${DEPOSIT_WALLET}` +
     `&sort=desc` +
-    `&offset=20` +      // latest 20 transfers
-    `&page=1`;
+    `&offset=20` +
+    `&page=1` +
+    apiKeyParam;
 
   return new Promise((resolve) => {
     const opts = new URL(url);
@@ -2693,9 +2699,10 @@ async function scanBEP20() {
     const data = await fetchBscScanTransfers();
 
     if (!data || data.status === '0') {
-      // BscScan returns status=0 with "No transactions found" when empty — that's OK
       const msg = data && data.message ? data.message : 'no response';
-      if (msg !== 'No transactions found') {
+      // "No transactions found" = empty wallet, perfectly normal
+      // "NOTOK" = rate limit hit — skip silently, retry next cycle
+      if (msg !== 'No transactions found' && msg !== 'NOTOK') {
         log('RPC', 'BscScan error: ' + msg);
       }
       return;
@@ -2939,11 +2946,12 @@ async function startScanners() {
     log('RPC', 'No saved state — will process latest 20 transfers');
   }
 
-  log('RPC', 'Scanner started (10s polling interval)');
+  log('RPC', `Scanner started (15s polling interval${BSCSCAN_API_KEY ? ' + API key' : ' — add BSCSCAN_API_KEY env for faster polling'})`);
 
-  // ── BEP20 deposit scanner — every 10s ───────────────────────────────────
-  setTimeout(scanBEP20, 3000);   // first scan after 3s
-  setInterval(scanBEP20, 10000); // then every 10s
+  // ── BEP20 deposit scanner ─────────────────────────────────────────────────
+  // 15s interval — safe for BscScan free tier (no key: 1 req/5s, key: 5 req/s)
+  setTimeout(scanBEP20, 5000);   // first scan after 5s
+  setInterval(scanBEP20, 15000); // then every 15s
 
   // ── Withdrawal TX fallback proof sender (no Moralis needed) ─────────────
   // Runs every 2 min — fires Telegram proof for approved withdrawals with no tx hash
