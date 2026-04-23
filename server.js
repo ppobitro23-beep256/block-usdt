@@ -2626,7 +2626,11 @@ const RPC_ENDPOINTS = [
   ...(_envRpc && !_envRpc.includes('bsc-dataseed') ? [_envRpc] : []),
   'https://bsc-rpc.publicnode.com',
   'https://rpc.ankr.com/bsc',
-  'https://1rpc.io/bnb',
+  'https://bsc-dataseed2.binance.org',  // binance dataseed2 — may support getLogs
+  'https://bsc-dataseed3.binance.org',  // binance dataseed3
+  'https://bsc-dataseed4.binance.org',  // binance dataseed4
+  'https://bsc.meowrpc.com',            // meowrpc — free, supports getLogs
+  'https://binance.llamarpc.com',       // llamarpc — reliable free BSC RPC
 ];
 
 // Transfer(address indexed from, address indexed to, uint256 value)
@@ -2671,14 +2675,24 @@ async function rpcPost(endpoint, method, params) {
 }
 
 // Try each endpoint in order — return first success
+// Try each endpoint in order — return first success
 async function rpcCall(method, params) {
-  for (const endpoint of RPC_ENDPOINTS) {
-    const result = await rpcPost(endpoint, method, params);
-    if (!result.error && result.result !== undefined) return result;
-    // Only log failure if more endpoints remain to try
-    const idx = RPC_ENDPOINTS.indexOf(endpoint);
-    if (idx < RPC_ENDPOINTS.length - 1) {
-      log('RPC', `${new URL(endpoint).hostname} failed — trying next`);
+  for (let i = 0; i < RPC_ENDPOINTS.length; i++) {
+    const endpoint = RPC_ENDPOINTS[i];
+    const result   = await rpcPost(endpoint, method, params);
+
+    // Success: no error AND result is not null/undefined
+    // eth_blockNumber → string like "0x..."
+    // eth_getLogs     → array (can be empty [])
+    const isSuccess = !result.error && result.result !== undefined && result.result !== null;
+    if (isSuccess) return result;
+
+    const errMsg = result.error?.message || (result.result === null ? 'null result' : 'unknown');
+    const hasNext = i < RPC_ENDPOINTS.length - 1;
+    if (hasNext) {
+      log('RPC', `${new URL(endpoint).hostname} failed (${errMsg}) — trying next`);
+    } else {
+      log('RPC', `All RPC endpoints failed. Last error: ${errMsg}`);
     }
   }
   return { error: { message: 'all RPC endpoints failed' } };
