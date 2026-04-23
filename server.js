@@ -2354,7 +2354,7 @@ async function scanBEP20() {
     );
     if (!pending.length) return;
 
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=0x38&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data.result || !Array.isArray(data.result)) {
