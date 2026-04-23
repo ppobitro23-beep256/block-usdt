@@ -61,11 +61,18 @@ function httpsGet(url, headers) {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch(_) { resolve({}); }
+        let parsed = {};
+        try { parsed = JSON.parse(data); } catch(_) {}
+        resolve({
+          ...parsed,
+          _http_status: res.statusCode || 0,
+          _ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
+          _raw: data ? String(data).slice(0, 500) : '',
+        });
       });
     });
-    req.on('error', () => resolve({}));
-    req.setTimeout(10000, () => { req.destroy(); resolve({}); });
+    req.on('error', (err) => resolve({ _http_status: 0, _ok: false, message: err.message || 'request failed' }));
+    req.setTimeout(10000, () => { req.destroy(); resolve({ _http_status: 0, _ok: false, message: 'request timeout' }); });
     req.end();
   });
 }
@@ -2234,10 +2241,26 @@ async function generateUniqueAmt(base) {
     throw new Error('Invalid deposit amount');
   }
 
-  // Use a larger suffix range to avoid collisions during busy periods.
-  const tried = new Set();
-  for (let i = 0; i < 99; i++) {
-    const dec = Math.floor(Math.random() * 99) + 1; // 0.01 .. 0.99
+  // Keep user-facing amount close (0.01..0.05), then expand only if needed.
+  const preferred = [1, 2, 3, 4, 5];
+  for (let i = preferred.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = preferred[i];
+    preferred[i] = preferred[j];
+    preferred[j] = tmp;
+  }
+  for (const dec of preferred) {
+    const uAmt = +(baseAmt + dec / 100).toFixed(2);
+    const ex = await db.one(
+      `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
+      [uAmt]
+    );
+    if (!ex) return uAmt;
+  }
+
+  const tried = new Set(preferred);
+  for (let i = 0; i < 94; i++) {
+    const dec = Math.floor(Math.random() * 99) + 1;
     if (tried.has(dec)) continue;
     tried.add(dec);
     const uAmt = +(baseAmt + dec / 100).toFixed(2);
@@ -2373,11 +2396,20 @@ async function scanBEP20() {
     );
     if (!pending.length) return;
 
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
-    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
+    if (!MORALIS_KEY) {
+      console.log('[BEP20] Moralis key missing (MORALIS_API_KEY)');
+      return;
+    }
 
-    if (!data.result || !Array.isArray(data.result)) {
-      console.log('[BEP20] Moralis error:', JSON.stringify(data).slice(0, 200));
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses=${USDT_CONTRACT}&limit=20&order=DESC`;
+    const data = await httpsGet(url, {
+      'X-API-Key': MORALIS_KEY,
+      'accept': 'application/json',
+    });
+
+    if (!data._ok || !data.result || !Array.isArray(data.result)) {
+      const msg = data.message || data.error || data._raw || 'Unknown Moralis response';
+      console.log(`[BEP20] Moralis error status=${data._http_status || 0}: ${String(msg).slice(0, 220)}`);
       return;
     }
 
