@@ -47,7 +47,6 @@ const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF7
 const BEP20_WALLET        = DEPOSIT_WALLET;
 const BEP20_USDT_CONTRACT = USDT_CONTRACT;
 const WITHDRAWAL_WALLET   = (process.env.WITHDRAWAL_WALLET || '').toLowerCase();
-const BSCSCAN_API_KEY     = process.env.BSCSCAN_API_KEY || 'YourApiKeyToken'; // free tier works
 
 // Simple HTTPS GET helper
 function httpsGet(url, headers) {
@@ -209,24 +208,29 @@ function tgEscape(str) {
 async function sendWithdrawProof(txData) {
   try {
     const cfg = await getTgGroupSettings();
-    if (!cfg.enabled || !cfg.chatId) return;
+    log('TG_PROOF', `cfg: enabled=${cfg.enabled} chatId=${cfg.chatId} topicId=${cfg.topicId} wd=${txData.withdraw_id}`);
+    if (!cfg.enabled || !cfg.chatId) {
+      log('TG_PROOF', `SKIP: enabled=${cfg.enabled} chatId="${cfg.chatId}"`);
+      return;
+    }
 
     const { withdraw_id, username, first_name, user_id, amount, address, bsc_tx_hash } = txData;
-    const hasTx = !!(bsc_tx_hash && bsc_tx_hash.trim());
 
-    // Duplicate guard:
-    // - If already sent WITH tx_hash → never send again
-    // - If already sent WITHOUT tx_hash and now we have tx_hash → allow re-send once
-    // - If already sent WITHOUT tx_hash and still no tx_hash → skip
+    // Duplicate guard — if already sent successfully, skip (unless this call has a tx_hash and previous didn't)
     const existing = await db.all(
-      `SELECT sent_status, error_msg FROM tg_proof_logs WHERE withdraw_id=$1 AND sent_status='sent' ORDER BY id DESC LIMIT 1`,
+      `SELECT sent_status, error_msg FROM tg_proof_logs WHERE withdraw_id=$1 ORDER BY id DESC LIMIT 1`,
       [withdraw_id]
     );
-    if (existing.length > 0) {
-      const prevHasTx = existing[0].error_msg === 'has_tx';
-      if (prevHasTx) return;           // already sent with tx_hash — done
-      if (!hasTx) return;              // already sent without tx_hash, still no tx_hash — skip
-      // prevHasTx=false + hasTx=true → re-send with tx_hash (upgrade)
+    if (existing.length > 0 && existing[0].sent_status === 'sent') {
+      // Already sent successfully — only re-send if now we have a tx_hash that wasn't there before
+      if (!bsc_tx_hash || !bsc_tx_hash.trim()) return;
+      // Check if previously sent version had no tx_hash (error_msg stores context)
+      // We allow one re-send with tx_hash for better proof
+      const alreadyHasTx = await db.all(
+        `SELECT id FROM tg_proof_logs WHERE withdraw_id=$1 AND sent_status='sent' AND error_msg LIKE '%has_tx%'`,
+        [withdraw_id]
+      );
+      if (alreadyHasTx.length > 0) return; // already sent with tx_hash
     }
     // HTML-escape user-supplied strings to prevent broken Telegram HTML
     const safeName    = username ? '@' + tgEscape(username) : tgEscape(first_name || 'No Username');
@@ -257,7 +261,6 @@ async function sendWithdrawProof(txData) {
     if (!isNaN(parsedTopicId) && parsedTopicId > 0) payload.message_thread_id = parsedTopicId;
 
     const result = await tgBotApi('sendMessage', payload);
-    if (!result.ok) log('TG_PROOF', `Send failed wd=${withdraw_id}: ${result.description||result.error||'unknown'}`);
 
     // Log result to DB — use simple INSERT (no ON CONFLICT needed, each proof gets own row)
     const status  = result.ok ? 'sent' : 'failed';
@@ -2178,21 +2181,17 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
     logSecurity('WITHDRAW_APPROVED', {tx_id, user_id, amount, address: (tx.address||'').slice(0,20)});
     res.json({success:true});
 
-    // If admin manually entered bsc_tx_hash → fire proof immediately with hash
-    // Otherwise → scanner will detect TX hash from Moralis within 2 min and send proof with hash
-    // Fallback → if no hash found after 5 min, sends proof without hash
-    if (bsc_tx_hash && bsc_tx_hash.trim()) {
-      setImmediate(() => sendWithdrawProof({
-        withdraw_id: tx_id,
-        username:    tx.username    || '',
-        first_name:  tx.first_name  || '',
-        user_id:     user_id,
-        amount:      amount,
-        address:     tx.address     || '',
-        bsc_tx_hash: bsc_tx_hash.trim()
-      }));
-    }
-    // else: scanWithdrawalTx runs every 30s and will detect + send with hash
+    // Fire Telegram proof immediately after approve (non-blocking)
+    // Scanner will try to add TX hash separately if Moralis detects it
+    setImmediate(() => sendWithdrawProof({
+      withdraw_id: tx_id,
+      username:    tx.username    || '',
+      first_name:  tx.first_name  || '',
+      user_id:     user_id,
+      amount:      amount,
+      address:     tx.address     || '',
+      bsc_tx_hash: (bsc_tx_hash && bsc_tx_hash.trim()) ? bsc_tx_hash.trim() : ''
+    }));
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
@@ -2663,7 +2662,6 @@ async function scanBEP20() {
         if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
       }
     }
-
   } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
 }
 
@@ -2680,7 +2678,9 @@ async function scanBEP20() {
 
 async function scanWithdrawalTx() {
   try {
-    // Get approved withdrawals with no tx_hash in last 2 hours
+    if (!MORALIS_KEY) return;
+
+    // Get all approved withdrawals with no tx_hash, approved in last 24h
     const pending = await db.all(`
       SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
              u.username, u.first_name
@@ -2693,17 +2693,20 @@ async function scanWithdrawalTx() {
         AND t.approved_at >= NOW() - INTERVAL '2 hours'
     `);
 
-    if (!pending.length) return;
+    if (!pending.length) return; // nothing to match — skip Moralis call entirely
 
+    // Use WITHDRAWAL_WALLET if set and different from DEPOSIT_WALLET,
+    // otherwise reuse DEPOSIT_WALLET (same wallet handles both deposit & withdrawal)
     const scanWallet = (WITHDRAWAL_WALLET && WITHDRAWAL_WALLET !== DEPOSIT_WALLET)
       ? WITHDRAWAL_WALLET
       : DEPOSIT_WALLET;
 
-    // EXACT same endpoint as deposit scanner — returns ALL transfers (in+out)
-    const url  = `https://deep-index.moralis.io/api/v2.2/${scanWallet}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=25&order=DESC`;
+    const url  = `https://deep-index.moralis.io/api/v2.2/${scanWallet}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=50&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data || !data.result || !Array.isArray(data.result)) {
+      // Generic Moralis error (wallet has no history or API limit) — fallback will handle proof after 30 min
+      // Only log unexpected errors, not the generic "Something went wrong"
       const errMsg = data && data.message ? data.message : 'no result';
       if (errMsg !== 'Something went wrong') {
         log('WITH_SCAN', `Moralis error: ${errMsg}`);
@@ -2711,38 +2714,42 @@ async function scanWithdrawalTx() {
       return;
     }
 
-    // Filter outgoing only — from_address === our wallet
+    // Only outgoing transfers (from = scanWallet → to = user address)
     const outgoing = data.result.filter(tx =>
-      tx.from_address && tx.from_address.toLowerCase() === scanWallet.toLowerCase()
+      tx.from_address && tx.from_address.toLowerCase() === scanWallet
     );
 
     if (!outgoing.length) return;
 
-    log('WITH_SCAN', `${outgoing.length} outgoing txs | ${pending.length} pending`);
+    log('WITH_SCAN', `Moralis: ${outgoing.length} outgoing txs | unmatched approvals: ${pending.length}`);
 
     for (const wd of pending) {
       const approvedAt = new Date(wd.approved_at).getTime();
       const toAddr     = (wd.address || '').toLowerCase().trim();
 
       for (const tx of outgoing) {
+        // Must go TO user's registered withdraw address
         if (!tx.to_address || tx.to_address.toLowerCase() !== toAddr) continue;
-
+        // Must happen AFTER or within 10 min before approval (clock skew buffer)
         const txTime = new Date(tx.block_timestamp).getTime();
-        if (txTime < approvedAt - 600000) continue; // 10 min buffer
+        if (txTime < approvedAt - 600000) continue;
 
-        const txAmt = parseFloat(tx.value_decimal || 0);
-        const wdAmt = parseFloat(wd.amount);
+        // Amount match — allow ±1 USDT tolerance (fee deductions)
+        const txAmt  = parseFloat(tx.value_decimal || 0);
+        const wdAmt  = parseFloat(wd.amount);
         if (Math.abs(txAmt - wdAmt) > 1.0) continue;
 
-        // ✅ MATCH
+        // ✅ MATCH FOUND
         const txHash = tx.transaction_hash;
-        log('WITH_SCAN', `✅ wd=${wd.id} user=${wd.user_id} amt=${wdAmt} tx=${txHash.slice(0,16)}`);
+        log('WITH_SCAN', `✅ Matched wd=${wd.id} user=${wd.user_id} amt=${wdAmt} tx=${txHash.slice(0,16)}`);
 
+        // Save tx_hash to DB
         await db.run(
           `UPDATE transactions SET bsc_tx_hash=$1 WHERE id=$2 AND (bsc_tx_hash IS NULL OR bsc_tx_hash='')`,
           [txHash, wd.id]
         );
 
+        // Fire Telegram proof with tx_hash
         setImmediate(() => sendWithdrawProof({
           withdraw_id: wd.id,
           username:    wd.username   || '',
@@ -2753,7 +2760,7 @@ async function scanWithdrawalTx() {
           bsc_tx_hash: txHash
         }));
 
-        break;
+        break; // stop checking txs for this withdrawal
       }
     }
   } catch(e) {
@@ -2806,9 +2813,9 @@ function startScanners() {
   // Withdrawal TX auto-detector — runs every 30s (no rush, Moralis rate limit friendly)
   if (MORALIS_KEY) {
     const scanWalletLabel = WITHDRAWAL_WALLET || DEPOSIT_WALLET;
-    console.log('🔍 Withdrawal TX scanner started (15s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
-    setTimeout(scanWithdrawalTx, 8000);
-    setInterval(scanWithdrawalTx, 15000);
+    console.log('🔍 Withdrawal TX scanner started (30s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
+    setTimeout(scanWithdrawalTx, 15000); // first run after 15s
+    setInterval(scanWithdrawalTx, 30000);
     // Fallback proof sender — first run after 3 min (startup migration needs time), then every 2 min
     setTimeout(scanWithdrawalFallback, 180000);
     setInterval(scanWithdrawalFallback, 120000);
