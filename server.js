@@ -2623,14 +2623,14 @@ async function creditAutoDeposit(dep, txHash) {
 // BSC_RPC_URL env overrides only if it's not the broken default
 const _envRpc = process.env.BSC_RPC_URL || '';
 const RPC_ENDPOINTS = [
-  ...(_envRpc && !_envRpc.includes('bsc-dataseed') ? [_envRpc] : []),
-  'https://bsc-rpc.publicnode.com',
+  ...(_envRpc && !_envRpc.includes('bsc-dataseed.binance') ? [_envRpc] : []),
+  'https://binance.llamarpc.com',
+  'https://bsc.meowrpc.com',
+  'https://bsc-dataseed2.binance.org',
+  'https://bsc-dataseed3.binance.org',
+  'https://bsc-dataseed4.binance.org',
   'https://rpc.ankr.com/bsc',
-  'https://bsc-dataseed2.binance.org',  // binance dataseed2 — may support getLogs
-  'https://bsc-dataseed3.binance.org',  // binance dataseed3
-  'https://bsc-dataseed4.binance.org',  // binance dataseed4
-  'https://bsc.meowrpc.com',            // meowrpc — free, supports getLogs
-  'https://binance.llamarpc.com',       // llamarpc — reliable free BSC RPC
+  'https://bsc-rpc.publicnode.com',
 ];
 
 // Transfer(address indexed from, address indexed to, uint256 value)
@@ -2675,26 +2675,35 @@ async function rpcPost(endpoint, method, params) {
 }
 
 // Try each endpoint in order — return first success
+// Cache failed endpoints — skip them for 5 min before retrying
+const _endpointFailUntil = {};
+
 // Try each endpoint in order — return first success
 async function rpcCall(method, params) {
+  const now = Date.now();
   for (let i = 0; i < RPC_ENDPOINTS.length; i++) {
     const endpoint = RPC_ENDPOINTS[i];
-    const result   = await rpcPost(endpoint, method, params);
+    const host     = new URL(endpoint).hostname;
+
+    // Skip endpoints that failed recently (back-off 5 min)
+    if (_endpointFailUntil[host] && now < _endpointFailUntil[host]) continue;
+
+    const result = await rpcPost(endpoint, method, params);
 
     // Success: no error AND result is not null/undefined
-    // eth_blockNumber → string like "0x..."
-    // eth_getLogs     → array (can be empty [])
     const isSuccess = !result.error && result.result !== undefined && result.result !== null;
-    if (isSuccess) return result;
-
-    const errMsg = result.error?.message || (result.result === null ? 'null result' : 'unknown');
-    const hasNext = i < RPC_ENDPOINTS.length - 1;
-    if (hasNext) {
-      log('RPC', `${new URL(endpoint).hostname} failed (${errMsg}) — trying next`);
-    } else {
-      log('RPC', `All RPC endpoints failed. Last error: ${errMsg}`);
+    if (isSuccess) {
+      // Clear fail cache on success
+      delete _endpointFailUntil[host];
+      return result;
     }
+
+    // Mark this endpoint as failed — skip for 5 min
+    _endpointFailUntil[host] = now + 5 * 60 * 1000;
+    const errMsg = result.error?.message || (result.result === null ? 'null result' : 'unknown');
+    log('RPC', `${host} failed (${errMsg}) — skipping for 5min`);
   }
+  log('RPC', 'All RPC endpoints failed or in back-off — will retry next cycle');
   return { error: { message: 'all RPC endpoints failed' } };
 }
 
