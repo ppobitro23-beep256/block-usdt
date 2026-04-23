@@ -2616,151 +2616,176 @@ async function creditAutoDeposit(dep, txHash) {
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER — BscScan API
+// BEP20 AUTO SCANNER — eth_getLogs via RPC
 // ══════════════════════════════════════════
 
-let _lastSeenTxHash = '';
-let _scanRunning    = false;
-let _rateLimitUntil = 0; // timestamp — back off if rate limited
+// FIX 1: publicnode FIRST — bsc-dataseed doesn't support eth_getLogs
+// BSC_RPC_URL env overrides only if it's not the broken default
+const _envRpc = process.env.BSC_RPC_URL || '';
+const RPC_ENDPOINTS = [
+  ...(_envRpc && !_envRpc.includes('bsc-dataseed') ? [_envRpc] : []),
+  'https://bsc-rpc.publicnode.com',
+  'https://rpc.ankr.com/bsc',
+  'https://1rpc.io/bnb',
+];
 
-// Load last seen tx hash from DB
-async function loadLastTxHash() {
-  try {
-    const row = await db.one(`SELECT value FROM settings WHERE key='rpc_last_tx'`);
-    return row ? (row.value || '') : '';
-  } catch(e) { return ''; }
+// Transfer(address indexed from, address indexed to, uint256 value)
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+// Pad address to 32-byte topic
+function addrToTopic(addr) {
+  return '0x' + addr.replace(/^0x/i, '').toLowerCase().padStart(64, '0');
 }
 
-// Save last seen tx hash to DB
-async function saveLastTxHash(hash) {
-  try {
-    await db.run(
-      `INSERT INTO settings (key,value) VALUES ('rpc_last_tx',$1)
-       ON CONFLICT (key) DO UPDATE SET value=$1`,
-      [hash || '']
-    );
-  } catch(e) {}
-}
-
-// BscScan free API — fetch latest USDT transfers TO deposit wallet
-async function fetchBscScanTransfers() {
-  const apiKeyParam = BSCSCAN_API_KEY ? `&apikey=${BSCSCAN_API_KEY}` : '';
-  // FIX 1: removed &offset= param — BscScan uses &limit= not &offset= for result count
-  const url = `https://api.bscscan.com/api` +
-    `?module=account` +
-    `&action=tokentx` +
-    `&contractaddress=${USDT_CONTRACT}` +
-    `&address=${DEPOSIT_WALLET}` +
-    `&sort=desc` +
-    `&page=1` +
-    `&offset=20` +
-    apiKeyParam;
-
+// JSON-RPC POST to a single endpoint
+async function rpcPost(endpoint, method, params) {
   return new Promise((resolve) => {
-    const opts = new URL(url);
+    const body    = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+    const url     = new URL(endpoint);
+    const isHttps = url.protocol === 'https:';
     const options = {
-      hostname: opts.hostname,
-      path:     opts.pathname + opts.search,
-      method:   'GET',
-      // FIX 2: add Accept header — some proxies reject without it
-      headers:  { 'User-Agent': 'BlockUSDT/1.0', 'Accept': 'application/json' },
+      hostname: url.hostname,
+      port:     url.port ? parseInt(url.port, 10) : (isHttps ? 443 : 80),
+      path:     url.pathname + url.search,
+      method:   'POST',
+      headers:  {
+        'Content-Type':   'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'User-Agent':     'BlockUSDT/1.0',
+      },
     };
-    const req = require('https').request(options, (res) => {
+    const proto = isHttps ? require('https') : require('http');
+    const req   = proto.request(options, (res) => {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch(e) { resolve(null); }
+        catch(e) { resolve({ error: { message: 'parse error' } }); }
       });
     });
-    req.on('error', (e) => { resolve(null); });
-    req.setTimeout(12000, () => { req.destroy(); resolve(null); });
+    req.on('error', (e) => resolve({ error: { message: e.message } }));
+    req.setTimeout(12000, () => { req.destroy(); resolve({ error: { message: 'timeout' } }); });
+    req.write(body);
     req.end();
   });
 }
 
-// Main BEP20 scanner
+// Try each endpoint in order — return first success
+async function rpcCall(method, params) {
+  for (const endpoint of RPC_ENDPOINTS) {
+    const result = await rpcPost(endpoint, method, params);
+    if (!result.error && result.result !== undefined) return result;
+    // Only log failure if more endpoints remain to try
+    const idx = RPC_ENDPOINTS.indexOf(endpoint);
+    if (idx < RPC_ENDPOINTS.length - 1) {
+      log('RPC', `${new URL(endpoint).hostname} failed — trying next`);
+    }
+  }
+  return { error: { message: 'all RPC endpoints failed' } };
+}
+
+// Load / save last scanned block
+async function loadLastBlock() {
+  try {
+    const row = await db.one(`SELECT value FROM settings WHERE key='rpc_last_block'`);
+    if (row && row.value) return parseInt(row.value) || 0;
+  } catch(e) {}
+  return 0;
+}
+async function saveLastBlock(blockNum) {
+  try {
+    await db.run(
+      `INSERT INTO settings (key,value) VALUES ('rpc_last_block',$1)
+       ON CONFLICT (key) DO UPDATE SET value=$1`,
+      [String(blockNum)]
+    );
+  } catch(e) { log('RPC', 'saveLastBlock error: ' + e.message); }
+}
+
+let _lastScannedBlock = 0;
+let _scanRunning      = false;
+
+// Main BEP20 scanner — polls every 15s via eth_getLogs
 async function scanBEP20() {
-  // FIX 3: overlap guard must reset in finally, not just happy path
-  if (_scanRunning) return;
-
-  // FIX 4: rate limit back-off — don't hammer API after NOTOK
-  if (_rateLimitUntil && Date.now() < _rateLimitUntil) return;
-
+  if (_scanRunning) return; // overlap guard
   _scanRunning = true;
   try {
+
     // 1. Any pending deposits?
     const pending = await db.all(
       `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
-    if (!pending.length) return;
 
-    // 2. Fetch latest USDT transfers
-    const data = await fetchBscScanTransfers();
-
-    if (!data) {
-      log('RPC', 'BscScan: no response (network error) — will retry');
+    // FIX 2+4: get latest block ONCE — used for both idle advance and scan range
+    const latestResp = await rpcCall('eth_blockNumber', []);
+    if (latestResp.error || !latestResp.result) {
+      log('RPC', 'eth_blockNumber failed: ' + (latestResp.error?.message || 'no result'));
       return;
     }
+    const latestBlock = parseInt(latestResp.result, 16);
 
-    // FIX 5: BscScan rate limit returns status=0 message=NOTOK — back off 30s
-    if (data.status === '0') {
-      const msg = (data.message || '').trim();
-      if (msg === 'NOTOK' || (data.result && String(data.result).includes('rate limit'))) {
-        _rateLimitUntil = Date.now() + 30000; // back off 30s
-        log('RPC', 'BscScan rate limit — backing off 30s');
-        return;
-      }
-      // "No transactions found" = wallet has no USDT history yet — normal
-      if (msg !== 'No transactions found') {
-        log('RPC', `BscScan error: ${msg}`);
+    if (!pending.length) {
+      // FIX 4: idle — just keep block pointer current, no eth_getLogs needed
+      if (latestBlock > _lastScannedBlock) {
+        _lastScannedBlock = latestBlock;
+        await saveLastBlock(latestBlock);
       }
       return;
     }
 
-    const txList = data.result;
-    if (!Array.isArray(txList) || !txList.length) return;
+    // 2. Determine scan range
+    // FIX 3: MAX_PER_SCAN 100 — publicnode supports 5000, 100 covers ~5 min of catchup
+    const MAX_BACK     = 40;   // first start: ~2 min of BSC blocks
+    const MAX_PER_SCAN = 100;  // per cycle max — fast catchup after restart
+    const rawFrom   = _lastScannedBlock > 0 ? _lastScannedBlock + 1 : latestBlock - MAX_BACK;
+    const fromBlock = Math.max(1, rawFrom);
+    const toBlock   = Math.min(latestBlock, fromBlock + MAX_PER_SCAN - 1);
 
-    log('RPC', `Latest block: ${txList[0].blockNumber} | BscScan: ${txList.length} transfers fetched`);
-
-    // 3. Find txs newer than last seen hash
-    // FIX 6: if _lastSeenTxHash is empty (first run), only process txs from last 30 min
-    // to avoid crediting old historical deposits on first deploy
-    const newTxs = [];
-    const thirtyMinsAgo = Math.floor(Date.now() / 1000) - 1800;
-
-    for (const tx of txList) {
-      if (tx.hash === _lastSeenTxHash) break; // already processed from here on
-      // On first run (no saved hash), only process recent txs
-      if (!_lastSeenTxHash && parseInt(tx.timeStamp || 0) < thirtyMinsAgo) break;
-      newTxs.push(tx);
-    }
-
-    if (!newTxs.length) {
-      // All txs already seen — still save latest hash in case DB was cleared
-      if (!_lastSeenTxHash) {
-        _lastSeenTxHash = txList[0].hash;
-        await saveLastTxHash(_lastSeenTxHash);
-      }
+    if (fromBlock > toBlock) {
+      _lastScannedBlock = latestBlock;
+      await saveLastBlock(latestBlock);
       return;
     }
 
-    // 4. Match each new transfer against pending deposits
-    for (const tx of newTxs) {
-      // Only incoming to deposit wallet
-      if (!tx.to || tx.to.toLowerCase() !== DEPOSIT_WALLET) continue;
-      // Only USDT contract (BscScan tokentx filters by contract already, double-check)
-      if (!tx.contractAddress || tx.contractAddress.toLowerCase() !== USDT_CONTRACT) continue;
+    log('RPC', `Latest block: ${latestBlock} | Scanning ${fromBlock}→${toBlock} (${toBlock - fromBlock + 1} blocks)`);
 
-      const txHash = tx.hash;
+    // 3. eth_getLogs — USDT transfers TO deposit wallet only
+    const logsResp = await rpcCall('eth_getLogs', [{
+      fromBlock: '0x' + fromBlock.toString(16),
+      toBlock:   '0x' + toBlock.toString(16),
+      address:   USDT_CONTRACT,
+      topics:    [TRANSFER_TOPIC, null, addrToTopic(DEPOSIT_WALLET)],
+    }]);
 
-      // FIX 7: tokenDecimal can be string — parse safely
-      const decimals = parseInt(tx.tokenDecimal) || 18;
-      const txAmt    = parseFloat(tx.value) / Math.pow(10, decimals);
+    if (logsResp.error) {
+      log('RPC', 'eth_getLogs error: ' + logsResp.error.message);
+      // Don't advance block — retry same range next cycle
+      return;
+    }
 
+    const logs = logsResp.result || [];
+    if (logs.length > 0) {
+      log('RPC', `Found ${logs.length} Transfer(s) to deposit wallet`);
+    }
+
+    // 4. Process each Transfer log
+    for (const rawLog of logs) {
+      if (!rawLog.topics || rawLog.topics.length < 3) continue;
+
+      const to = '0x' + rawLog.topics[2].slice(-40).toLowerCase();
+      if (to !== DEPOSIT_WALLET) continue;
+
+      const rawData = rawLog.data || '0x0';
+      let txAmt;
+      try {
+        txAmt = Number(BigInt(rawData === '0x' ? '0x0' : rawData)) / 1e18;
+      } catch(e) { continue; }
       if (isNaN(txAmt) || txAmt <= 0) continue;
 
-      // Duplicate guard — fast DB check
+      const txHash = rawLog.transactionHash;
+      if (!txHash) continue;
+
+      // Duplicate guard
       const alreadyDone = await db.one(
         `SELECT id FROM auto_deposits WHERE tx_hash=$1`, [txHash]
       );
@@ -2774,11 +2799,8 @@ async function scanBEP20() {
       // Match against pending deposits (±0.02 tolerance)
       for (const dep of pending) {
         if (dep._matched) continue;
+        if (Math.abs(txAmt - dep.unique_amt) > 0.02) continue;
 
-        const diff = Math.abs(txAmt - dep.unique_amt);
-        if (diff > 0.02) continue;
-
-        // Expiry check before crediting
         if (new Date() > new Date(dep.expires_at)) {
           await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
           log('RPC', `Deposit expired dep=${dep.id} user=${dep.user_id}`);
@@ -2794,14 +2816,13 @@ async function scanBEP20() {
       }
     }
 
-    // 5. Save latest hash — always after full processing loop
-    _lastSeenTxHash = txList[0].hash;
-    await saveLastTxHash(_lastSeenTxHash);
+    // 5. Advance block — only after successful scan
+    _lastScannedBlock = toBlock;
+    await saveLastBlock(toBlock);
 
   } catch(e) {
     log('RPC', 'Error: ' + e.message);
   } finally {
-    // FIX 3: always release lock
     _scanRunning = false;
   }
 }
@@ -2959,23 +2980,19 @@ async function scanWithdrawalFallback() {
 }
 
 async function startScanners() {
-  // ── Load last seen tx hash from DB (safe restart) ─────────────────────────
-  _lastSeenTxHash = await loadLastTxHash();
-  const rpcLabel = 'BscScan API';
-  log('RPC', `Connected to BSC RPC: ${rpcLabel}`);
-
-  if (_lastSeenTxHash) {
-    log('RPC', `Resuming from last tx: ${_lastSeenTxHash.slice(0,18)}...`);
+  // Load last scanned block from DB (safe restart)
+  _lastScannedBlock = await loadLastBlock();
+  log('RPC', `Connected to BSC RPC: ${new URL(RPC_ENDPOINTS[0]).hostname}`);
+  if (_lastScannedBlock > 0) {
+    log('RPC', `Resuming from saved block: ${_lastScannedBlock}`);
   } else {
-    log('RPC', 'No saved state — will process latest 20 transfers');
+    log('RPC', 'No saved block — will start from latest - 40 blocks');
   }
+  log('RPC', 'Scanner started (15s polling interval)');
 
-  log('RPC', `Scanner started (15s polling interval${BSCSCAN_API_KEY ? ' + API key' : ' — add BSCSCAN_API_KEY env for faster polling'})`);
-
-  // ── BEP20 deposit scanner ─────────────────────────────────────────────────
-  // 15s interval — safe for BscScan free tier (no key: 1 req/5s, key: 5 req/s)
-  setTimeout(scanBEP20, 5000);   // first scan after 5s
-  setInterval(scanBEP20, 15000); // then every 15s
+  // BEP20 deposit scanner — every 15s
+  setTimeout(scanBEP20, 5000);
+  setInterval(scanBEP20, 15000);
 
   // ── Withdrawal TX fallback proof sender (no Moralis needed) ─────────────
   // Runs every 2 min — fires Telegram proof for approved withdrawals with no tx hash
