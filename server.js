@@ -47,6 +47,7 @@ const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF7
 const BEP20_WALLET        = DEPOSIT_WALLET;
 const BEP20_USDT_CONTRACT = USDT_CONTRACT;
 const WITHDRAWAL_WALLET   = (process.env.WITHDRAWAL_WALLET || '').toLowerCase();
+const BSCSCAN_API_KEY     = process.env.BSCSCAN_API_KEY || 'YourApiKeyToken'; // free tier works
 
 // Simple HTTPS GET helper
 function httpsGet(url, headers) {
@@ -2679,9 +2680,7 @@ async function scanBEP20() {
 
 async function scanWithdrawalTx() {
   try {
-    if (!MORALIS_KEY) return;
-
-    // Get all approved withdrawals with no tx_hash, approved in last 24h
+    // Get approved withdrawals with no tx_hash in last 2 hours
     const pending = await db.all(`
       SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
              u.username, u.first_name
@@ -2694,21 +2693,17 @@ async function scanWithdrawalTx() {
         AND t.approved_at >= NOW() - INTERVAL '2 hours'
     `);
 
-    if (!pending.length) return; // nothing to match — skip Moralis call entirely
+    if (!pending.length) return;
 
-    // Use WITHDRAWAL_WALLET if set and different from DEPOSIT_WALLET,
-    // otherwise reuse DEPOSIT_WALLET (same wallet handles both deposit & withdrawal)
     const scanWallet = (WITHDRAWAL_WALLET && WITHDRAWAL_WALLET !== DEPOSIT_WALLET)
       ? WITHDRAWAL_WALLET
       : DEPOSIT_WALLET;
 
-    // Use token contract transfers endpoint with from_address filter
-    const url  = `https://deep-index.moralis.io/api/v2.2/erc20/${USDT_CONTRACT}/transfers?chain=bsc&from_address=${scanWallet}&limit=25&order=DESC`;
+    // EXACT same endpoint as deposit scanner — returns ALL transfers (in+out)
+    const url  = `https://deep-index.moralis.io/api/v2.2/${scanWallet}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=25&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data || !data.result || !Array.isArray(data.result)) {
-      // Generic Moralis error (wallet has no history or API limit) — fallback will handle proof after 30 min
-      // Only log unexpected errors, not the generic "Something went wrong"
       const errMsg = data && data.message ? data.message : 'no result';
       if (errMsg !== 'Something went wrong') {
         log('WITH_SCAN', `Moralis error: ${errMsg}`);
@@ -2716,40 +2711,38 @@ async function scanWithdrawalTx() {
       return;
     }
 
-    // All results are already outgoing (from_address=scanWallet in URL)
-    const outgoing = data.result || [];
+    // Filter outgoing only — from_address === our wallet
+    const outgoing = data.result.filter(tx =>
+      tx.from_address && tx.from_address.toLowerCase() === scanWallet.toLowerCase()
+    );
 
     if (!outgoing.length) return;
 
-    log('WITH_SCAN', `Moralis: ${outgoing.length} outgoing txs | unmatched approvals: ${pending.length}`);
+    log('WITH_SCAN', `${outgoing.length} outgoing txs | ${pending.length} pending`);
 
     for (const wd of pending) {
       const approvedAt = new Date(wd.approved_at).getTime();
       const toAddr     = (wd.address || '').toLowerCase().trim();
 
       for (const tx of outgoing) {
-        // Must go TO user's registered withdraw address
         if (!tx.to_address || tx.to_address.toLowerCase() !== toAddr) continue;
-        // Must happen AFTER or within 10 min before approval (clock skew buffer)
-        const txTime = new Date(tx.block_timestamp).getTime();
-        if (txTime < approvedAt - 600000) continue;
 
-        // Amount match — allow ±1 USDT tolerance (fee deductions)
-        const txAmt  = parseFloat(tx.value_decimal || 0);
-        const wdAmt  = parseFloat(wd.amount);
+        const txTime = new Date(tx.block_timestamp).getTime();
+        if (txTime < approvedAt - 600000) continue; // 10 min buffer
+
+        const txAmt = parseFloat(tx.value_decimal || 0);
+        const wdAmt = parseFloat(wd.amount);
         if (Math.abs(txAmt - wdAmt) > 1.0) continue;
 
-        // ✅ MATCH FOUND
+        // ✅ MATCH
         const txHash = tx.transaction_hash;
-        log('WITH_SCAN', `✅ Matched wd=${wd.id} user=${wd.user_id} amt=${wdAmt} tx=${txHash.slice(0,16)}`);
+        log('WITH_SCAN', `✅ wd=${wd.id} user=${wd.user_id} amt=${wdAmt} tx=${txHash.slice(0,16)}`);
 
-        // Save tx_hash to DB
         await db.run(
           `UPDATE transactions SET bsc_tx_hash=$1 WHERE id=$2 AND (bsc_tx_hash IS NULL OR bsc_tx_hash='')`,
           [txHash, wd.id]
         );
 
-        // Fire Telegram proof with tx_hash
         setImmediate(() => sendWithdrawProof({
           withdraw_id: wd.id,
           username:    wd.username   || '',
@@ -2760,7 +2753,7 @@ async function scanWithdrawalTx() {
           bsc_tx_hash: txHash
         }));
 
-        break; // stop checking txs for this withdrawal
+        break;
       }
     }
   } catch(e) {
@@ -2813,9 +2806,9 @@ function startScanners() {
   // Withdrawal TX auto-detector — runs every 30s (no rush, Moralis rate limit friendly)
   if (MORALIS_KEY) {
     const scanWalletLabel = WITHDRAWAL_WALLET || DEPOSIT_WALLET;
-    console.log('🔍 Withdrawal TX scanner started (10s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
+    console.log('🔍 Withdrawal TX scanner started (15s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
     setTimeout(scanWithdrawalTx, 8000);
-    setInterval(scanWithdrawalTx, 10000);
+    setInterval(scanWithdrawalTx, 15000);
     // Fallback proof sender — first run after 3 min (startup migration needs time), then every 2 min
     setTimeout(scanWithdrawalFallback, 180000);
     setInterval(scanWithdrawalFallback, 120000);
