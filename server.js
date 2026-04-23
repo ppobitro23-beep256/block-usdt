@@ -39,14 +39,17 @@ const authLimit     = rateLimit(20,  60_000);   // 20/min per IP
 const depositLimit  = rateLimit(30,  60_000);   // 30/min
 
 // ══════════════════════════════════════════
-// AUTO DEPOSIT SCANNER CONFIG
+// AUTO DEPOSIT SCANNER CONFIG (BSC RPC)
 // ══════════════════════════════════════════
-const MORALIS_KEY         = process.env.MORALIS_API_KEY || '';
+const BSC_RPC_URL         = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org/';
 const DEPOSIT_WALLET      = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148').toLowerCase();
 const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF775485246999027B3197955').toLowerCase();
 const BEP20_WALLET        = DEPOSIT_WALLET;
 const BEP20_USDT_CONTRACT = USDT_CONTRACT;
 const WITHDRAWAL_WALLET   = (process.env.WITHDRAWAL_WALLET || '').toLowerCase();
+
+// ── BSC RPC: last scanned block tracker (in-memory + DB-backed) ──────────────
+let rpcLastBlock = 0; // will be loaded from DB on startup
 
 // Simple HTTPS GET helper
 function httpsGet(url, headers) {
@@ -2611,84 +2614,218 @@ async function creditAutoDeposit(dep, txHash) {
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER (BscScan)
+// BEP20 AUTO SCANNER — Direct BSC RPC
+// Replaces Moralis with ethers.js JSON-RPC
 // ══════════════════════════════════════════
+
+// Transfer(address indexed from, address indexed to, uint256 value)
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+// keccak256('Transfer(address,address,uint256)')
+
+// Pad an Ethereum address to 32-byte topic (lowercase, no 0x prefix padding)
+function addrToTopic(addr) {
+  return '0x' + addr.replace('0x', '').toLowerCase().padStart(64, '0');
+}
+
+// Decode a Transfer log into { from, to, value (USDT decimals=18) }
+function decodeTransferLog(log_) {
+  try {
+    // BUG FIX 3: topics[2] = 0x + 24 zero-padded bytes + 20-byte address (40 hex chars)
+    // Use slice(-40) — more robust than slice(26) which relies on exact prefix length
+    if (!log_.topics || log_.topics.length < 3) return null;
+    const to    = '0x' + log_.topics[2].slice(-40).toLowerCase();
+    // BUG FIX 4: log_.data may be '0x' (empty) or missing — guard before BigInt
+    const rawData = log_.data || '0x0';
+    const value = BigInt(rawData === '0x' ? '0x0' : rawData);
+    const amt   = Number(value) / 1e18; // USDT on BSC = 18 decimals
+    return { to, amt };
+  } catch(e) {
+    return null;
+  }
+}
+
+// Low-level JSON-RPC call to BSC node (no external library required)
+async function rpcCall(method, params) {
+  return new Promise((resolve) => {
+    const body    = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
+    const url     = new URL(BSC_RPC_URL);
+    const isHttps = url.protocol === 'https:';
+    // BUG FIX 1: port must default correctly per protocol (not always 443)
+    const defaultPort = isHttps ? 443 : 80;
+    const options = {
+      hostname: url.hostname,
+      port:     url.port ? parseInt(url.port, 10) : defaultPort,
+      path:     url.pathname + url.search,
+      method:   'POST',
+      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    };
+    const proto = isHttps ? require('https') : require('http');
+    const req = proto.request(options, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { resolve({ error: { message: 'parse error' } }); }
+      });
+    });
+    req.on('error', (e) => resolve({ error: { message: e.message } }));
+    req.setTimeout(10000, () => { req.destroy(); resolve({ error: { message: 'timeout' } }); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// Load last scanned block from DB (key: 'rpc_last_block')
+async function loadLastBlock() {
+  try {
+    const row = await db.one(`SELECT value FROM settings WHERE key='rpc_last_block'`);
+    if (row && row.value) return parseInt(row.value) || 0;
+  } catch(e) {}
+  return 0;
+}
+
+// Persist last scanned block to DB
+async function saveLastBlock(blockNum) {
+  try {
+    await db.run(
+      `INSERT INTO settings (key,value) VALUES ('rpc_last_block',$1)
+       ON CONFLICT (key) DO UPDATE SET value=$1`,
+      [String(blockNum)]
+    );
+  } catch(e) {
+    log('RPC', 'Failed to save last block: ' + e.message);
+  }
+}
+
+// Main BEP20 scanner — polls BSC RPC for USDT Transfer events every 10s
+let _scanRunning = false; // prevent overlapping scans
 async function scanBEP20() {
-  // ✅ FIX: MORALIS_KEY guard — skip silently if key not configured
-  if (!MORALIS_KEY) {
-    console.warn('[BEP20] MORALIS_API_KEY not set — scanner skipped');
+  // Overlap guard — if previous scan is still running, skip this cycle
+  if (_scanRunning) {
+    log('RPC', 'Previous scan still running — skipping cycle');
     return;
   }
-
+  _scanRunning = true;
   try {
-    const pending = await db.all(
-      `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
-    );
-    if (!pending.length) return;
+    // 1. Get latest block from BSC FIRST (always — so rpcLastBlock stays current
+    //    even during idle periods with no pending deposits)
+    const latestResp = await rpcCall('eth_blockNumber', []);
+    if (latestResp.error || !latestResp.result) {
+      log('RPC', 'Error getting latest block: ' + (latestResp.error?.message || 'no result'));
+      return;
+    }
+    const latestBlock = parseInt(latestResp.result, 16);
 
-    // ✅ FIX: removed contract_addresses[] filter — Starter plan blocks this param on BSC
-    // Instead fetch all ERC20 transfers and filter server-side by USDT contract address
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
-    const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
+    // 2. Determine scan range
+    // BSC ~3s/block → 10s interval = ~3-4 new blocks per cycle
+    // Cap at 500 blocks max per cycle — free BSC RPCs reject larger ranges
+    const MAX_BACK     = 200; // on first start, go back 200 blocks (~10 min)
+    const MAX_PER_SCAN = 500; // hard cap per cycle to avoid RPC "block range too large" error
+    const rawFrom  = rpcLastBlock > 0 ? rpcLastBlock + 1 : latestBlock - MAX_BACK;
+    // BUG FIX: fromBlock must never be negative or zero
+    const fromBlock = Math.max(1, rawFrom);
+    const toBlock   = Math.min(latestBlock, fromBlock + MAX_PER_SCAN - 1);
 
-    if (!data.result || !Array.isArray(data.result)) {
-      console.log('[BEP20] Moralis error:', JSON.stringify(data).slice(0, 200));
+    if (fromBlock > toBlock) {
+      // Already up to date — advance saved block silently so next restart is fresh
+      rpcLastBlock = latestBlock;
+      await saveLastBlock(latestBlock);
       return;
     }
 
-    // Filter server-side: only USDT contract transfers
-    const txs = data.result.filter(tx =>
-      tx.token_address && tx.token_address.toLowerCase() === USDT_CONTRACT
+    log('RPC', `Latest block: ${latestBlock} | Scanning ${fromBlock}→${toBlock} (${toBlock - fromBlock + 1} blocks)`);
+
+    // 3. Check if any pending deposits exist (cheap query — after block range calc
+    //    so rpcLastBlock still advances even with no pending deposits)
+    const pending = await db.all(
+      `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
-    console.log(`[BEP20] Moralis: ${txs.length} txs | pending auto: ${pending.length}`);
 
-    for (const dep of pending) {
-      const depTs = new Date(dep.created_at).getTime() - 60000;
-      let matched = false;
+    if (!pending.length) {
+      // No pending deposits — still advance last block so we don't re-scan old blocks
+      rpcLastBlock = toBlock;
+      await saveLastBlock(toBlock);
+      return;
+    }
 
-      for (const tx of txs) {
-        if (!tx.to_address || tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
-        if (new Date(tx.block_timestamp).getTime() < depTs) continue;
+    // 4. Fetch Transfer logs: USDT contract, to=DEPOSIT_WALLET
+    const logsResp = await rpcCall('eth_getLogs', [{
+      fromBlock: '0x' + fromBlock.toString(16),
+      toBlock:   '0x' + toBlock.toString(16),
+      address:   USDT_CONTRACT,
+      topics:    [
+        TRANSFER_TOPIC,
+        null,                          // from: any
+        addrToTopic(DEPOSIT_WALLET),   // to:   deposit wallet only
+      ],
+    }]);
 
-        // ✅ FIX: value_decimal may be null/undefined on some Moralis responses — fallback to raw value
-        let txAmt;
-        if (tx.value_decimal != null && tx.value_decimal !== '') {
-          txAmt = parseFloat(tx.value_decimal);
-        } else if (tx.value != null) {
-          // USDT on BSC is 18 decimals
-          txAmt = parseFloat(tx.value) / 1e18;
-        } else {
-          continue; // no usable amount field — skip this tx
-        }
+    if (logsResp.error) {
+      log('RPC', 'eth_getLogs error: ' + logsResp.error.message);
+      // Don't advance last block on RPC error — retry same range next cycle
+      return;
+    }
 
-        // ✅ FIX: NaN guard — if parsing still fails, skip
-        if (isNaN(txAmt)) continue;
+    const logs = logsResp.result || [];
+    if (logs.length > 0) {
+      log('RPC', `Found ${logs.length} Transfer(s) to deposit wallet in range`);
+    }
 
-        const diff  = Math.abs(txAmt - dep.unique_amt);
-        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
+    // 5. Match each Transfer against pending deposits
+    for (const rawLog of logs) {
+      const decoded = decodeTransferLog(rawLog);
+      if (!decoded) continue;
+      if (decoded.to !== DEPOSIT_WALLET) continue; // safety double-check
 
-        // ✅ FIX: tolerance 0.01 → 0.02 to handle floating point precision issues
-        if (diff <= 0.02) {
-          // [STRICT] Double-check expiry before crediting
-          if (new Date() > new Date(dep.expires_at)) {
-            await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-            log('EXPIRY', `Auto deposit ${dep.id} expired before match user=${dep.user_id}`);
-            matched = true; // stop searching for this dep
-            break;
-          }
-          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
-          await creditAutoDeposit(dep, tx.transaction_hash);
-          matched = true;
+      const txHash = rawLog.transactionHash;
+      const txAmt  = decoded.amt;
+
+      if (isNaN(txAmt) || txAmt <= 0) continue;
+
+      // Already processed? (duplicate guard via DB unique index)
+      const alreadyDone = await db.one(
+        `SELECT id FROM auto_deposits WHERE tx_hash=$1`, [txHash]
+      );
+      if (alreadyDone) {
+        log('RPC', `Duplicate skipped tx: ${txHash.slice(0, 18)}...`);
+        continue;
+      }
+
+      log('RPC', `Deposit found tx: ${txHash.slice(0, 18)}... amt=${txAmt}`);
+
+      // Match against pending deposit requests (amount within ±0.02 tolerance)
+      for (const dep of pending) {
+        // Skip already-matched deposits in this cycle
+        if (dep._matched) continue;
+
+        const diff = Math.abs(txAmt - dep.unique_amt);
+        if (diff > 0.02) continue; // amount doesn't match
+
+        // Expiry check
+        if (new Date() > new Date(dep.expires_at)) {
+          await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
+          log('RPC', `Deposit expired before match dep=${dep.id} user=${dep.user_id}`);
+          dep._matched = true;
           break;
         }
-      }
-      // [REDUCED LOG] Only log no-match for very recent deposits (< 5 min)
-      if (!matched) {
-        const age = (Date.now() - new Date(dep.created_at).getTime()) / 60000;
-        if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
+
+        log('RPC', `User matched: dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+        await creditAutoDeposit(dep, txHash);
+        log('RPC', `Credited successfully: user=${dep.user_id} amount=${dep.amount} tx=${txHash.slice(0,18)}...`);
+        dep._matched = true;
+        break;
       }
     }
-  } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
+
+    // 6. Advance last scanned block — only after successful scan
+    rpcLastBlock = toBlock;
+    await saveLastBlock(toBlock);
+
+  } catch(e) {
+    log('RPC', 'Error: ' + e.message);
+  } finally {
+    _scanRunning = false;
+  }
 }
 
 // ══════════════════════════════════════════
@@ -2703,6 +2840,9 @@ async function scanBEP20() {
 // ══════════════════════════════════════════
 
 async function scanWithdrawalTx() {
+  // Withdrawal TX auto-detection requires Moralis (optional feature)
+  // If MORALIS_KEY not set, fallback proof sender handles notification without tx hash
+  const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
   try {
     if (!MORALIS_KEY) return;
 
@@ -2840,38 +2980,37 @@ async function scanWithdrawalFallback() {
   }
 }
 
-function startScanners() {
-  if (!MORALIS_KEY) {
-    console.warn('⚠️ MORALIS_API_KEY not set — auto deposit scanner & withdrawal TX scanner disabled');
-    // Still run expiry cleanup even without Moralis key
-    setInterval(async () => {
-      await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
-    }, 60000);
-    return;
-  }
+async function startScanners() {
+  // ── Load last scanned block from DB (safe restart) ──────────────────────
+  rpcLastBlock = await loadLastBlock();
+  const rpcLabel = BSC_RPC_URL.replace(/https?:\/\//, '').split('/')[0];
+  log('RPC', `Connected to BSC RPC: ${rpcLabel}`);
 
-  console.log('🔍 BEP20 Moralis scanner started (10s interval)');
-  setTimeout(scanBEP20, 5000);
-  setInterval(scanBEP20, 10000);
-
-  // Withdrawal TX auto-detector — runs every 30s (no rush, Moralis rate limit friendly)
-  if (MORALIS_KEY) {
-    const scanWalletLabel = WITHDRAWAL_WALLET || DEPOSIT_WALLET;
-    console.log('🔍 Withdrawal TX scanner started (30s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
-    setTimeout(scanWithdrawalTx, 15000); // first run after 15s
-    setInterval(scanWithdrawalTx, 30000);
-    // Fallback proof sender — first run after 3 min (startup migration needs time), then every 2 min
-    setTimeout(scanWithdrawalFallback, 180000);
-    setInterval(scanWithdrawalFallback, 120000);
+  if (rpcLastBlock > 0) {
+    log('RPC', `Resuming from saved block: ${rpcLastBlock}`);
   } else {
-    console.warn('⚠️ MORALIS_API_KEY not set — withdrawal TX auto-detection disabled');
+    log('RPC', 'No saved block found — will start from latest - 200');
   }
 
-  // Auto-expire old pending deposits every minute
+  log('RPC', 'Scanner started (10s polling interval)');
+
+  // ── BEP20 deposit scanner — every 10s ───────────────────────────────────
+  setTimeout(scanBEP20, 3000);   // first scan after 3s
+  setInterval(scanBEP20, 10000); // then every 10s
+
+  // ── Withdrawal TX fallback proof sender (no Moralis needed) ─────────────
+  // Runs every 2 min — fires Telegram proof for approved withdrawals with no tx hash
+  setTimeout(scanWithdrawalFallback, 180000);  // first run after 3 min (migrations settle)
+  setInterval(scanWithdrawalFallback, 120000); // then every 2 min
+
+  // ── Auto-expire stale pending deposits every 60s ─────────────────────────
   setInterval(async () => {
-    await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
+    try {
+      await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
+    } catch(e) {}
   }, 60000);
-  // today_earned is reset per-user in GET /api/user/:id when last_earn_date changes (no bulk reset needed)
+
+  // today_earned is reset per-user in GET /api/user/:id when last_earn_date changes
 }
 
 // ══════════════════════════════════════════
@@ -3848,8 +3987,8 @@ app.use((req, res) => {
 // ══════════════════════════════════════════
 // START
 // ══════════════════════════════════════════
-setupDB().then(() => {
-  startScanners();
+setupDB().then(async () => {
+  await startScanners();
   app.listen(PORT, () => {
     console.log(`✅ Server on port ${PORT} — Neon PostgreSQL connected`);
 
