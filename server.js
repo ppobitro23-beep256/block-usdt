@@ -39,19 +39,13 @@ const authLimit     = rateLimit(20,  60_000);   // 20/min per IP
 const depositLimit  = rateLimit(30,  60_000);   // 30/min
 
 // ══════════════════════════════════════════
-// AUTO DEPOSIT SCANNER CONFIG
+// DEPOSIT CONFIG
 // ══════════════════════════════════════════
-const BSC_RPC_URL         = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org/';
 const DEPOSIT_WALLET      = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148').toLowerCase();
 const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF775485246999027B3197955').toLowerCase();
 const BEP20_WALLET        = DEPOSIT_WALLET;
 const BEP20_USDT_CONTRACT = USDT_CONTRACT;
 const WITHDRAWAL_WALLET   = (process.env.WITHDRAWAL_WALLET || '').toLowerCase();
-// BscScan free API key (optional but recommended — raises rate limit 1/5s → 5/s)
-// Get free at: https://bscscan.com/myapikey
-const BSCSCAN_API_KEY     = process.env.BSCSCAN_API_KEY || '';
-
-// ── BSC scanner state (in-memory + DB-backed) ────────────────────────────────
 
 // Simple HTTPS GET helper
 function httpsGet(url, headers) {
@@ -2617,266 +2611,63 @@ async function creditAutoDeposit(dep, txHash) {
 
 // ══════════════════════════════════════════
 // BEP20 AUTO DEPOSIT SCANNER
-// Primary:  BscScan API (reliable, no eth_getLogs needed)
-// Fallback: eth_getLogs via BSC_RPC_URL env (optional)
+// Polls Moralis every 10s for incoming USDT
+// transfers to the platform deposit wallet,
+// matches by unique amount, credits balance.
 // ══════════════════════════════════════════
 
-const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+let _scanRunning = false;
 
-function addrToTopic(addr) {
-  return '0x' + addr.replace(/^0x/i, '').toLowerCase().padStart(64, '0');
-}
-
-// ── Scanner state ─────────────────────────────────────────────────────────────
-let _scanRunning      = false;
-let _lastSeenTxHash   = '';   // BscScan: last processed tx hash
-let _nextScanAllowed  = 0;    // BscScan: rate limit timestamp
-let _lastScannedBlock = 0;    // RPC fallback: last block
-
-async function loadScanState() {
-  try {
-    const rows = await db.all(`SELECT key,value FROM settings WHERE key IN ('rpc_last_tx','rpc_last_block')`);
-    for (const r of rows) {
-      if (r.key === 'rpc_last_tx')    _lastSeenTxHash   = r.value || '';
-      if (r.key === 'rpc_last_block') _lastScannedBlock = parseInt(r.value) || 0;
-    }
-  } catch(e) {}
-}
-
-async function saveTxHash(hash) {
-  if (!hash) return;
-  try { await db.run(`INSERT INTO settings(key,value) VALUES('rpc_last_tx',$1) ON CONFLICT(key) DO UPDATE SET value=$1`, [hash]); } catch(e) {}
-  _lastSeenTxHash = hash;
-}
-
-async function saveBlock(num) {
-  if (!num) return;
-  try { await db.run(`INSERT INTO settings(key,value) VALUES('rpc_last_block',$1) ON CONFLICT(key) DO UPDATE SET value=$1`, [String(num)]); } catch(e) {}
-  _lastScannedBlock = num;
-}
-
-// ── BscScan API ───────────────────────────────────────────────────────────────
-async function bscScanFetch() {
-  const key = process.env.BSCSCAN_API_KEY || '';
-  const url = `https://api.bscscan.com/api?module=account&action=tokentx` +
-    `&contractaddress=${USDT_CONTRACT}&address=${DEPOSIT_WALLET}` +
-    `&sort=desc&page=1&offset=25` + (key ? `&apikey=${key}` : '');
-  return new Promise((resolve) => {
-    const u = new URL(url);
-    const req = require('https').request({
-      hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
-      headers: { 'User-Agent': 'BlockUSDT/1.0', 'Accept': 'application/json' },
-    }, (res) => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve(null); } });
-    });
-    req.on('error', () => resolve(null));
-    req.setTimeout(12000, () => { req.destroy(); resolve(null); });
-    req.end();
-  });
-}
-
-// ── RPC call (only if BSC_RPC_URL set in ENV) ─────────────────────────────────
-async function rpcPost(rpcUrl, method, params) {
-  return new Promise((resolve) => {
-    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
-    const u    = new URL(rpcUrl);
-    const isHttps = u.protocol === 'https:';
-    const req = require(isHttps ? 'https' : 'http').request({
-      hostname: u.hostname,
-      port:     u.port ? parseInt(u.port) : (isHttps ? 443 : 80),
-      path:     u.pathname + u.search, method: 'POST',
-      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'User-Agent': 'BlockUSDT/1.0' },
-    }, (res) => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({ error: { message: 'parse error' } }); } });
-    });
-    req.on('error', e => resolve({ error: { message: e.message } }));
-    req.setTimeout(12000, () => { req.destroy(); resolve({ error: { message: 'timeout' } }); });
-    req.write(body); req.end();
-  });
-}
-
-// ── Match and credit a transfer ───────────────────────────────────────────────
-async function matchTransfer(txHash, txAmt, pending) {
-  const already = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [txHash]);
-  if (already) return;
-  log('RPC', `Deposit found tx: ${txHash.slice(0,18)}... amt=${txAmt}`);
-  for (const dep of pending) {
-    if (dep._matched) continue;
-    if (Math.abs(txAmt - dep.unique_amt) > 0.02) continue;
-    if (new Date() > new Date(dep.expires_at)) {
-      await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-      log('RPC', `Deposit expired dep=${dep.id} user=${dep.user_id}`);
-      dep._matched = true;
-      return;
-    }
-    log('RPC', `User matched: dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
-    await creditAutoDeposit(dep, txHash);
-    log('RPC', `Credited successfully: user=${dep.user_id} amount=${dep.amount}`);
-    dep._matched = true;
-    return;
-  }
-}
-
-// ── Main scanner ──────────────────────────────────────────────────────────────
 async function scanBEP20() {
   if (_scanRunning) return;
   _scanRunning = true;
+
   try {
+    const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
+    if (!MORALIS_KEY) return;
+
+    // Skip if no pending deposits
     const pending = await db.all(
-      `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
+      `SELECT * FROM auto_deposits
+       WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
     if (!pending.length) return;
 
-    // ── Strategy 1: BscScan API ───────────────────────────────────────────────
-    const hasKey  = !!process.env.BSCSCAN_API_KEY;
-    const minWait = hasKey ? 1000 : 6000; // 1s with key, 6s without
-    if (Date.now() >= _nextScanAllowed) {
-      _nextScanAllowed = Date.now() + minWait;
-      const data = await bscScanFetch();
-
-      if (data && data.status === '1' && Array.isArray(data.result) && data.result.length) {
-        const txList = data.result;
-        log('RPC', `Latest block: ${txList[0].blockNumber} | BscScan: ${txList.length} transfers`);
-        const thirtyMinsAgo = Math.floor(Date.now() / 1000) - 1800;
-        for (const tx of txList) {
-          if (tx.hash === _lastSeenTxHash) break;
-          if (!_lastSeenTxHash && parseInt(tx.timeStamp || 0) < thirtyMinsAgo) break;
-          if (!tx.to || tx.to.toLowerCase() !== DEPOSIT_WALLET) continue;
-          if (!tx.contractAddress || tx.contractAddress.toLowerCase() !== USDT_CONTRACT) continue;
-          const txAmt = parseFloat(tx.value) / Math.pow(10, parseInt(tx.tokenDecimal) || 18);
-          if (isNaN(txAmt) || txAmt <= 0) continue;
-          await matchTransfer(tx.hash, txAmt, pending);
-        }
-        await saveTxHash(txList[0].hash);
-        return; // BscScan success — skip RPC fallback
-      }
-
-      if (data && data.status === '0') {
-        const msg = (data.message || '').trim();
-        if (msg === 'No transactions found') return;
-        if (msg !== 'NOTOK') log('RPC', `BscScan: ${msg}`);
-        // rate limited or error — fall through to RPC
-      }
-      // data === null (network error) — fall through to RPC
-    }
-
-    // ── Strategy 2: eth_getLogs via BSC_RPC_URL (fallback) ───────────────────
-    const rpcUrl = process.env.BSC_RPC_URL || '';
-    if (!rpcUrl || rpcUrl.includes('bsc-dataseed.binance.org')) return;
-
-    const blkResp = await rpcPost(rpcUrl, 'eth_blockNumber', []);
-    if (blkResp.error || !blkResp.result) return;
-    const latestBlock = parseInt(blkResp.result, 16);
-
-    const fromBlock = Math.max(1, _lastScannedBlock > 0 ? _lastScannedBlock + 1 : latestBlock - 40);
-    const toBlock   = Math.min(latestBlock, fromBlock + 99);
-    if (fromBlock > toBlock) { await saveBlock(latestBlock); return; }
-
-    log('RPC', `RPC fallback: ${fromBlock}→${toBlock}`);
-    const logsResp = await rpcPost(rpcUrl, 'eth_getLogs', [{
-      fromBlock: '0x' + fromBlock.toString(16),
-      toBlock:   '0x' + toBlock.toString(16),
-      address:   USDT_CONTRACT,
-      topics:    [TRANSFER_TOPIC, null, addrToTopic(DEPOSIT_WALLET)],
-    }]);
-
-    if (logsResp.error) { log('RPC', 'eth_getLogs: ' + logsResp.error.message); return; }
-
-    for (const rawLog of (logsResp.result || [])) {
-      if (!rawLog.topics || rawLog.topics.length < 3 || !rawLog.transactionHash) continue;
-      if (('0x' + rawLog.topics[2].slice(-40).toLowerCase()) !== DEPOSIT_WALLET) continue;
-      const rawData = rawLog.data || '0x0';
-      let txAmt;
-      try { txAmt = Number(BigInt(rawData === '0x' ? '0x0' : rawData)) / 1e18; } catch(e) { continue; }
-      if (isNaN(txAmt) || txAmt <= 0) continue;
-      await matchTransfer(rawLog.transactionHash, txAmt, pending);
-    }
-    await saveBlock(toBlock);
-
-  } catch(e) {
-    log('RPC', 'Scanner error: ' + e.message);
-  } finally {
-    _scanRunning = false;
-  }
-}
-
-// ══════════════════════════════════════════
-// START SCANNERS
-// ══════════════════════════════════════════
-// ══════════════════════════════════════════
-// WITHDRAWAL TX AUTO-DETECTOR (Moralis)
-// ══════════════════════════════════════════
-// Scans WITHDRAWAL_WALLET outgoing USDT transfers on BSC
-// Matches against approved withdrawals that have no tx_hash yet
-// On match → saves tx_hash → fires Telegram proof
-// ══════════════════════════════════════════
-
-async function scanWithdrawalTx() {
-  // Withdrawal TX auto-detection requires Moralis (optional feature)
-  // If MORALIS_KEY not set, fallback proof sender handles notification without tx hash
-  const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
-  try {
-    if (!MORALIS_KEY) return;
-
-    // Get all approved withdrawals with no tx_hash, approved in last 24h
-    const pending = await db.all(`
-      SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
-             u.username, u.first_name
-      FROM transactions t
-      LEFT JOIN users u ON u.id = t.user_id
-      WHERE t.type    = 'withdraw'
-        AND t.status  = 'approved'
-        AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
-        AND t.approved_at IS NOT NULL
-        AND t.approved_at >= NOW() - INTERVAL '2 hours'
-    `);
-
-    if (!pending.length) return; // nothing to match — skip Moralis call entirely
-
-    // Use WITHDRAWAL_WALLET if set and different from DEPOSIT_WALLET,
-    // otherwise reuse DEPOSIT_WALLET (same wallet handles both deposit & withdrawal)
-    const scanWallet = (WITHDRAWAL_WALLET && WITHDRAWAL_WALLET !== DEPOSIT_WALLET)
-      ? WITHDRAWAL_WALLET
-      : DEPOSIT_WALLET;
-
-    // ✅ FIX: removed contract_addresses[] filter — Starter plan blocks this param on BSC
-    const url  = `https://deep-index.moralis.io/api/v2.2/${scanWallet}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
+    // Fetch latest 50 BEP20 transfers to deposit wallet
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
-    if (!data || !data.result || !Array.isArray(data.result)) {
-      const errMsg = data && data.message ? data.message : 'no result';
-      if (errMsg !== 'Something went wrong') {
-        log('WITH_SCAN', `Moralis error: ${errMsg}`);
-      }
+    if (!data || !Array.isArray(data.result)) {
+      if (data && data.message) log('SCANNER', `Moralis error: ${data.message}`);
       return;
     }
 
-    // Filter server-side: only USDT contract, outgoing from scanWallet
-    const outgoing = data.result.filter(tx =>
-      tx.token_address && tx.token_address.toLowerCase() === USDT_CONTRACT &&
-      tx.from_address  && tx.from_address.toLowerCase()  === scanWallet
+    // Keep only incoming USDT transfers
+    const transfers = data.result.filter(tx =>
+      tx.to_address && tx.to_address.toLowerCase() === DEPOSIT_WALLET &&
+      tx.token_address && tx.token_address.toLowerCase() === USDT_CONTRACT
     );
 
-    if (!outgoing.length) return;
+    if (transfers.length) {
+      log('SCANNER', `Block: ${transfers[0].block_number} | ${transfers.length} incoming USDT transfer(s)`);
+    }
 
-    log('WITH_SCAN', `Moralis: ${outgoing.length} outgoing txs | unmatched approvals: ${pending.length}`);
+    // Track which tx hashes we process this cycle to avoid double-credit
+    const processedHashes = new Set();
 
-    for (const wd of pending) {
-      const approvedAt = new Date(wd.approved_at).getTime();
-      const toAddr     = (wd.address || '').toLowerCase().trim();
+    for (const dep of pending) {
+      if (dep._matched) continue;
 
-      for (const tx of outgoing) {
-        // Must go TO user's registered withdraw address
-        if (!tx.to_address || tx.to_address.toLowerCase() !== toAddr) continue;
-        // Must happen AFTER or within 10 min before approval (clock skew buffer)
-        const txTime = new Date(tx.block_timestamp).getTime();
-        if (txTime < approvedAt - 600000) continue;
+      // Only look at transfers that happened after this deposit was created (2 min buffer)
+      const depCreatedMs = new Date(dep.created_at).getTime() - 120000;
 
-        // ✅ FIX: value_decimal null/undefined guard — same fix as scanBEP20
+      for (const tx of transfers) {
+        // Guard: skip if no valid tx hash (Moralis can return null for pending txs)
+        if (!tx.transaction_hash || typeof tx.transaction_hash !== 'string') continue;
+        if (processedHashes.has(tx.transaction_hash)) continue;
+        if (new Date(tx.block_timestamp).getTime() < depCreatedMs) continue;
+
+        // Parse transfer amount (value_decimal preferred, fallback to raw/1e18)
         let txAmt;
         if (tx.value_decimal != null && tx.value_decimal !== '') {
           txAmt = parseFloat(tx.value_decimal);
@@ -2885,96 +2676,60 @@ async function scanWithdrawalTx() {
         } else {
           continue;
         }
-        if (isNaN(txAmt)) continue;
+        if (isNaN(txAmt) || txAmt <= 0) continue;
 
-        const wdAmt  = parseFloat(wd.amount);
-        if (Math.abs(txAmt - wdAmt) > 1.0) continue;
+        // Amount must match within ±$0.02 tolerance
+        if (Math.abs(txAmt - dep.unique_amt) > 0.02) continue;
 
-        // ✅ MATCH FOUND
-        const txHash = tx.transaction_hash;
-        log('WITH_SCAN', `✅ Matched wd=${wd.id} user=${wd.user_id} amt=${wdAmt} tx=${txHash.slice(0,16)}`);
+        log('SCANNER', `Deposit found tx: ${tx.transaction_hash.slice(0, 18)}... amt=${txAmt}`);
 
-        // Save tx_hash to DB
-        await db.run(
-          `UPDATE transactions SET bsc_tx_hash=$1 WHERE id=$2 AND (bsc_tx_hash IS NULL OR bsc_tx_hash='')`,
-          [txHash, wd.id]
-        );
+        // Check expiry before crediting
+        if (new Date() > new Date(dep.expires_at)) {
+          await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
+          log('SCANNER', `Deposit expired: dep=${dep.id} user=${dep.user_id}`);
+          dep._matched = true;
+          break;
+        }
 
-        // Fire Telegram proof with tx_hash
-        setImmediate(() => sendWithdrawProof({
-          withdraw_id: wd.id,
-          username:    wd.username   || '',
-          first_name:  wd.first_name || '',
-          user_id:     wd.user_id,
-          amount:      wd.amount,
-          address:     wd.address    || '',
-          bsc_tx_hash: txHash
-        }));
+        // Credit the deposit
+        log('SCANNER', `User matched: dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+        await creditAutoDeposit(dep, tx.transaction_hash);
+        log('SCANNER', `Credited: user=${dep.user_id} amount=$${dep.amount}`);
 
-        break; // stop checking txs for this withdrawal
+        dep._matched = true;
+        processedHashes.add(tx.transaction_hash);
+        break;
       }
     }
-  } catch(e) {
-    log('WITH_SCAN', 'Scanner error: ' + e.message);
-  }
-}
 
-// Fallback: if approved withdrawal still has no tx_hash after 30 min,
-// post Telegram proof WITHOUT tx_hash so group always gets notified
-async function scanWithdrawalFallback() {
-  try {
-    const stale = await db.all(`
-      SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
-             u.username, u.first_name
-      FROM transactions t
-      LEFT JOIN users u ON u.id = t.user_id
-      WHERE t.type    = 'withdraw'
-        AND t.status  = 'approved'
-        AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
-        AND t.approved_at IS NOT NULL
-        AND t.approved_at >= NOW() - INTERVAL '2 hours'
-        AND t.approved_at <= NOW() - INTERVAL '5 minutes'
-        AND NOT EXISTS (
-          SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id
-        )
-    `);
-
-    for (const wd of stale) {
-      log('WITH_SCAN', `Fallback proof (no tx_hash) wd=${wd.id} user=${wd.user_id}`);
-      setImmediate(() => sendWithdrawProof({
-        withdraw_id: wd.id,
-        username:    wd.username   || '',
-        first_name:  wd.first_name || '',
-        user_id:     wd.user_id,
-        amount:      wd.amount,
-        address:     wd.address    || '',
-        bsc_tx_hash: ''
-      }));
-    }
   } catch(e) {
-    log('WITH_SCAN', 'Fallback error: ' + e.message);
+    log('SCANNER', `Error: ${e.message}`);
+  } finally {
+    _scanRunning = false;
   }
 }
 
 async function startScanners() {
-  await loadScanState();
+  const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
 
-  const hasKey  = !!process.env.BSCSCAN_API_KEY;
-  const hasRpc  = !!(process.env.BSC_RPC_URL && !process.env.BSC_RPC_URL.includes('bsc-dataseed.binance.org'));
-  const mode    = hasRpc ? 'BscScan + RPC fallback' : 'BscScan only';
-  log('RPC', `Scanner started — mode: ${mode}${hasKey ? ' + API key' : ''}`);
-  if (_lastSeenTxHash)   log('RPC', `Resuming from tx: ${_lastSeenTxHash.slice(0,18)}...`);
-  if (_lastScannedBlock) log('RPC', `Resuming from block: ${_lastScannedBlock}`);
+  if (!MORALIS_KEY) {
+    console.warn('[SCANNER] MORALIS_API_KEY not set — auto deposit scanner disabled');
+  } else {
+    log('SCANNER', 'Auto deposit scanner started (10s interval)');
+    setTimeout(scanBEP20, 5000);
+    setInterval(scanBEP20, 10000);
+  }
 
-  setTimeout(scanBEP20, 5000);
-  setInterval(scanBEP20, 15000);
+  // Withdrawal proof fallback (fires TG proof for approved withdrawals with no tx hash)
+  setTimeout(scanWithdrawalFallback, 3 * 60 * 1000);
+  setInterval(scanWithdrawalFallback, 2 * 60 * 1000);
 
-  setTimeout(scanWithdrawalFallback, 180000);
-  setInterval(scanWithdrawalFallback, 120000);
-
+  // Auto-expire stale pending deposits
   setInterval(async () => {
-    try { await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`); } catch(e) {}
-  }, 60000);
+    try {
+      await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
+    } catch(e) {}
+  }, 60 * 1000);
 }
 
 // ══════════════════════════════════════════
