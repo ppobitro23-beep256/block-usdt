@@ -2617,14 +2617,7 @@ async function scanBEP20() {
     const pending = await db.all(
       `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
-
-    // Also check if any withdrawal needs hash detection
-    const pendingWithdrawals = await db.one(
-      `SELECT COUNT(*) as c FROM transactions WHERE type='withdraw' AND status='approved' AND (bsc_tx_hash IS NULL OR bsc_tx_hash='') AND approved_at IS NOT NULL AND approved_at >= NOW() - INTERVAL '2 hours'`
-    );
-    const hasWithdrawalWork = parseInt(pendingWithdrawals.c) > 0;
-
-    if (!pending.length && !hasWithdrawalWork) return;
+    if (!pending.length) return;
 
     const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
@@ -2670,55 +2663,6 @@ async function scanBEP20() {
       }
     }
 
-    // ── WITHDRAWAL HASH DETECTION (piggyback on same Moralis result) ──
-    // outgoing TX = from_address is DEPOSIT_WALLET
-    const outgoingTxs = txs.filter(tx =>
-      tx.from_address && tx.from_address.toLowerCase() === DEPOSIT_WALLET.toLowerCase()
-    );
-    if (outgoingTxs.length > 0) {
-      // Get pending approved withdrawals with no tx_hash (last 2 hours)
-      const pendingWith = await db.all(`
-        SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
-               u.username, u.first_name
-        FROM transactions t
-        LEFT JOIN users u ON u.id = t.user_id
-        WHERE t.type   = 'withdraw'
-          AND t.status = 'approved'
-          AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
-          AND t.approved_at IS NOT NULL
-          AND t.approved_at >= NOW() - INTERVAL '2 hours'
-      `);
-      for (const wd of pendingWith) {
-        const toAddr    = (wd.address || '').toLowerCase().trim();
-        const approvedAt = new Date(wd.approved_at).getTime();
-        for (const tx of outgoingTxs) {
-          if (!tx.to_address || tx.to_address.toLowerCase() !== toAddr) continue;
-          const txTime = new Date(tx.block_timestamp).getTime();
-          if (txTime < approvedAt - 600000) continue;
-          const txAmt = parseFloat(tx.value_decimal || 0);
-          const wdAmt = parseFloat(wd.amount);
-          if (Math.abs(txAmt - wdAmt) > 1.0) continue;
-          // ✅ MATCH
-          const txHash = tx.transaction_hash;
-          log('WITH_SCAN', `✅ Hash matched wd=${wd.id} amt=${wdAmt} tx=${txHash.slice(0,16)}`);
-          await db.run(
-            `UPDATE transactions SET bsc_tx_hash=$1 WHERE id=$2 AND (bsc_tx_hash IS NULL OR bsc_tx_hash='')`,
-            [txHash, wd.id]
-          );
-          setImmediate(() => sendWithdrawProof({
-            withdraw_id: wd.id,
-            username:    wd.username   || '',
-            first_name:  wd.first_name || '',
-            user_id:     wd.user_id,
-            amount:      wd.amount,
-            address:     wd.address    || '',
-            bsc_tx_hash: txHash
-          }));
-          break;
-        }
-      }
-    }
-
   } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
 }
 
@@ -2758,6 +2702,7 @@ async function scanWithdrawalTx() {
       ? WITHDRAWAL_WALLET
       : DEPOSIT_WALLET;
 
+    // Use token contract transfers endpoint with from_address filter
     const url  = `https://deep-index.moralis.io/api/v2.2/erc20/${USDT_CONTRACT}/transfers?chain=bsc&from_address=${scanWallet}&limit=25&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
@@ -2868,9 +2813,9 @@ function startScanners() {
   // Withdrawal TX auto-detector — runs every 30s (no rush, Moralis rate limit friendly)
   if (MORALIS_KEY) {
     const scanWalletLabel = WITHDRAWAL_WALLET || DEPOSIT_WALLET;
-    console.log('🔍 Withdrawal TX scanner started (30s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
-    setTimeout(scanWithdrawalTx, 15000); // first run after 15s
-    setInterval(scanWithdrawalTx, 30000);
+    console.log('🔍 Withdrawal TX scanner started (10s interval) wallet=' + scanWalletLabel.slice(0,10) + '...');
+    setTimeout(scanWithdrawalTx, 8000);
+    setInterval(scanWithdrawalTx, 10000);
     // Fallback proof sender — first run after 3 min (startup migration needs time), then every 2 min
     setTimeout(scanWithdrawalFallback, 180000);
     setInterval(scanWithdrawalFallback, 120000);
