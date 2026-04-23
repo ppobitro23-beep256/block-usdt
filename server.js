@@ -2401,7 +2401,7 @@ async function scanBEP20() {
       return;
     }
 
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses=${USDT_CONTRACT}&limit=20&order=DESC`;
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses=${USDT_CONTRACT}&limit=100&order=DESC`;
     const data = await httpsGet(url, {
       'X-API-Key': MORALIS_KEY,
       'accept': 'application/json',
@@ -2425,10 +2425,29 @@ async function scanBEP20() {
         if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
         if (new Date(tx.block_timestamp).getTime() < depTs) continue;
 
-        const txAmt = parseFloat(tx.value_decimal);
-        if (!Number.isFinite(txAmt)) continue;
+        // ── FIX: Moralis returns raw integer `value` + `token_decimals`, NOT `value_decimal` ──
+        // Use BigInt math to avoid floating-point precision loss on large integers
+        let txAmt;
+        try {
+          const rawValue    = tx.value || tx.value_decimal || '0';
+          const decimals    = parseInt(tx.token_decimals !== undefined ? tx.token_decimals : 18);
+          if (typeof rawValue === 'string' && /^\d+$/.test(rawValue)) {
+            // Raw integer string from Moralis (e.g. "10000000000000000000")
+            const factor = BigInt(10) ** BigInt(decimals);
+            const intPart = BigInt(rawValue) / factor;
+            const fracRaw = BigInt(rawValue) % factor;
+            txAmt = Number(intPart) + Number(fracRaw) / (10 ** decimals);
+          } else {
+            // Fallback: already a decimal string or number
+            txAmt = parseFloat(rawValue);
+          }
+        } catch(_) {
+          txAmt = NaN;
+        }
+        if (!Number.isFinite(txAmt) || txAmt <= 0) continue;
+
         const diff  = Math.abs(txAmt - dep.unique_amt);
-        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
+        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} from=${(tx.from_address||'?').slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff.toFixed(4)}`);
 
         if (diff <= 0.01) {
           // [STRICT] Double-check expiry before crediting
@@ -2438,7 +2457,7 @@ async function scanBEP20() {
             matched = true; // stop searching for this dep
             break;
           }
-          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt} tx=${tx.transaction_hash.slice(0,16)}`);
           await creditAutoDeposit(dep, tx.transaction_hash);
           matched = true;
           break;
