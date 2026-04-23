@@ -2420,6 +2420,20 @@ async function scanBEP20() {
       return;
     }
 
+    // ── Diagnostic: show partial key so user can verify it's correct ──
+    console.log(`[BEP20] API key: "${MORALIS_KEY.slice(0,12)}..." len=${MORALIS_KEY.length}`);
+
+    // ── Quick ping: test if key is valid at all ──
+    const pingData = await httpsGet(
+      `https://deep-index.moralis.io/api/v2.2/discovery/block?chain=0x38&block_number_or_hash=1`,
+      { 'X-API-Key': MORALIS_KEY, 'accept': 'application/json' }
+    );
+    if (pingData._http_status === 401) {
+      console.log('[BEP20] ❌ MORALIS KEY INVALID — 401 Unauthorized. Go to admin.moralis.io and copy the Web3 API key.');
+      return;
+    }
+    console.log(`[BEP20] Ping HTTP=${pingData._http_status} (401=bad key, 200/400/404=key OK)`);
+
     // ── Fetch via Moralis: try v2.2 first, fallback to v2 ──
     // chain=0x38 = BSC mainnet (more explicit than 'bsc')
     // No order/contract_addresses params — they cause 500 on some plans
