@@ -2639,12 +2639,10 @@ async function scanBEP20() {
 
     if (!data || !Array.isArray(data.result)) {
       const msg = data && data.message ? data.message : 'no response';
-      // Log everything except known transient errors
+      // 'Something went wrong' = wallet has no BSC ERC20 history yet, or transient error
+      // Both cases: silent retry next cycle
       if (msg !== 'Something went wrong') {
         log('SCANNER', `Moralis error: ${msg}`);
-      } else {
-        // Log full response once so we can diagnose
-        log('SCANNER', `Moralis transient error — response: ${JSON.stringify(data).slice(0, 200)}`);
       }
       return;
     }
