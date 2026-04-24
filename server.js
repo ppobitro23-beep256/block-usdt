@@ -668,6 +668,23 @@ async function setupDB() {
   `);
   await db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS bsc_tx_hash TEXT DEFAULT NULL`);
 
+  // Moralis webhook detailed log table
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS webhook_logs (
+      id         SERIAL PRIMARY KEY,
+      event      TEXT NOT NULL,
+      tx_hash    TEXT,
+      dep_id     INTEGER,
+      user_id    BIGINT,
+      status     TEXT,
+      detail     TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_webhook_logs_tx   ON webhook_logs (tx_hash)`);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_webhook_logs_user ON webhook_logs (user_id)`);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_webhook_logs_time ON webhook_logs (created_at DESC)`);
+
   // Mark all pre-existing approved withdrawals as 'skipped' in proof logs
   // so fallback scanner never re-posts old withdrawals after deploy
   await db.run(`
@@ -2619,98 +2636,262 @@ async function creditAutoDeposit(dep, txHash) {
 // BEP20 AUTO DEPOSIT — Moralis Streams
 // Webhook-based, real-time, no polling needed
 // Moralis calls POST /webhook/moralis-deposit
-// whenever USDT arrives at deposit wallet
 // ══════════════════════════════════════════
 
-// BUG FIX 1: Moralis signature needs raw body string, not parsed object
-// Must use express.raw() for this route — done below
+// ── [1] SIGNATURE VERIFICATION ─────────────────────────────────────────────
+// Moralis signs each webhook with HMAC-SHA3-256 using the stream secret.
+// Must compute over raw body buffer (before JSON.parse).
 function verifyMoralisWebhook(rawBody, signature) {
   const secret = process.env.MORALIS_STREAM_SECRET || '';
-  if (!secret) return true;
-  if (!signature) return false;
-  const crypto = require('crypto');
-  const hash   = crypto.createHmac('sha3-256', secret).update(rawBody).digest('hex');
-  return hash === signature;
+  if (!secret) {
+    log('WEBHOOK', '⚠️ MORALIS_STREAM_SECRET not set — skipping sig verification');
+    return true; // allow in dev, warn in logs
+  }
+  if (!signature) {
+    log('WEBHOOK', '❌ No x-signature header received');
+    return false;
+  }
+  const hash = crypto.createHmac('sha3-256', secret).update(rawBody).digest('hex');
+  const valid = hash === signature;
+  if (!valid) log('WEBHOOK', `❌ Signature mismatch | received=${signature.slice(0,16)}... computed=${hash.slice(0,16)}...`);
+  return valid;
 }
 
+// ── [2] WEBHOOK LOG TABLE (insert into DB for admin visibility) ─────────────
+async function logWebhookEvent(event, txHash, depId, userId, status, detail) {
+  try {
+    await db.run(
+      `INSERT INTO webhook_logs (event, tx_hash, dep_id, user_id, status, detail)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [event, txHash || null, depId || null, userId || null, status, detail || null]
+    );
+  } catch(e) {
+    log('WEBHOOK', `logWebhookEvent DB error: ${e.message}`);
+  }
+}
+
+// ── [3] ADMIN FAILURE ALERT ─────────────────────────────────────────────────
+// Sends Telegram DM to admin on critical webhook failures.
+// ADMIN_TG_CHAT_ID env var = admin's personal Telegram user ID
+const _adminAlertCooldown = new Map(); // avoid spam — 1 alert per error-type per 10min
+
+async function notifyAdminWebhookFailure(reason, detail) {
+  try {
+    const adminChatId = process.env.ADMIN_TG_CHAT_ID || '';
+    if (!adminChatId || !BOT_TOKEN) return; // silently skip if not configured
+
+    // Cooldown: same reason → max 1 alert per 10 min
+    const cooldownKey = reason;
+    const lastSent = _adminAlertCooldown.get(cooldownKey) || 0;
+    if (Date.now() - lastSent < 10 * 60 * 1000) return;
+    _adminAlertCooldown.set(cooldownKey, Date.now());
+
+    const now = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka', hour12: false });
+    const msg =
+      `🚨 <b>Webhook Alert</b>\n` +
+      `⚠️ Reason: <b>${tgEscape(reason)}</b>\n` +
+      `📋 Detail: <code>${tgEscape((detail || '').substring(0, 300))}</code>\n` +
+      `⏰ Time: ${now}`;
+
+    await tgBotApi('sendMessage', { chat_id: adminChatId, text: msg, parse_mode: 'HTML' });
+    log('WEBHOOK', `Admin alerted: ${reason}`);
+  } catch(e) {
+    log('WEBHOOK', `notifyAdminWebhookFailure error: ${e.message}`);
+  }
+}
+
+// ── [4] RETRY-SAFE CREDIT WRAPPER ───────────────────────────────────────────
+// Wraps creditAutoDeposit with idempotency:
+// - Checks tx_hash uniqueness in webhook_logs BEFORE touching auto_deposits
+// - Handles DB unique constraint gracefully
+// - Logs every outcome to webhook_logs
+async function safeCredit(dep, txHash, source) {
+  const tag = `[${source}] dep=${dep.id} user=${dep.user_id} tx=${txHash.slice(0,16)}...`;
+
+  // [FAST DUPLICATE CHECK] — check tx_hash across both tables before any write
+  const txExists = await db.one(
+    `SELECT id FROM auto_deposits WHERE tx_hash=$1`, [txHash]
+  );
+  if (txExists) {
+    log('WEBHOOK', `${tag} → DUPLICATE (already in auto_deposits)`);
+    await logWebhookEvent('duplicate', txHash, dep.id, dep.user_id, 'skipped', 'tx_hash already exists');
+    return 'duplicate';
+  }
+
+  // [IDEMPOTENT UPDATE] — atomic status flip, rowCount=0 means already done
+  let credited = false;
+  try {
+    const result = await pool.query(
+      `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
+      [txHash, dep.id]
+    );
+    if (result.rowCount === 0) {
+      log('WEBHOOK', `${tag} → RACE SKIP (status already changed)`);
+      await logWebhookEvent('race_skip', txHash, dep.id, dep.user_id, 'skipped', 'rowCount=0');
+      return 'race_skip';
+    }
+    credited = true;
+  } catch(e) {
+    // Unique constraint = already credited via parallel request
+    if (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash')) {
+      log('WEBHOOK', `${tag} → SAFE DUPLICATE (unique constraint)`);
+      await logWebhookEvent('duplicate', txHash, dep.id, dep.user_id, 'skipped', e.message.substring(0, 200));
+      return 'duplicate';
+    }
+    log('WEBHOOK', `${tag} → DB ERROR: ${e.message}`);
+    await logWebhookEvent('error', txHash, dep.id, dep.user_id, 'error', e.message.substring(0, 300));
+    await notifyAdminWebhookFailure('DB error in safeCredit', `${tag} — ${e.message}`);
+    return 'error';
+  }
+
+  if (!credited) return 'skip';
+
+  // [FAST BALANCE CREDIT] — runs immediately after atomic row lock
+  try {
+    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]);
+    await db.run(
+      `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [dep.user_id, 'deposit', dep.amount, 'BEP20', txHash, 'approved', `Auto-detected [${source}]`]
+    );
+    // Mark first_deposit task (no reward — keeps original behavior)
+    await db.run(
+      `INSERT INTO tasks (user_id,task_key,completed,completed_at)
+       VALUES ($1,'first_deposit',1,NOW()) ON CONFLICT DO NOTHING`,
+      [dep.user_id]
+    );
+    log('WEBHOOK', `${tag} → ✅ CREDITED $${dep.amount} USDT`);
+    await logWebhookEvent('credited', txHash, dep.id, dep.user_id, 'success',
+      `amount=${dep.amount} source=${source}`);
+    return 'credited';
+  } catch(e) {
+    // CRITICAL: auto_deposits row already set to 'completed' above.
+    // If balance/transaction insert fails here, user may be under-credited.
+    // Log with full detail so admin can manually recover.
+    const recoveryInfo = `MANUAL_RECOVERY_NEEDED: user=${dep.user_id} amount=${dep.amount} tx=${txHash} dep_id=${dep.id} — ${e.message}`;
+    log('WEBHOOK', `${tag} → 🚨 POST-CREDIT ERROR: ${recoveryInfo}`);
+    await logWebhookEvent('error', txHash, dep.id, dep.user_id, 'error',
+      `post-credit: ${e.message.substring(0,300)}`);
+    await notifyAdminWebhookFailure('🚨 MANUAL RECOVERY NEEDED — Post-credit DB error', recoveryInfo);
+    return 'error';
+  }
+}
+
+// ── [5] MAIN WEBHOOK ENDPOINT ───────────────────────────────────────────────
 app.post('/webhook/moralis-deposit',
   express.raw({ type: 'application/json' }),
   async (req, res) => {
-    // Always respond 200 fast — Moralis retries on non-200
+    // Always ACK 200 immediately — Moralis retries on non-200 (retry-safe design)
     res.status(200).json({ ok: true });
 
+    const webhookStart = Date.now();
+
     try {
-      // req.body is a Buffer from express.raw()
+      // Parse raw body (express.raw gives a Buffer)
       const rawBody   = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body);
-      const body      = JSON.parse(rawBody);
       const signature = req.headers['x-signature'] || '';
 
+      // ── [A] Signature check ─────────────────────────────────────────────
       if (!verifyMoralisWebhook(rawBody, signature)) {
-        log('SCANNER', 'Webhook signature invalid — ignored');
+        log('WEBHOOK', '❌ Rejected — invalid signature');
+        await logWebhookEvent('rejected', null, null, null, 'sig_fail', `sig=${signature.slice(0,20)}`);
+        await notifyAdminWebhookFailure('Invalid webhook signature', `sig=${signature.slice(0,20)}`);
         return;
       }
 
-      // BUG FIX 2: Moralis test webhook has block.number = "0" — ignore it
-      if (!body.block || body.block.number === '0') return;
+      const body = JSON.parse(rawBody);
 
-      // Only process confirmed blocks
-      if (!body.confirmed) return;
+      // ── [B] Skip test/unconfirmed webhooks ──────────────────────────────
+      if (!body.block || body.block.number === '0') {
+        log('WEBHOOK', 'ℹ️ Test webhook (block=0) — ignored');
+        return;
+      }
+      if (!body.confirmed) {
+        log('WEBHOOK', `ℹ️ Unconfirmed block ${body.block.number} — ignored`);
+        return;
+      }
 
       const transfers = body.erc20Transfers || [];
-      if (!transfers.length) return;
+      if (!transfers.length) {
+        log('WEBHOOK', `ℹ️ Block ${body.block.number} — no ERC20 transfers`);
+        return;
+      }
 
-      log('SCANNER', `Webhook: ${transfers.length} ERC20 transfer(s) | block=${body.block.number}`);
+      log('WEBHOOK', `📥 Block=${body.block.number} | ${transfers.length} transfer(s) | sig=✅`);
+      await logWebhookEvent('received', null, null, null, 'ok',
+        `block=${body.block.number} transfers=${transfers.length}`);
 
+      // ── [C] Filter USDT→wallet transfers ────────────────────────────────
+      const relevant = transfers.filter(tx => {
+        const contract = (tx.tokenAddress || tx.contract || '').toLowerCase();
+        const to       = (tx.to || '').toLowerCase();
+        return contract === USDT_CONTRACT && to === DEPOSIT_WALLET && tx.transactionHash;
+      });
+
+      if (!relevant.length) {
+        log('WEBHOOK', `ℹ️ Block ${body.block.number} — no matching USDT transfers`);
+        return;
+      }
+
+      // ── [D] Load pending deposits once ──────────────────────────────────
       const pending = await db.all(
         `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
       );
-      if (!pending.length) return;
+      if (!pending.length) {
+        log('WEBHOOK', `ℹ️ No pending deposits — ${relevant.length} tx(s) unmatched`);
+        await logWebhookEvent('no_pending', null, null, null, 'skipped',
+          `txs=${relevant.map(t=>t.transactionHash.slice(0,10)).join(',')}`);
+        return;
+      }
 
-      for (const tx of transfers) {
-        // BUG FIX 4: Moralis Streams uses 'tokenAddress' not 'contract'
-        const contractAddr = (tx.tokenAddress || tx.contract || '').toLowerCase();
-        const toAddr       = (tx.to || '').toLowerCase();
+      log('WEBHOOK', `⏳ ${pending.length} pending dep(s) vs ${relevant.length} tx(s)`);
 
-        if (contractAddr !== USDT_CONTRACT) continue;
-        if (toAddr !== DEPOSIT_WALLET) continue;
-        if (!tx.transactionHash) continue;
+      // ── [E] Match & credit ───────────────────────────────────────────────
+      let credited = 0, duplicates = 0, unmatched = 0;
 
-        // Parse amount — Moralis Streams value is in raw units
+      for (const tx of relevant) {
         const decimals = parseInt(tx.tokenDecimals) || 18;
         const txAmt    = parseFloat(tx.value) / Math.pow(10, decimals);
         if (isNaN(txAmt) || txAmt <= 0) continue;
 
-        log('SCANNER', `Deposit found tx: ${tx.transactionHash.slice(0,18)}... amt=${txAmt}`);
+        log('WEBHOOK', `🔍 tx=${tx.transactionHash.slice(0,18)}... amt=${txAmt} USDT`);
 
-        // Duplicate guard
-        const already = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [tx.transactionHash]);
-        if (already) {
-          log('SCANNER', `Duplicate skipped: ${tx.transactionHash.slice(0,18)}...`);
-          continue;
-        }
-
-        // Match against pending deposits
+        let matched = false;
         for (const dep of pending) {
           if (dep._matched) continue;
           if (Math.abs(txAmt - dep.unique_amt) > 0.05) continue;
 
+          matched = true;
+          dep._matched = true;
+
+          // Expired check
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-            log('SCANNER', `Deposit expired: dep=${dep.id} user=${dep.user_id}`);
-            dep._matched = true;
+            log('WEBHOOK', `⏰ Dep ${dep.id} expired — tx unmatched`);
+            await logWebhookEvent('expired', tx.transactionHash, dep.id, dep.user_id, 'expired', null);
             break;
           }
 
-          log('SCANNER', `User matched: dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
-          await creditAutoDeposit(dep, tx.transactionHash);
-          log('SCANNER', `Credited: user=${dep.user_id} amount=$${dep.amount}`);
-          dep._matched = true;
+          const result = await safeCredit(dep, tx.transactionHash, 'webhook');
+          if (result === 'credited') credited++;
+          else if (result === 'duplicate' || result === 'race_skip') duplicates++;
           break;
+        }
+
+        if (!matched) {
+          unmatched++;
+          log('WEBHOOK', `⚠️ No pending dep matched tx=${tx.transactionHash.slice(0,18)}... amt=${txAmt}`);
+          await logWebhookEvent('unmatched', tx.transactionHash, null, null, 'warn', `amt=${txAmt}`);
         }
       }
 
+      const elapsed = Date.now() - webhookStart;
+      log('WEBHOOK', `✅ Done — credited=${credited} dupes=${duplicates} unmatched=${unmatched} ms=${elapsed}`);
+
     } catch(e) {
-      log('SCANNER', `Webhook error: ${e.message}`);
+      log('WEBHOOK', `💥 Fatal error: ${e.message}`);
+      await logWebhookEvent('fatal', null, null, null, 'error', e.message.substring(0, 300));
+      await notifyAdminWebhookFailure('Fatal webhook error', e.message);
     }
   }
 );
@@ -2723,7 +2904,7 @@ async function scanBEP20() {
   _scanRunning = true;
   try {
     const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
-    if (!MORALIS_KEY) return;
+    if (!MORALIS_KEY) { _scanRunning = false; return; }
 
     const pending = await db.all(
       `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
@@ -2769,7 +2950,7 @@ async function scanBEP20() {
         }
 
         log('SCANNER', `[Fallback] Matched dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
-        await creditAutoDeposit(dep, tx.transaction_hash);
+        await safeCredit(dep, tx.transaction_hash, 'fallback');
         dep._matched = true;
         processedHashes.add(tx.transaction_hash);
         break;
@@ -3782,6 +3963,24 @@ app.get('/admin/special/logs', adminAuth, async (req, res) => {
        ORDER BY ol.created_at DESC LIMIT 100`
     );
     res.json({ logs: rows });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ══════════════════════════════════════════
+// WEBHOOK LOGS — Admin visibility
+// GET /admin/webhook-logs?limit=50&status=error
+// ══════════════════════════════════════════
+app.get('/admin/webhook-logs', adminAuth, async (req, res) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit) || 100, 500);
+    const status = req.query.status || null;
+    const rows = status
+      ? await db.all(
+          `SELECT * FROM webhook_logs WHERE status=$1 ORDER BY created_at DESC LIMIT $2`,
+          [status, limit])
+      : await db.all(
+          `SELECT * FROM webhook_logs ORDER BY created_at DESC LIMIT $1`, [limit]);
+    res.json({ logs: rows, total: rows.length });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
