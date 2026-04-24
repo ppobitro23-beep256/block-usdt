@@ -2820,17 +2820,9 @@ async function scanWithdrawalFallback() {
 
 
 async function startScanners() {
-  const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
+  log('SCANNER', 'Auto deposit scanner ready (Moralis Streams webhook active)');
 
-  if (!MORALIS_KEY) {
-    console.warn('[SCANNER] MORALIS_API_KEY not set — auto deposit scanner disabled');
-  } else {
-    log('SCANNER', 'Auto deposit scanner started (30s interval)');
-    setTimeout(scanBEP20, 5000);
-    setInterval(scanBEP20, 30000);
-  }
-
-  // Withdrawal proof fallback (fires TG proof for approved withdrawals with no tx hash)
+  // Withdrawal proof fallback
   setTimeout(scanWithdrawalFallback, 3 * 60 * 1000);
   setInterval(scanWithdrawalFallback, 2 * 60 * 1000);
 
