@@ -2634,14 +2634,17 @@ async function scanBEP20() {
     if (!pending.length) return;
 
     // Fetch latest 50 BEP20 transfers to deposit wallet
-    const url  = `https://deep-index.moralis.io/api/v2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data || !Array.isArray(data.result)) {
-      // 'Something went wrong' = transient Moralis server error — silent retry next cycle
-      const msg = data && data.message ? data.message : '';
-      if (msg && msg !== 'Something went wrong') {
+      const msg = data && data.message ? data.message : 'no response';
+      // Log everything except known transient errors
+      if (msg !== 'Something went wrong') {
         log('SCANNER', `Moralis error: ${msg}`);
+      } else {
+        // Log full response once so we can diagnose
+        log('SCANNER', `Moralis transient error — response: ${JSON.stringify(data).slice(0, 200)}`);
       }
       return;
     }
@@ -2756,9 +2759,9 @@ async function startScanners() {
   if (!MORALIS_KEY) {
     console.warn('[SCANNER] MORALIS_API_KEY not set — auto deposit scanner disabled');
   } else {
-    log('SCANNER', 'Auto deposit scanner started (10s interval)');
+    log('SCANNER', 'Auto deposit scanner started (30s interval)');
     setTimeout(scanBEP20, 5000);
-    setInterval(scanBEP20, 10000);
+    setInterval(scanBEP20, 30000);
   }
 
   // Withdrawal proof fallback (fires TG proof for approved withdrawals with no tx hash)
