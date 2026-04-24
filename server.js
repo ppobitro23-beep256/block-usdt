@@ -39,13 +39,13 @@ const authLimit     = rateLimit(20,  60_000);   // 20/min per IP
 const depositLimit  = rateLimit(30,  60_000);   // 30/min
 
 // ══════════════════════════════════════════
-// AUTO DEPOSIT SCANNER CONFIG
+// DEPOSIT CONFIG
 // ══════════════════════════════════════════
-const MORALIS_KEY         = process.env.MORALIS_API_KEY || '';
 const DEPOSIT_WALLET      = (process.env.DEPOSIT_WALLET || '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148').toLowerCase();
 const USDT_CONTRACT       = (process.env.USDT_CONTRACT  || '0x55d398326f99059fF775485246999027B3197955').toLowerCase();
 const BEP20_WALLET        = DEPOSIT_WALLET;
 const BEP20_USDT_CONTRACT = USDT_CONTRACT;
+const WITHDRAWAL_WALLET   = (process.env.WITHDRAWAL_WALLET || '').toLowerCase();
 
 // Simple HTTPS GET helper
 function httpsGet(url, headers) {
@@ -153,6 +153,128 @@ if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.
 if (!ADMIN_SECRET) { console.error('❌ ADMIN_SECRET env var missing'); process.exit(1); }
 if (!BOT_TOKEN)    { console.warn('⚠️ BOT_TOKEN env var missing — Telegram auth verification disabled'); }
 if (!process.env.WEBAPP_URL) { console.warn('⚠️ WEBAPP_URL not set — using default https://myusdtapp.xyz/'); }
+
+// ══════════════════════════════════════════
+// TELEGRAM GROUP PROOF MODULE
+// ══════════════════════════════════════════
+
+// Low-level Telegram Bot API caller (server-side only, token never exposed)
+async function tgBotApi(method, payload) {
+  if (!BOT_TOKEN) return { ok: false, error: 'BOT_TOKEN missing' };
+  return new Promise((resolve) => {
+    const body = JSON.stringify(payload);
+    const options = {
+      hostname: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/${method}`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', d => data += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { resolve({ ok: false, error: 'parse_error' }); }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.setTimeout(10000, () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// Get tg group settings from DB
+async function getTgGroupSettings() {
+  try {
+    const rows = await db.all(`SELECT key, value FROM settings WHERE key IN ('tg_group_chat_id','tg_group_topic_id','tg_group_enabled')`);
+    const s = {};
+    rows.forEach(r => { s[r.key] = r.value; });
+    return {
+      chatId:   s.tg_group_chat_id  || '',
+      topicId:  s.tg_group_topic_id || '',
+      enabled:  s.tg_group_enabled  === '1'
+    };
+  } catch(e) { return { chatId:'', topicId:'', enabled:false }; }
+}
+
+// Send withdrawal proof to Telegram group topic (non-blocking — never fails the main flow)
+// Escape HTML special chars to prevent broken parse_mode=HTML messages
+function tgEscape(str) {
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function sendWithdrawProof(txData) {
+  try {
+    const cfg = await getTgGroupSettings();
+    log('TG_PROOF', `cfg: enabled=${cfg.enabled} chatId=${cfg.chatId} topicId=${cfg.topicId} wd=${txData.withdraw_id}`);
+    if (!cfg.enabled || !cfg.chatId) {
+      log('TG_PROOF', `SKIP: enabled=${cfg.enabled} chatId="${cfg.chatId}"`);
+      return;
+    }
+
+    const { withdraw_id, username, first_name, user_id, amount, address, bsc_tx_hash } = txData;
+
+    // Duplicate guard — if already sent successfully, skip (unless this call has a tx_hash and previous didn't)
+    const existing = await db.all(
+      `SELECT sent_status, error_msg FROM tg_proof_logs WHERE withdraw_id=$1 ORDER BY id DESC LIMIT 1`,
+      [withdraw_id]
+    );
+    if (existing.length > 0 && existing[0].sent_status === 'sent') {
+      // Already sent successfully — only re-send if now we have a tx_hash that wasn't there before
+      if (!bsc_tx_hash || !bsc_tx_hash.trim()) return;
+      // Check if previously sent version had no tx_hash (error_msg stores context)
+      // We allow one re-send with tx_hash for better proof
+      const alreadyHasTx = await db.all(
+        `SELECT id FROM tg_proof_logs WHERE withdraw_id=$1 AND sent_status='sent' AND error_msg LIKE '%has_tx%'`,
+        [withdraw_id]
+      );
+      if (alreadyHasTx.length > 0) return; // already sent with tx_hash
+    }
+    // HTML-escape user-supplied strings to prevent broken Telegram HTML
+    const safeName    = username ? '@' + tgEscape(username) : tgEscape(first_name || 'No Username');
+    const safeAddr    = address ? address.slice(0,8) + '...' + address.slice(-6) : 'N/A';
+    const now         = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka', hour12: false });
+
+    let msg =
+      `💸 <b>Withdrawal Paid</b>\n` +
+      `👤 Username: <b>${safeName}</b>\n` +
+      `🆔 User ID: <code>${user_id}</code>\n` +
+      `💰 Amount: <b>${parseFloat(amount).toFixed(2)} USDT</b>\n` +
+      `🌐 Network: BEP20 (BSC)\n` +
+      `🏦 Wallet: <code>${safeAddr}</code>\n` +
+      `⏰ Time: ${now}`;
+
+    if (bsc_tx_hash && bsc_tx_hash.trim()) {
+      msg += `\n🔗 Verify on BscScan:\nhttps://bscscan.com/tx/${bsc_tx_hash.trim()}`;
+    }
+    msg += `\n\n✅ Successfully Sent`;
+
+    const payload = {
+      chat_id:    cfg.chatId,
+      text:       msg,
+      parse_mode: 'HTML'
+    };
+    // FIX: parseInt('') = NaN — guard with parsedId check before assigning
+    const parsedTopicId = cfg.topicId ? parseInt(cfg.topicId, 10) : NaN;
+    if (!isNaN(parsedTopicId) && parsedTopicId > 0) payload.message_thread_id = parsedTopicId;
+
+    const result = await tgBotApi('sendMessage', payload);
+
+    // Log result to DB — use simple INSERT (no ON CONFLICT needed, each proof gets own row)
+    const status  = result.ok ? 'sent' : 'failed';
+    const errMsg  = result.ok
+      ? (bsc_tx_hash && bsc_tx_hash.trim() ? 'has_tx' : null)
+      : (result.description || result.error || 'unknown');
+    await db.run(
+      `INSERT INTO tg_proof_logs (withdraw_id, sent_status, error_msg) VALUES ($1,$2,$3)`,
+      [withdraw_id, status, errMsg]
+    );
+    if (!result.ok) log('TG_PROOF', `Failed to send proof for tx=${withdraw_id}: ${errMsg}`);
+  } catch(e) {
+    log('TG_PROOF', `sendWithdrawProof error: ${e.message}`);
+  }
+}
 
 // ── CORS — allow Cloudflare Pages frontend + all Telegram origins ──────
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || 'https://block-usdt.pages.dev';
@@ -321,7 +443,7 @@ async function setupDB() {
       status     TEXT DEFAULT 'pending',
       tx_hash    TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
-      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '15 minutes')
+      expires_at TIMESTAMP DEFAULT (NOW() + INTERVAL '30 minutes')
     )
   `);
   await db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_dep_txhash ON auto_deposits (tx_hash) WHERE tx_hash IS NOT NULL`);
@@ -490,6 +612,27 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address_updated_at TIMESTAMP DEFAULT NULL`),
     // Unique index: one address per account (NULL allowed for unbound users)
     db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_withdraw_address ON users (withdraw_address) WHERE withdraw_address IS NOT NULL`),
+    // VIP system migrations
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_level TEXT DEFAULT 'Member'`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_updated_at TIMESTAMP DEFAULT NULL`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_investments_user_status ON investments (user_id, status)`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users (referred_by)`),
+    // ── Special Override System ──────────────────────────────────────────────
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_commission_enabled BOOLEAN DEFAULT FALSE`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_plan_tier TEXT DEFAULT NULL`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_vip_level TEXT DEFAULT NULL`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_override_expiry TIMESTAMP DEFAULT NULL`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_badge_label TEXT DEFAULT NULL`),
+    db.run(`CREATE TABLE IF NOT EXISTS override_logs (
+      id           SERIAL PRIMARY KEY,
+      admin_action TEXT NOT NULL,
+      target_user  BIGINT NOT NULL,
+      field        TEXT,
+      old_value    TEXT,
+      new_value    TEXT,
+      note         TEXT,
+      created_at   TIMESTAMP DEFAULT NOW()
+    )`),
   ]);
 
   // Audit log table for address changes
@@ -503,6 +646,31 @@ async function setupDB() {
       action       TEXT DEFAULT 'change',
       created_at   TIMESTAMP DEFAULT NOW()
     )
+  `);
+
+  // Telegram Group proof log table
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS tg_proof_logs (
+      id          SERIAL PRIMARY KEY,
+      withdraw_id INTEGER NOT NULL,
+      sent_status TEXT    DEFAULT 'pending',
+      error_msg   TEXT    DEFAULT NULL,
+      retry_count INTEGER DEFAULT 0,
+      created_at  TIMESTAMP DEFAULT NOW(),
+      updated_at  TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS bsc_tx_hash TEXT DEFAULT NULL`);
+
+  // Mark all pre-existing approved withdrawals as 'skipped' in proof logs
+  // so fallback scanner never re-posts old withdrawals after deploy
+  await db.run(`
+    INSERT INTO tg_proof_logs (withdraw_id, sent_status, error_msg)
+    SELECT t.id, 'skipped', 'pre-existing before TG proof feature'
+    FROM transactions t
+    WHERE t.type = 'withdraw'
+      AND t.status = 'approved'
+      AND NOT EXISTS (SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id)
   `);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
@@ -524,12 +692,218 @@ async function getSetting(key) {
 
 
 // ── Rank + UID helpers ────────────────────
+
+// Plan tier order (lowest → highest)
+const PLAN_TIER_ORDER = ['bronze','silver','gold','platinum','diamond','titanium','quantum'];
+
+function getPlanTier(planName) {
+  const n = (planName || '').toLowerCase();
+  for (const tier of [...PLAN_TIER_ORDER].reverse()) {
+    if (n.includes(tier)) return tier;
+  }
+  return 'bronze';
+}
+
+function planTierIndex(planName) {
+  return PLAN_TIER_ORDER.indexOf(getPlanTier(planName));
+}
+
+// VIP REQUIREMENTS
+const VIP_LEVELS = [
+  // Member (base — no VIP)
+  { name: 'Member',          minPlanTier: null,       minRefs: 0,  minTeamDep: 0,    maxLevels: 3,
+    rates: [3, 2, 1, 0, 0, 0, 0] }, // fallback = Bronze rates
+  // Bronze plan active
+  { name: 'Bronze',          minPlanTier: 'bronze',   minRefs: 0,  minTeamDep: 0,    maxLevels: 3,
+    rates: [3, 2, 1, 0, 0, 0, 0] },
+  // Silver plan active
+  { name: 'Silver',          minPlanTier: 'silver',   minRefs: 0,  minTeamDep: 0,    maxLevels: 3,
+    rates: [4, 2, 1, 0, 0, 0, 0] },
+  // Gold plan active
+  { name: 'Gold',            minPlanTier: 'gold',     minRefs: 0,  minTeamDep: 0,    maxLevels: 3,
+    rates: [5, 3, 1, 0, 0, 0, 0] },
+  // VIP 1 — Platinum
+  { name: 'VIP 1',           minPlanTier: 'platinum', minRefs: 2,  minTeamDep: 100,  maxLevels: 4,
+    rates: [8, 3, 1, 1, 0, 0, 0] },
+  // VIP 2 — Diamond
+  { name: 'VIP 2',           minPlanTier: 'diamond',  minRefs: 5,  minTeamDep: 500,  maxLevels: 5,
+    rates: [8, 3, 1, 1, 1, 0, 0] },
+  // VIP 3 — Titanium
+  { name: 'VIP 3',           minPlanTier: 'titanium', minRefs: 10, minTeamDep: 1000, maxLevels: 6,
+    rates: [8, 3, 1, 1, 1, 1, 0] },
+  // VIP 4 — Quantum
+  { name: 'VIP 4',           minPlanTier: 'quantum',  minRefs: 20, minTeamDep: 2000, maxLevels: 7,
+    rates: [8, 3, 1, 1, 1, 1, 1] },
+];
+
+// Compute user's VIP level given their stats
+function computeVipLevel(highestPlanTier, activeRefs, teamDeposit) {
+  const tierIdx = highestPlanTier ? PLAN_TIER_ORDER.indexOf(highestPlanTier) : -1;
+  let bestLevel = VIP_LEVELS[0]; // Member default
+
+  for (const vip of VIP_LEVELS) {
+    if (!vip.minPlanTier) continue; // skip Member entry
+    const reqTierIdx = PLAN_TIER_ORDER.indexOf(vip.minPlanTier);
+    if (tierIdx < reqTierIdx) continue;
+    if (activeRefs < vip.minRefs) continue;
+    if (teamDeposit < vip.minTeamDep) continue;
+    bestLevel = vip;
+  }
+  return bestLevel;
+}
+
+// Get highest active plan tier for a user (server-side)
+async function getHighestActivePlanTier(userId) {
+  const rows = await db.all(
+    `SELECT plan_name FROM investments WHERE user_id=$1 AND status='active'`,
+    [userId]
+  );
+  if (!rows || !rows.length) return null;
+  let best = -1;
+  for (const r of rows) {
+    const idx = planTierIndex(r.plan_name);
+    if (idx > best) best = idx;
+  }
+  return best >= 0 ? PLAN_TIER_ORDER[best] : null;
+}
+
+// Get team deposit total for N levels deep
+async function getTeamDeposit(userId, maxLevels) {
+  // BFS across referral tree up to maxLevels
+  // Always use numeric bigint-safe id
+  let currentIds = [parseInt(userId)];
+  let allDownlineIds = [];
+  for (let lvl = 0; lvl < maxLevels; lvl++) {
+    if (!currentIds.length) break;
+    const rows = await db.all(
+      `SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`,
+      [currentIds]
+    );
+    const nextIds = rows.map(r => r.id);
+    allDownlineIds = allDownlineIds.concat(nextIds);
+    currentIds = nextIds;
+  }
+  if (!allDownlineIds.length) return 0;
+  const r = await db.one(
+    `SELECT COALESCE(SUM(i.amount), 0) as total
+     FROM investments i
+     WHERE i.user_id = ANY($1::bigint[]) AND i.status IN ('active','completed')`,
+    [allDownlineIds]
+  );
+  return parseFloat(r.total) || 0;
+}
+
+// Get active referral count (direct L1 only for VIP gate)
+async function getActiveReferralCount(userId) {
+  const r = await db.one(
+    `SELECT COUNT(DISTINCT u.id) as cnt
+     FROM users u
+     JOIN investments i ON u.id = i.user_id
+     WHERE u.referred_by = $1 AND i.status = 'active'`,
+    [userId]
+  );
+  return parseInt(r.cnt) || 0;
+}
+
+// Full VIP status for a user — used in /api/vip-status and commission calc
+// Strategy: first compute candidate VIP from plan+refs only (no team dep),
+// then scan teamDep using that candidate's maxLevels for consistency.
+// reqMaxLevels: hard cap for commission calc to limit DB queries.
+async function getUserVipStatus(userId, reqMaxLevels) {
+  // ── Check manual override FIRST ──────────────────────────────────────
+  const overrideRow = await db.one(
+    `SELECT manual_commission_enabled, manual_plan_tier, manual_vip_level,
+            manual_override_expiry, manual_badge_label
+     FROM users WHERE id=$1`, [userId]
+  );
+
+  // Check if override is still valid (not expired)
+  const overrideActive = overrideRow && (
+    !overrideRow.manual_override_expiry ||
+    new Date() < new Date(overrideRow.manual_override_expiry)
+  );
+
+  if (overrideActive && overrideRow.manual_vip_level && overrideRow.manual_vip_level !== 'none') {
+    // Find the VIP level definition matching the manual assignment
+    const overrideVip = VIP_LEVELS.find(v => v.name === overrideRow.manual_vip_level);
+    if (overrideVip) {
+      // Also apply manual plan tier override for commission rates
+      let effectiveVip = { ...overrideVip };
+      if (overrideRow.manual_plan_tier && overrideRow.manual_plan_tier !== 'none') {
+        // Find plan-tier-based rates from VIP_LEVELS equivalent tier
+        const planVip = VIP_LEVELS.find(v => v.minPlanTier === overrideRow.manual_plan_tier);
+        if (planVip && planTierIndex(planVip.minPlanTier) > planTierIndex(overrideVip.minPlanTier || 'bronze')) {
+          // If manual plan tier gives higher rates, use those rates but keep VIP levels
+          effectiveVip = { ...overrideVip, rates: planVip.rates };
+        }
+      }
+      const teamDep = await getTeamDeposit(userId, effectiveVip.maxLevels).catch(() => 0);
+      return {
+        vip: effectiveVip,
+        highestTier: overrideRow.manual_plan_tier || null,
+        activeRefs: 0,
+        teamDep,
+        isManualOverride: true,
+        badgeLabel: overrideRow.manual_badge_label || null,
+      };
+    }
+  }
+
+  // If manual_commission_enabled but no VIP override — use manual_plan_tier for rates
+  if (overrideActive && overrideRow.manual_commission_enabled && overrideRow.manual_plan_tier && overrideRow.manual_plan_tier !== 'none') {
+    const planVip = VIP_LEVELS.find(v => v.minPlanTier === overrideRow.manual_plan_tier);
+    if (planVip) {
+      const teamDep = await getTeamDeposit(userId, planVip.maxLevels).catch(() => 0);
+      return {
+        vip: planVip,
+        highestTier: overrideRow.manual_plan_tier,
+        activeRefs: 0,
+        teamDep,
+        isManualOverride: true,
+        badgeLabel: overrideRow.manual_badge_label || null,
+      };
+    }
+  }
+
+  // ── Normal automatic VIP calculation ────────────────────────────────
+  const [highestTier, activeRefs] = await Promise.all([
+    getHighestActivePlanTier(userId),
+    getActiveReferralCount(userId),
+  ]);
+
+  // Step 1: find highest VIP tier user COULD reach based on plan+refs only
+  const tierIdx = highestTier ? PLAN_TIER_ORDER.indexOf(highestTier) : -1;
+
+  // If manual_commission_enabled (no plan), treat as having a plan for commission purposes
+  let effectiveTierIdx = tierIdx;
+  if (overrideActive && overrideRow.manual_commission_enabled && tierIdx < 0) {
+    effectiveTierIdx = 0; // treat as bronze for commission eligibility
+  }
+
+  let candidateMaxLevels = 3;
+  for (const v of VIP_LEVELS) {
+    if (!v.minPlanTier) continue;
+    const reqTierIdx = PLAN_TIER_ORDER.indexOf(v.minPlanTier);
+    if (effectiveTierIdx < reqTierIdx) continue;
+    if (activeRefs < v.minRefs) continue;
+    candidateMaxLevels = v.maxLevels;
+  }
+
+  const scanDepth = reqMaxLevels
+    ? Math.min(reqMaxLevels, candidateMaxLevels)
+    : candidateMaxLevels;
+
+  const teamDep = await getTeamDeposit(userId, scanDepth);
+  const vip = computeVipLevel(highestTier, activeRefs, teamDep);
+  return { vip, highestTier, activeRefs, teamDep, isManualOverride: false };
+}
+
+// Legacy rank name (kept for leaderboard badge compatibility)
 function getUserRank(activeRefs) {
   const n = parseInt(activeRefs) || 0;
-  if (n >= 20) return 'VIP 5';
-  if (n >= 10) return 'VIP 4';
-  if (n >= 5)  return 'VIP 3';
-  if (n >= 3)  return 'VIP 2';
+  if (n >= 20) return 'VIP 4';
+  if (n >= 10) return 'VIP 3';
+  if (n >= 5)  return 'VIP 2';
   if (n >= 1)  return 'VIP 1';
   return 'Member';
 }
@@ -544,11 +918,12 @@ function generateUID() {
 
 // ── Plan unlock: active referral requirements ──
 function getPlanReferralReq(planName) {
+  // Must match VIP_LEVELS requirements exactly
   const n = (planName || '').toLowerCase();
   if (n.includes('quantum'))  return 20;
   if (n.includes('titanium')) return 10;
-  if (n.includes('diamond'))  return 3;
-  if (n.includes('platinum')) return 1;
+  if (n.includes('diamond'))  return 5;
+  if (n.includes('platinum')) return 2;
   return 0; // bronze, silver, gold — always open
 }
 
@@ -825,7 +1200,23 @@ app.get('/api/user/:id', async (req, res) => {
     };
     userWithComm.rank   = getUserRank(activeReferrals);
     userWithComm.active_referrals = activeReferrals;
-    res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals});
+
+    // Compute VIP status (lightweight — uses cached highest plan query)
+    let vipData = null;
+    try {
+      const vs = await getUserVipStatus(req.params.id);
+      vipData = {
+        vip_name:     vs.vip.name,
+        vip_rates:    vs.vip.rates,
+        max_levels:   vs.vip.maxLevels,
+        highest_tier: vs.highestTier || null,
+        team_deposit: +vs.teamDep.toFixed(2),
+      };
+      // Cache vip_level on user row (async, non-blocking)
+      db.run(`UPDATE users SET vip_level=$1, vip_updated_at=NOW() WHERE id=$2`, [vs.vip.name, req.params.id]).catch(()=>{});
+    } catch(e) { log('WARN', 'VIP calc skipped: ' + e.message); }
+
+    res.json({user: userWithComm, investments, transactions, tasks, referrals, plans, settings, active_referrals: activeReferrals, vip: vipData});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
@@ -926,30 +1317,45 @@ app.post('/api/invest', userAuth, async (req, res) => {
       log('REF', `User ${user.id} marked as active referral of ${user.referred_by}`);
     }
 
-    // Distribute referral commissions (3 levels)
+    // Distribute referral commissions — VIP-based dynamic rates
     try {
-      const settingRows = await db.all(`SELECT * FROM settings`);
-      const sMap = settingRows.reduce((a,r) => ({...a,[r.key]:r.value}), {});
-      const pcts = [
-        parseFloat(sMap.ref_lvl1_pct || 8) / 100,
-        parseFloat(sMap.ref_lvl2_pct || 3) / 100,
-        parseFloat(sMap.ref_lvl3_pct || 1) / 100
-      ];
       let currentId = u.id;
-      for (let lvl = 0; lvl < 3; lvl++) {
-        const row = await db.one(`SELECT referred_by FROM users WHERE id=$1`, [currentId]);
+      const vipCache = new Map(); // per-invest cache: referrerId → vip object
+      for (let lvl = 0; lvl < 7; lvl++) {
+        const row = await db.one(`SELECT referred_by, is_banned FROM users WHERE id=$1`, [currentId]);
         if (!row || !row.referred_by) break;
         const referrerId = row.referred_by;
-        // Referrer must not be banned
-        const referrerRow = await db.one(`SELECT is_banned FROM users WHERE id=$1`, [referrerId]);
-        if (!referrerRow || referrerRow.is_banned) {
-          currentId = referrerId;
-          continue;
+
+        // Referrer must not be banned (already fetched above)
+        if (row.is_banned) { currentId = referrerId; continue; }
+
+        // Compute referrer VIP — use cache to avoid repeat DB calls
+        let refVip;
+        if (vipCache.has(referrerId)) {
+          refVip = vipCache.get(referrerId);
+        } else {
+          // Use scanDepth = 4 max for commission calc (VIP 4 needs L7 but teamDep is pre-qualified)
+          const refVipData = await getUserVipStatus(referrerId, 4);
+          refVip = refVipData.vip;
+          vipCache.set(referrerId, refVip);
         }
-        const comm = +(amount * pcts[lvl]).toFixed(4);
-        await db.run(`UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`, [comm, referrerId]);
-        await db.run(`INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1,$2,$3,$4)`, [referrerId, u.id, lvl+1, comm]);
-        log('COMM', `Level ${lvl+1} commission $${comm} → user ${referrerId} (from ${u.id})`);
+
+        // Stop if this level is beyond referrer's unlocked levels
+        if (lvl >= refVip.maxLevels) { currentId = referrerId; continue; }
+
+        const pct = (refVip.rates[lvl] || 0) / 100;
+        if (pct <= 0) { currentId = referrerId; continue; }
+
+        const comm = +(amount * pct).toFixed(4);
+        await db.run(
+          `UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`,
+          [comm, referrerId]
+        );
+        await db.run(
+          `INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1,$2,$3,$4)`,
+          [referrerId, u.id, lvl+1, comm]
+        );
+        log('COMM', `L${lvl+1} ${refVip.name} ${pct*100}% $${comm} → user ${referrerId}`);
         currentId = referrerId;
       }
     } catch(e) { console.log('Commission error:', e.message); }
@@ -1752,9 +2158,9 @@ app.post('/admin/deposit/reject', adminAuth, async (req, res) => {
 
 app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
   try {
-    const {tx_id, admin_note} = req.body;
+    const {tx_id, admin_note, bsc_tx_hash} = req.body;
     if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
-    const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='withdraw'`, [tx_id]);
+    const tx = await db.one(`SELECT t.*, u.username, u.first_name FROM transactions t LEFT JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.type='withdraw'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
 
     // [ATOMIC] Only approve if still pending — rowCount=0 means already processed
@@ -1764,10 +2170,27 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
     );
     if (result.rowCount === 0) return res.status(400).json({error:'Already processed'});
 
+    // Save bsc_tx_hash AFTER atomic approval confirmed (not before — avoids saving on already-processed)
+    if (bsc_tx_hash && bsc_tx_hash.trim()) {
+      await db.run(`UPDATE transactions SET bsc_tx_hash=$1 WHERE id=$2`, [bsc_tx_hash.trim(), tx_id]);
+    }
+
     const {user_id, amount} = result.rows[0];
     log('WITHDRAW', `APPROVED tx=${tx_id} user=${user_id} amt=$${amount} addr=${(tx.address||'').slice(0,16)}`);
     logSecurity('WITHDRAW_APPROVED', {tx_id, user_id, amount, address: (tx.address||'').slice(0,20)});
     res.json({success:true});
+
+    // Fire Telegram proof immediately after approve (non-blocking)
+    // Scanner will try to add TX hash separately if Moralis detects it
+    setImmediate(() => sendWithdrawProof({
+      withdraw_id: tx_id,
+      username:    tx.username    || '',
+      first_name:  tx.first_name  || '',
+      user_id:     user_id,
+      amount:      amount,
+      address:     tx.address     || '',
+      bsc_tx_hash: (bsc_tx_hash && bsc_tx_hash.trim()) ? bsc_tx_hash.trim() : ''
+    }));
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
@@ -1903,6 +2326,106 @@ app.post('/admin/maintenance', adminAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// TELEGRAM GROUP INTEGRATION — ADMIN ROUTES
+// ══════════════════════════════════════════
+
+// GET current tg group settings + bot status + today's sent count
+app.get('/admin/tg-group/status', adminAuth, async (req, res) => {
+  try {
+    const cfg = await getTgGroupSettings();
+
+    // Count today's sent proofs
+    const todayRow = await db.one(
+      `SELECT COUNT(*) as c FROM tg_proof_logs WHERE sent_status='sent' AND created_at >= NOW() - INTERVAL '24 hours'`
+    );
+    // Last log entry — use db.all + take first to avoid crash on empty table
+    const lastLogs = await db.all(
+      `SELECT sent_status, error_msg, updated_at FROM tg_proof_logs ORDER BY id DESC LIMIT 1`
+    );
+    const lastLog = lastLogs && lastLogs.length > 0 ? lastLogs[0] : null;
+
+    // Check bot alive
+    let botOk = false;
+    let botUsername = '';
+    if (BOT_TOKEN) {
+      const me = await tgBotApi('getMe', {});
+      botOk = !!me.ok;
+      botUsername = me.result && me.result.username ? '@' + me.result.username : '';
+    }
+
+    res.json({
+      bot_ok:        botOk,
+      bot_username:  botUsername,
+      chat_id:       cfg.chatId,
+      topic_id:      cfg.topicId,
+      enabled:       cfg.enabled,
+      sent_today:    parseInt(todayRow.c || 0),
+      last_status:   lastLog ? lastLog.sent_status  : null,
+      last_error:    lastLog ? lastLog.error_msg     : null,
+      last_time:     lastLog ? lastLog.updated_at    : null
+    });
+  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// Save tg group settings
+app.post('/admin/tg-group/settings', adminAuth, async (req, res) => {
+  try {
+    const { chat_id, topic_id, enabled } = req.body;
+    await db.run(`INSERT INTO settings (key,value) VALUES ('tg_group_chat_id',$1)  ON CONFLICT (key) DO UPDATE SET value=$1`, [String(chat_id||'')]);
+    await db.run(`INSERT INTO settings (key,value) VALUES ('tg_group_topic_id',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [String(topic_id||'')]);
+    await db.run(`INSERT INTO settings (key,value) VALUES ('tg_group_enabled',$1)  ON CONFLICT (key) DO UPDATE SET value=$1`, [enabled?'1':'0']);
+    res.json({success:true});
+  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// Test connection — send test message to configured topic
+app.post('/admin/tg-group/test', adminAuth, async (req, res) => {
+  try {
+    const cfg = await getTgGroupSettings();
+    if (!BOT_TOKEN)   return res.status(400).json({error:'BOT_TOKEN not configured on server'});
+    if (!cfg.chatId)  return res.status(400).json({error:'Group Chat ID not set'});
+
+    const payload = {
+      chat_id:    cfg.chatId,
+      text:       '💸 <b>Block USDT Proof Feed Connected Successfully</b>',
+      parse_mode: 'HTML'
+    };
+    if (cfg.topicId) {
+      const tid = parseInt(cfg.topicId, 10);
+      if (!isNaN(tid) && tid > 0) payload.message_thread_id = tid;
+    }
+
+    const result = await tgBotApi('sendMessage', payload);
+    if (!result.ok) return res.status(400).json({error: result.description || 'Send failed — check Chat ID / Topic ID and bot admin permissions'});
+    res.json({success:true, message_id: result.result && result.result.message_id});
+  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// Check bot permissions in group
+app.post('/admin/tg-group/check-permissions', adminAuth, async (req, res) => {
+  try {
+    const cfg = await getTgGroupSettings();
+    if (!BOT_TOKEN)  return res.status(400).json({error:'BOT_TOKEN not set'});
+    if (!cfg.chatId) return res.status(400).json({error:'Chat ID not configured'});
+
+    const me = await tgBotApi('getMe', {});
+    if (!me.ok || !me.result || !me.result.id) return res.status(400).json({error:'Cannot reach Telegram API'});
+
+    const member = await tgBotApi('getChatMember', { chat_id: cfg.chatId, user_id: me.result.id });
+    if (!member.ok) return res.status(400).json({error: member.description || 'Bot is not in the group'});
+
+    const status = member.result && member.result.status;
+    const canPost = status === 'administrator' || status === 'creator';
+    res.json({
+      ok: canPost,
+      status,
+      can_send_messages: canPost,
+      warning: canPost ? null : 'Bot is not an admin — cannot post messages'
+    });
+  } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// ══════════════════════════════════════════
 // REFERRAL STATS (per-level breakdown)
 // ══════════════════════════════════════════
 app.get('/api/referral-stats/:id', async (req, res) => {
@@ -1924,27 +2447,27 @@ app.get('/api/referral-stats/:id', async (req, res) => {
     const uid = parseInt(req.params.id);
     if (!uid) return res.status(400).json({ error: 'Invalid id' });
 
-    // Level 1 — direct referrals
-    const lvl1rows = await db.all(`SELECT id FROM users WHERE referred_by=$1`, [uid]);
-    const lvl1ids  = lvl1rows.map(r => r.id);
+    // Get user VIP to know how many levels to scan
+    const { vip } = await getUserVipStatus(uid, 4);
+    const maxLvl = vip.maxLevels || 3;
 
-    // Level 2
-    let lvl2ids = [];
-    if (lvl1ids.length > 0) {
-      const lvl2rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl1ids]);
-      lvl2ids = lvl2rows.map(r => r.id);
+    // BFS up to maxLvl levels
+    const lvlIds = [];
+    let currentIds = [uid];
+    for (let lvl = 0; lvl < maxLvl; lvl++) {
+      if (!currentIds.length) { lvlIds.push([]); continue; }
+      const rows = await db.all(
+        `SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`,
+        [currentIds]
+      );
+      const nextIds = rows.map(r => parseInt(r.id));
+      lvlIds.push(nextIds);
+      currentIds = nextIds;
     }
 
-    // Level 3
-    let lvl3ids = [];
-    if (lvl2ids.length > 0) {
-      const lvl3rows = await db.all(`SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [lvl2ids]);
-      lvl3ids = lvl3rows.map(r => r.id);
-    }
-
-    // Active = has at least one active investment (strict rule, same as plan section)
+    // Count active per level
     const countActive = async (ids) => {
-      if (!ids.length) return 0;
+      if (!ids || !ids.length) return 0;
       const r = await db.one(
         `SELECT COUNT(DISTINCT user_id) as cnt FROM investments WHERE user_id = ANY($1::bigint[]) AND status='active'`,
         [ids]
@@ -1952,19 +2475,17 @@ app.get('/api/referral-stats/:id', async (req, res) => {
       return parseInt(r.cnt) || 0;
     };
 
-    const [act1, act2, act3] = await Promise.all([
-      countActive(lvl1ids),
-      countActive(lvl2ids),
-      countActive(lvl3ids),
-    ]);
+    const activePerLvl = await Promise.all(lvlIds.map(function(ids) { return countActive(ids); }));
 
-    res.json({
-      total: lvl1ids.length + lvl2ids.length + lvl3ids.length,
-      total_active: act1 + act2 + act3,
-      lvl1: { total: lvl1ids.length, active: act1 },
-      lvl2: { total: lvl2ids.length, active: act2 },
-      lvl3: { total: lvl3ids.length, active: act3 },
-    });
+    const totalAll    = lvlIds.reduce(function(s, ids) { return s + ids.length; }, 0);
+    const totalActive = activePerLvl.reduce(function(s, n) { return s + n; }, 0);
+
+    const result = { total: totalAll, total_active: totalActive, max_levels: maxLvl };
+    for (let i = 0; i < lvlIds.length; i++) {
+      result['lvl' + (i + 1)] = { total: lvlIds[i].length, active: activePerLvl[i] };
+    }
+
+    res.json(result);
   } catch(e) { log("ERROR", e.message); res.status(500).json({error: "Server error. Please try again."}); }
 });
 
@@ -1972,9 +2493,10 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 // AUTO DEPOSIT — Generate unique amount
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
-  for (let i = 0; i < 50; i++) {
-    // 1-5 → 0.01-0.05 (2 decimal places, 5 possible values)
-    const dec  = (Math.floor(Math.random() * 5) + 1);
+  // ✅ FIX: expanded from 5 → 99 possible suffix values (0.01–0.99)
+  // This dramatically reduces collision chance when many deposits are pending
+  for (let i = 0; i < 99; i++) {
+    const dec  = (Math.floor(Math.random() * 99) + 1); // 1–99
     const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
@@ -2088,78 +2610,379 @@ async function creditAutoDeposit(dep, txHash) {
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO SCANNER (BscScan)
+// BEP20 AUTO DEPOSIT SCANNER
+// Polls Moralis every 10s for incoming USDT
+// transfers to the platform deposit wallet,
+// matches by unique amount, credits balance.
 // ══════════════════════════════════════════
+
+let _scanRunning = false;
+
 async function scanBEP20() {
+  if (_scanRunning) return;
+  _scanRunning = true;
+
   try {
+    const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
+    if (!MORALIS_KEY) return;
+
+    // Skip if no pending deposits
     const pending = await db.all(
-      `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
+      `SELECT * FROM auto_deposits
+       WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
     if (!pending.length) return;
 
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&contract_addresses[0]=${USDT_CONTRACT}&limit=20&order=DESC`;
+    // Fetch latest 50 BEP20 transfers to deposit wallet
+    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
-    if (!data.result || !Array.isArray(data.result)) {
-      console.log('[BEP20] Moralis error:', JSON.stringify(data).slice(0, 200));
+    if (!data || !Array.isArray(data.result)) {
+      if (data && data.message) log('SCANNER', `Moralis error: ${data.message}`);
       return;
     }
 
-    const txs = data.result;
-    console.log(`[BEP20] Moralis: ${txs.length} txs | pending auto: ${pending.length}`);
+    // Keep only incoming USDT transfers
+    const transfers = data.result.filter(tx =>
+      tx.to_address && tx.to_address.toLowerCase() === DEPOSIT_WALLET &&
+      tx.token_address && tx.token_address.toLowerCase() === USDT_CONTRACT
+    );
+
+    if (transfers.length) {
+      log('SCANNER', `Block: ${transfers[0].block_number} | ${transfers.length} incoming USDT transfer(s)`);
+    }
+
+    // Track which tx hashes we process this cycle to avoid double-credit
+    const processedHashes = new Set();
 
     for (const dep of pending) {
-      const depTs = new Date(dep.created_at).getTime() - 60000;
-      let matched = false;
+      if (dep._matched) continue;
 
-      for (const tx of txs) {
-        if (tx.to_address.toLowerCase() !== DEPOSIT_WALLET) continue;
-        if (new Date(tx.block_timestamp).getTime() < depTs) continue;
+      // Only look at transfers that happened after this deposit was created (2 min buffer)
+      const depCreatedMs = new Date(dep.created_at).getTime() - 120000;
 
-        const txAmt = parseFloat(tx.value_decimal);
-        const diff  = Math.abs(txAmt - dep.unique_amt);
-        console.log(`[BEP20] tx=${tx.transaction_hash.slice(0,12)} got=${txAmt} exp=${dep.unique_amt} diff=${diff}`);
+      for (const tx of transfers) {
+        // Guard: skip if no valid tx hash (Moralis can return null for pending txs)
+        if (!tx.transaction_hash || typeof tx.transaction_hash !== 'string') continue;
+        if (processedHashes.has(tx.transaction_hash)) continue;
+        if (new Date(tx.block_timestamp).getTime() < depCreatedMs) continue;
 
-        if (diff <= 0.01) {
-          // [STRICT] Double-check expiry before crediting
-          if (new Date() > new Date(dep.expires_at)) {
-            await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-            log('EXPIRY', `Auto deposit ${dep.id} expired before match user=${dep.user_id}`);
-            matched = true; // stop searching for this dep
-            break;
-          }
-          log('DEPOSIT', `Auto match dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
-          await creditAutoDeposit(dep, tx.transaction_hash);
-          matched = true;
+        // Parse transfer amount (value_decimal preferred, fallback to raw/1e18)
+        let txAmt;
+        if (tx.value_decimal != null && tx.value_decimal !== '') {
+          txAmt = parseFloat(tx.value_decimal);
+        } else if (tx.value != null) {
+          txAmt = parseFloat(tx.value) / 1e18;
+        } else {
+          continue;
+        }
+        if (isNaN(txAmt) || txAmt <= 0) continue;
+
+        // Amount must match within ±$0.02 tolerance
+        if (Math.abs(txAmt - dep.unique_amt) > 0.02) continue;
+
+        log('SCANNER', `Deposit found tx: ${tx.transaction_hash.slice(0, 18)}... amt=${txAmt}`);
+
+        // Check expiry before crediting
+        if (new Date() > new Date(dep.expires_at)) {
+          await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
+          log('SCANNER', `Deposit expired: dep=${dep.id} user=${dep.user_id}`);
+          dep._matched = true;
           break;
         }
-      }
-      // [REDUCED LOG] Only log no-match for very recent deposits (< 5 min)
-      if (!matched) {
-        const age = (Date.now() - new Date(dep.created_at).getTime()) / 60000;
-        if (age < 5) console.log(`[BEP20] No match dep=${dep.id} amt=${dep.unique_amt} age=${age.toFixed(1)}m`);
+
+        // Credit the deposit
+        log('SCANNER', `User matched: dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+        await creditAutoDeposit(dep, tx.transaction_hash);
+        log('SCANNER', `Credited: user=${dep.user_id} amount=$${dep.amount}`);
+
+        dep._matched = true;
+        processedHashes.add(tx.transaction_hash);
+        break;
       }
     }
-  } catch(e) { console.error('[BEP20] Scanner error:', e.message); }
+
+  } catch(e) {
+    log('SCANNER', `Error: ${e.message}`);
+  } finally {
+    _scanRunning = false;
+  }
 }
 
-// ══════════════════════════════════════════
-// START SCANNERS
-// ══════════════════════════════════════════
-function startScanners() {
-  console.log('🔍 BEP20 Moralis scanner started (10s interval)');
-  setTimeout(scanBEP20, 5000);
-  setInterval(scanBEP20, 10000);
-  // Auto-expire old pending deposits every minute
+// Fires Telegram withdrawal proof for approved withdrawals that still have no tx hash
+// Runs every 2 min as a safety net — ensures group always gets notified
+async function scanWithdrawalFallback() {
+  try {
+    const stale = await db.all(`
+      SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
+             u.username, u.first_name
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE t.type    = 'withdraw'
+        AND t.status  = 'approved'
+        AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
+        AND t.approved_at IS NOT NULL
+        AND t.approved_at >= NOW() - INTERVAL '2 hours'
+        AND t.approved_at <= NOW() - INTERVAL '5 minutes'
+        AND NOT EXISTS (
+          SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id
+        )
+    `);
+    for (const wd of stale) {
+      log('WITH_SCAN', `Fallback proof wd=${wd.id} user=${wd.user_id}`);
+      setImmediate(() => sendWithdrawProof({
+        withdraw_id: wd.id,
+        username:    wd.username   || '',
+        first_name:  wd.first_name || '',
+        user_id:     wd.user_id,
+        amount:      wd.amount,
+        address:     wd.address    || '',
+        bsc_tx_hash: ''
+      }));
+    }
+  } catch(e) {
+    log('WITH_SCAN', 'Fallback error: ' + e.message);
+  }
+}
+
+// Sends Telegram withdrawal proof for approved withdrawals that have no tx hash yet
+// Runs every 2 min — ensures group always gets notified even without Moralis tx detection
+async function scanWithdrawalFallback() {
+  try {
+    const stale = await db.all(`
+      SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
+             u.username, u.first_name
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE t.type    = 'withdraw'
+        AND t.status  = 'approved'
+        AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
+        AND t.approved_at IS NOT NULL
+        AND t.approved_at >= NOW() - INTERVAL '2 hours'
+        AND t.approved_at <= NOW() - INTERVAL '5 minutes'
+        AND NOT EXISTS (
+          SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id
+        )
+    `);
+    for (const wd of stale) {
+      log('WITH_SCAN', `Fallback proof wd=${wd.id} user=${wd.user_id}`);
+      setImmediate(() => sendWithdrawProof({
+        withdraw_id: wd.id,
+        username:    wd.username   || '',
+        first_name:  wd.first_name || '',
+        user_id:     wd.user_id,
+        amount:      wd.amount,
+        address:     wd.address    || '',
+        bsc_tx_hash: ''
+      }));
+    }
+  } catch(e) {
+    log('WITH_SCAN', 'Fallback error: ' + e.message);
+  }
+}
+
+async function startScanners() {
+  const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
+
+  if (!MORALIS_KEY) {
+    console.warn('[SCANNER] MORALIS_API_KEY not set — auto deposit scanner disabled');
+  } else {
+    log('SCANNER', 'Auto deposit scanner started (10s interval)');
+    setTimeout(scanBEP20, 5000);
+    setInterval(scanBEP20, 10000);
+  }
+
+  // Withdrawal proof fallback (fires TG proof for approved withdrawals with no tx hash)
+  setTimeout(scanWithdrawalFallback, 3 * 60 * 1000);
+  setInterval(scanWithdrawalFallback, 2 * 60 * 1000);
+
+  // Auto-expire stale pending deposits
   setInterval(async () => {
-    await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
-  }, 60000);
-  // today_earned is reset per-user in GET /api/user/:id when last_earn_date changes (no bulk reset needed)
+    try {
+      await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
+    } catch(e) {}
+  }, 60 * 1000);
 }
 
 // ══════════════════════════════════════════
 // START
 // ══════════════════════════════════════════
+
+// ══════════════════════════════════════════
+// VIP STATUS API
+// ══════════════════════════════════════════
+
+// GET /api/vip-status — full VIP status + progress for current user
+app.get('/api/vip-status', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    // First pass: compute VIP (uses scanDepth=7 for gate check)
+    const { vip, highestTier, activeRefs, isManualOverride, badgeLabel } = await getUserVipStatus(u.id);
+    // Second pass: recompute teamDep using ONLY user's current unlocked levels
+    const teamDep = await getTeamDeposit(u.id, vip.maxLevels);
+
+    // Build next VIP target
+    const currentIdx = VIP_LEVELS.indexOf(vip);
+    let nextVip = null;
+    let nextProgress = null;
+
+    // If manual override active — skip next VIP progress (not applicable)
+    if (!isManualOverride && currentIdx < VIP_LEVELS.length - 1) {
+      for (let i = currentIdx + 1; i < VIP_LEVELS.length; i++) {
+        if (VIP_LEVELS[i].name.startsWith('VIP')) {
+          nextVip = VIP_LEVELS[i];
+          break;
+        }
+      }
+      if (nextVip) {
+        const reqTier = nextVip.minPlanTier;
+        const reqTierIdx = PLAN_TIER_ORDER.indexOf(reqTier);
+        const curTierIdx = highestTier ? PLAN_TIER_ORDER.indexOf(highestTier) : -1;
+        nextProgress = {
+          plan:    { current: highestTier || 'none', required: reqTier, met: curTierIdx >= reqTierIdx },
+          refs:    { current: activeRefs, required: nextVip.minRefs, met: activeRefs >= nextVip.minRefs },
+          teamDep: { current: +teamDep.toFixed(2), required: nextVip.minTeamDep, met: teamDep >= nextVip.minTeamDep },
+        };
+      }
+    }
+
+    res.json({
+      vip_name:          vip.name,
+      vip_rates:         vip.rates,
+      max_levels:        vip.maxLevels,
+      highest_tier:      highestTier || null,
+      active_refs:       activeRefs,
+      team_deposit:      +teamDep.toFixed(2),
+      next_vip:          nextVip ? { name: nextVip.name, minPlanTier: nextVip.minPlanTier, minRefs: nextVip.minRefs, minTeamDep: nextVip.minTeamDep, maxLevels: nextVip.maxLevels, rates: nextVip.rates } : null,
+      next_progress:     nextProgress,
+      is_manual_override: isManualOverride || false,
+      badge_label:       badgeLabel || null,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+});
+
+// GET /api/team-deposit — paginated, searchable, level-filtered team deposit
+// Query params: level (1-7), page (default 1), limit (default 15), search (username/name/uid)
+app.get('/api/team-deposit', userAuth, async (req, res) => {
+  try {
+    const u       = req.tgUser;
+    const { vip } = await getUserVipStatus(u.id);
+    const maxLvl  = vip.maxLevels || 3;
+
+    const filterLvl = parseInt(req.query.level) || 0;   // 0 = all
+    const page      = Math.max(1, parseInt(req.query.page) || 1);
+    const limit     = Math.min(50, parseInt(req.query.limit) || 15);
+    const offset    = (page - 1) * limit;
+    const search    = (req.query.search || '').trim().toLowerCase();
+
+    // BFS to build level id maps
+    const lvlIds = [];
+    let currentIds = [parseInt(u.id)];
+    for (let lvl = 0; lvl < maxLvl; lvl++) {
+      if (!currentIds.length) { lvlIds.push([]); continue; }
+      const rows = await db.all(
+        `SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`, [currentIds]
+      );
+      const nextIds = rows.map(r => parseInt(r.id));
+      lvlIds.push(nextIds);
+      currentIds = nextIds;
+    }
+
+    // Summary: totals per level
+    const levelSummary = [];
+    let grandTotal = 0;
+    let grandMembers = 0;
+    let grandActive = 0;
+
+    for (let i = 0; i < lvlIds.length; i++) {
+      const ids = lvlIds[i];
+      if (!ids.length) {
+        levelSummary.push({ level: i+1, count: 0, total: 0, active: 0 });
+        continue;
+      }
+      const r = await db.one(
+        `SELECT COALESCE(SUM(CASE WHEN i.status IN ('active','completed') THEN i.amount ELSE 0 END),0) as total,
+                COUNT(DISTINCT CASE WHEN i.status='active' THEN i.user_id END) as active
+         FROM investments i WHERE i.user_id = ANY($1::bigint[])`,
+        [ids]
+      );
+      const total  = parseFloat(r.total) || 0;
+      const active = parseInt(r.active) || 0;
+      levelSummary.push({ level: i+1, count: ids.length, total: +total.toFixed(2), active });
+      grandTotal   += total;
+      grandMembers += ids.length;
+      grandActive  += active;
+    }
+
+    // Determine which level(s) to fetch members for
+    const fetchLevels = filterLvl > 0 && filterLvl <= maxLvl
+      ? [filterLvl - 1]          // 0-indexed
+      : lvlIds.map((_, i) => i); // all levels
+
+    // Build combined member list with level tag
+    let memberRows = [];
+    for (const li of fetchLevels) {
+      const ids = lvlIds[li];
+      if (!ids || !ids.length) continue;
+
+      // Build search filter
+      let whereExtra = '';
+      const params = [ids];
+      if (search) {
+        whereExtra = ` AND (LOWER(u.first_name) LIKE $2 OR LOWER(u.username) LIKE $2 OR CAST(u.uid AS TEXT) LIKE $2)`;
+        params.push('%' + search + '%');
+      }
+
+      const rows = await db.all(
+        `SELECT u.id, u.first_name, u.username, u.uid, u.created_at,
+                COALESCE(SUM(CASE WHEN i.status IN ('active','completed') THEN i.amount ELSE 0 END),0) as invested,
+                COUNT(CASE WHEN i.status='active' THEN 1 END) as active_plans,
+                (SELECT plan_name FROM investments WHERE user_id=u.id AND status='active' ORDER BY id DESC LIMIT 1) as top_plan
+         FROM users u
+         LEFT JOIN investments i ON i.user_id=u.id
+         WHERE u.id = ANY($1::bigint[])${whereExtra}
+         GROUP BY u.id, u.first_name, u.username, u.uid, u.created_at
+         ORDER BY invested DESC`,
+        params
+      );
+      rows.forEach(r => { r._level = li + 1; memberRows.push(r); });
+    }
+
+    // Sort by invested desc across levels, then paginate
+    memberRows.sort((a, b) => parseFloat(b.invested||0) - parseFloat(a.invested||0));
+    const totalFiltered = memberRows.length;
+    const paginatedRows = memberRows.slice(offset, offset + limit);
+
+    res.json({
+      summary: {
+        total_deposit: +grandTotal.toFixed(2),
+        total_members: grandMembers,
+        active_investors: grandActive,
+        max_levels: maxLvl,
+        vip_name: vip.name,
+      },
+      level_summary: levelSummary,
+      members: paginatedRows.map(m => ({
+        id:          m.id,
+        name:        m.first_name || 'User',
+        username:    m.username   || null,
+        uid:         m.uid        || null,
+        level:       m._level,
+        invested:    +parseFloat(m.invested||0).toFixed(2),
+        active_plans: parseInt(m.active_plans)||0,
+        top_plan:    m.top_plan   || null,
+        joined:      m.created_at ? String(m.created_at).split('T')[0] : null,
+      })),
+      pagination: {
+        page, limit,
+        total: totalFiltered,
+        pages: Math.ceil(totalFiltered / limit),
+        has_more: offset + limit < totalFiltered,
+      },
+      filter_level: filterLvl,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+});
 
 // ══════════════════════════════════════════
 // LEADERBOARD
@@ -2228,33 +3051,33 @@ app.get('/api/referrals/:userId', userAuth, async (req, res) => {
   if (String(req.tgUser.id) !== String(req.params.userId)) return res.status(403).json({ error: 'Forbidden' });
   try {
     const userId = req.params.userId;
-    const [level1, level2, level3] = await Promise.all([
-      db.all(`
-        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
-          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
-        FROM users u WHERE u.referred_by=$1 ORDER BY u.created_at DESC
-      `, [userId]),
-      db.all(`
-        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
-          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
-        FROM users u
-        WHERE u.referred_by IN (SELECT id FROM users WHERE referred_by=$1)
-        ORDER BY u.created_at DESC
-      `, [userId]),
-      db.all(`
-        SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
-          COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
-          EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
-        FROM users u
-        WHERE u.referred_by IN (
-          SELECT id FROM users WHERE referred_by IN (SELECT id FROM users WHERE referred_by=$1)
-        )
-        ORDER BY u.created_at DESC
-      `, [userId]),
-    ]);
-    res.json({ level1, level2, level3 });
+
+    // Get user's real max levels (respects admin override)
+    const { vip } = await getUserVipStatus(userId);
+    const maxLevels = vip.maxLevels || 3;
+
+    // Build level queries dynamically up to maxLevels
+    // Level 1: direct referrals
+    // Level N: users referred by level N-1 users
+    const refQuery = `
+      SELECT u.id, u.first_name as name, u.username, u.uid, u.created_at as joined_at,
+        COALESCE((SELECT SUM(c.amount) FROM commissions c WHERE c.user_id=$1 AND c.from_user_id=u.id), 0) as earned,
+        EXISTS(SELECT 1 FROM investments i WHERE i.user_id=u.id AND i.status='active') as is_active
+      FROM users u WHERE u.referred_by = ANY($2::bigint[]) ORDER BY u.created_at DESC
+    `;
+
+    // Walk the tree level by level
+    const result = { max_levels: maxLevels };
+    let currentIds = [BigInt(userId)];
+
+    for (let lvl = 1; lvl <= maxLevels; lvl++) {
+      const rows = await db.all(refQuery, [userId, currentIds]);
+      result['level' + lvl] = rows;
+      currentIds = rows.map(r => BigInt(r.id));
+      if (currentIds.length === 0) break;
+    }
+
+    res.json(result);
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
 });
 
@@ -2778,6 +3601,161 @@ app.get('/admin/notices/:id/stats', adminAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// SPECIAL USER OVERRIDE SYSTEM (Admin Only)
+// ══════════════════════════════════════════
+
+// ── Search users for override panel ──
+app.get('/admin/special/search', adminAuth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (!q) return res.json({ users: [] });
+    const like = '%' + q + '%';
+    const rows = await db.all(
+      `SELECT id, first_name, last_name, username, vip_level,
+              manual_commission_enabled, manual_plan_tier, manual_vip_level,
+              manual_override_expiry, manual_badge_label
+       FROM users
+       WHERE CAST(id AS TEXT) LIKE $1
+          OR LOWER(username) LIKE LOWER($2)
+          OR LOWER(first_name || ' ' || COALESCE(last_name,'')) LIKE LOWER($3)
+       LIMIT 20`,
+      [like, like, like]
+    );
+    res.json({ users: rows });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Get override status for a user ──
+app.get('/admin/special/user/:id', adminAuth, async (req, res) => {
+  try {
+    const row = await db.one(
+      `SELECT id, first_name, last_name, username, vip_level,
+              manual_commission_enabled, manual_plan_tier, manual_vip_level,
+              manual_override_expiry, manual_badge_label
+       FROM users WHERE id=$1`, [req.params.id]
+    );
+    if (!row) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: row });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Set override for a user ──
+app.post('/admin/special/set', adminAuth, async (req, res) => {
+  try {
+    const {
+      user_id,
+      manual_commission_enabled,
+      manual_plan_tier,
+      manual_vip_level,
+      manual_override_expiry,
+      manual_badge_label
+    } = req.body;
+
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+
+    const user = await db.one(`SELECT id, first_name FROM users WHERE id=$1`, [user_id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Build expiry
+    let expiry = null;
+    if (manual_override_expiry && manual_override_expiry !== 'permanent') {
+      expiry = new Date(manual_override_expiry).toISOString();
+      if (isNaN(new Date(expiry))) expiry = null;
+    }
+
+    // Validate enums
+    const VALID_PLAN_TIERS = ['none','bronze','silver','gold','platinum','diamond','titanium','quantum'];
+    const VALID_VIP_LEVELS = ['none','Member','Bronze','Silver','Gold','VIP 1','VIP 2','VIP 3','VIP 4'];
+    const planTier = VALID_PLAN_TIERS.includes(manual_plan_tier) ? manual_plan_tier : 'none';
+    const vipLevel = VALID_VIP_LEVELS.includes(manual_vip_level) ? manual_vip_level : 'none';
+    const commEnabled = !!manual_commission_enabled;
+    const badgeLabel = (manual_badge_label || '').substring(0, 50);
+
+    // Get old values for log
+    const old = await db.one(
+      `SELECT manual_commission_enabled, manual_plan_tier, manual_vip_level,
+              manual_override_expiry, manual_badge_label FROM users WHERE id=$1`, [user_id]
+    );
+
+    await db.run(
+      `UPDATE users SET
+        manual_commission_enabled=$1,
+        manual_plan_tier=$2,
+        manual_vip_level=$3,
+        manual_override_expiry=$4,
+        manual_badge_label=$5
+       WHERE id=$6`,
+      [commEnabled, planTier === 'none' ? null : planTier, vipLevel === 'none' ? null : vipLevel,
+       expiry, badgeLabel || null, user_id]
+    );
+
+    // Log the action
+    await db.run(
+      `INSERT INTO override_logs (admin_action, target_user, field, old_value, new_value, note)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        'SET_OVERRIDE', user_id, 'all',
+        JSON.stringify({ comm: old.manual_commission_enabled, plan: old.manual_plan_tier, vip: old.manual_vip_level }),
+        JSON.stringify({ comm: commEnabled, plan: planTier, vip: vipLevel, expiry, badge: badgeLabel }),
+        `Admin set override for user ${user_id} (${user.first_name})`
+      ]
+    );
+
+    log('ADMIN', `Override SET user=${user_id} comm=${commEnabled} plan=${planTier} vip=${vipLevel} expiry=${expiry}`);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Remove all overrides for a user ──
+app.post('/admin/special/remove', adminAuth, async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+
+    const old = await db.one(
+      `SELECT manual_commission_enabled, manual_plan_tier, manual_vip_level FROM users WHERE id=$1`, [user_id]
+    );
+
+    await db.run(
+      `UPDATE users SET
+        manual_commission_enabled=FALSE,
+        manual_plan_tier=NULL,
+        manual_vip_level=NULL,
+        manual_override_expiry=NULL,
+        manual_badge_label=NULL
+       WHERE id=$1`, [user_id]
+    );
+
+    await db.run(
+      `INSERT INTO override_logs (admin_action, target_user, field, old_value, new_value, note)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        'REMOVE_OVERRIDE', user_id, 'all',
+        JSON.stringify({ comm: old.manual_commission_enabled, plan: old.manual_plan_tier, vip: old.manual_vip_level }),
+        'null',
+        `Admin removed all overrides for user ${user_id}`
+      ]
+    );
+
+    log('ADMIN', `Override REMOVED user=${user_id}`);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Get override action log ──
+app.get('/admin/special/logs', adminAuth, async (req, res) => {
+  try {
+    const rows = await db.all(
+      `SELECT ol.*, u.first_name, u.username
+       FROM override_logs ol
+       LEFT JOIN users u ON ol.target_user = u.id
+       ORDER BY ol.created_at DESC LIMIT 100`
+    );
+    res.json({ logs: rows });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ══════════════════════════════════════════
 // GLOBAL ERROR HANDLER
 // ══════════════════════════════════════════
 app.use((err, req, res, next) => {
@@ -2800,8 +3778,8 @@ app.use((req, res) => {
 // ══════════════════════════════════════════
 // START
 // ══════════════════════════════════════════
-setupDB().then(() => {
-  startScanners();
+setupDB().then(async () => {
+  await startScanners();
   app.listen(PORT, () => {
     console.log(`✅ Server on port ${PORT} — Neon PostgreSQL connected`);
 
