@@ -53,19 +53,25 @@ function httpsGet(url, headers) {
     const opts = new URL(url);
     const options = {
       hostname: opts.hostname,
-      path: opts.pathname + opts.search,
-      method: 'GET',
-      headers: Object.assign({ 'User-Agent': 'BlockUSDT/1.0' }, headers || {}),
+      port:     443,
+      path:     opts.pathname + opts.search,
+      method:   'GET',
+      headers:  Object.assign({ 'User-Agent': 'BlockUSDT/1.0', 'Accept': 'application/json' }, headers || {}),
     };
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', d => data += d);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch(_) { resolve({}); }
+        try {
+          const parsed = JSON.parse(data);
+          // Attach HTTP status so caller can diagnose auth errors
+          parsed._httpStatus = res.statusCode;
+          resolve(parsed);
+        } catch(_) { resolve({ _httpStatus: res.statusCode }); }
       });
     });
-    req.on('error', () => resolve({}));
-    req.setTimeout(10000, () => { req.destroy(); resolve({}); });
+    req.on('error', (e) => resolve({ _httpStatus: 0, _error: e.message }));
+    req.setTimeout(12000, () => { req.destroy(); resolve({ _httpStatus: 0, _error: 'timeout' }); });
     req.end();
   });
 }
@@ -2610,105 +2616,167 @@ async function creditAutoDeposit(dep, txHash) {
 }
 
 // ══════════════════════════════════════════
-// BEP20 AUTO DEPOSIT SCANNER
-// Polls Moralis every 10s for incoming USDT
-// transfers to the platform deposit wallet,
-// matches by unique amount, credits balance.
+// BEP20 AUTO DEPOSIT — Moralis Streams
+// Webhook-based, real-time, no polling needed
+// Moralis calls POST /webhook/moralis-deposit
+// whenever USDT arrives at deposit wallet
 // ══════════════════════════════════════════
 
+// BUG FIX 1: Moralis signature needs raw body string, not parsed object
+// Must use express.raw() for this route — done below
+function verifyMoralisWebhook(rawBody, signature) {
+  const secret = process.env.MORALIS_STREAM_SECRET || '';
+  if (!secret) return true;
+  if (!signature) return false;
+  const crypto = require('crypto');
+  const hash   = crypto.createHmac('sha3-256', secret).update(rawBody).digest('hex');
+  return hash === signature;
+}
+
+app.post('/webhook/moralis-deposit',
+  // BUG FIX 1: capture raw body for signature verification
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    // Always respond 200 fast — Moralis retries on non-200
+    res.status(200).json({ ok: true });
+
+    try {
+      const rawBody  = req.body.toString('utf8');
+      const body     = JSON.parse(rawBody);
+      const signature = req.headers['x-signature'] || '';
+
+      if (!verifyMoralisWebhook(rawBody, signature)) {
+        log('SCANNER', 'Webhook signature invalid — ignored');
+        return;
+      }
+
+      // BUG FIX 2: Moralis test webhook has block.number = "0" — ignore it
+      if (!body.block || body.block.number === '0') return;
+
+      // Only process confirmed blocks
+      if (!body.confirmed) return;
+
+      const transfers = body.erc20Transfers || [];
+      if (!transfers.length) return;
+
+      log('SCANNER', `Webhook: ${transfers.length} ERC20 transfer(s) | block=${body.block.number}`);
+
+      const pending = await db.all(
+        `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
+      );
+      if (!pending.length) return;
+
+      for (const tx of transfers) {
+        // BUG FIX 4: Moralis Streams uses 'tokenAddress' not 'contract'
+        const contractAddr = (tx.tokenAddress || tx.contract || '').toLowerCase();
+        const toAddr       = (tx.to || '').toLowerCase();
+
+        if (contractAddr !== USDT_CONTRACT) continue;
+        if (toAddr !== DEPOSIT_WALLET) continue;
+        if (!tx.transactionHash) continue;
+
+        // Parse amount — Moralis Streams value is in raw units
+        const decimals = parseInt(tx.tokenDecimals) || 18;
+        const txAmt    = parseFloat(tx.value) / Math.pow(10, decimals);
+        if (isNaN(txAmt) || txAmt <= 0) continue;
+
+        log('SCANNER', `Deposit found tx: ${tx.transactionHash.slice(0,18)}... amt=${txAmt}`);
+
+        // Duplicate guard
+        const already = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [tx.transactionHash]);
+        if (already) {
+          log('SCANNER', `Duplicate skipped: ${tx.transactionHash.slice(0,18)}...`);
+          continue;
+        }
+
+        // Match against pending deposits
+        for (const dep of pending) {
+          if (dep._matched) continue;
+          if (Math.abs(txAmt - dep.unique_amt) > 0.02) continue;
+
+          if (new Date() > new Date(dep.expires_at)) {
+            await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
+            log('SCANNER', `Deposit expired: dep=${dep.id} user=${dep.user_id}`);
+            dep._matched = true;
+            break;
+          }
+
+          log('SCANNER', `User matched: dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+          await creditAutoDeposit(dep, tx.transactionHash);
+          log('SCANNER', `Credited: user=${dep.user_id} amount=$${dep.amount}`);
+          dep._matched = true;
+          break;
+        }
+      }
+
+    } catch(e) {
+      log('SCANNER', `Webhook error: ${e.message}`);
+    }
+  }
+);
+
+// Fallback polling scanner — runs every 30s in case stream misses a tx
 let _scanRunning = false;
 
 async function scanBEP20() {
   if (_scanRunning) return;
   _scanRunning = true;
-
   try {
     const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
     if (!MORALIS_KEY) return;
 
-    // Skip if no pending deposits
     const pending = await db.all(
-      `SELECT * FROM auto_deposits
-       WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
+      `SELECT * FROM auto_deposits WHERE dep_type='auto' AND status='pending' AND expires_at > NOW()`
     );
     if (!pending.length) return;
 
-    // Fetch latest 50 BEP20 transfers to deposit wallet
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
+    const url  = `https://deep-index.moralis.io/api/v2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=25`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
+    if (!data || !Array.isArray(data.result)) return;
 
-    if (!data || !Array.isArray(data.result)) {
-      const msg = data && data.message ? data.message : 'no response';
-      // 'Something went wrong' = wallet has no BSC ERC20 history yet, or transient error
-      // Both cases: silent retry next cycle
-      if (msg !== 'Something went wrong') {
-        log('SCANNER', `Moralis error: ${msg}`);
-      }
-      return;
-    }
-
-    // Keep only incoming USDT transfers
     const transfers = data.result.filter(tx =>
       tx.to_address && tx.to_address.toLowerCase() === DEPOSIT_WALLET &&
-      tx.token_address && tx.token_address.toLowerCase() === USDT_CONTRACT
+      tx.token_address && tx.token_address.toLowerCase() === USDT_CONTRACT &&
+      tx.transaction_hash && typeof tx.transaction_hash === 'string'
     );
 
-    if (transfers.length) {
-      log('SCANNER', `Block: ${transfers[0].block_number} | ${transfers.length} incoming USDT transfer(s)`);
-    }
-
-    // Track which tx hashes we process this cycle to avoid double-credit
     const processedHashes = new Set();
 
     for (const dep of pending) {
       if (dep._matched) continue;
-
-      // Only look at transfers that happened after this deposit was created (2 min buffer)
       const depCreatedMs = new Date(dep.created_at).getTime() - 120000;
 
       for (const tx of transfers) {
-        // Guard: skip if no valid tx hash (Moralis can return null for pending txs)
-        if (!tx.transaction_hash || typeof tx.transaction_hash !== 'string') continue;
         if (processedHashes.has(tx.transaction_hash)) continue;
         if (new Date(tx.block_timestamp).getTime() < depCreatedMs) continue;
 
-        // Parse transfer amount (value_decimal preferred, fallback to raw/1e18)
+        // BUG FIX 3: duplicate check BEFORE amount match (cheaper query first)
+        const already = await db.one(`SELECT id FROM auto_deposits WHERE tx_hash=$1`, [tx.transaction_hash]);
+        if (already) { processedHashes.add(tx.transaction_hash); continue; }
+
         let txAmt;
         if (tx.value_decimal != null && tx.value_decimal !== '') {
           txAmt = parseFloat(tx.value_decimal);
         } else if (tx.value != null) {
           txAmt = parseFloat(tx.value) / 1e18;
-        } else {
-          continue;
-        }
+        } else continue;
         if (isNaN(txAmt) || txAmt <= 0) continue;
-
-        // Amount must match within ±$0.02 tolerance
         if (Math.abs(txAmt - dep.unique_amt) > 0.02) continue;
 
-        log('SCANNER', `Deposit found tx: ${tx.transaction_hash.slice(0, 18)}... amt=${txAmt}`);
-
-        // Check expiry before crediting
         if (new Date() > new Date(dep.expires_at)) {
           await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
-          log('SCANNER', `Deposit expired: dep=${dep.id} user=${dep.user_id}`);
-          dep._matched = true;
-          break;
+          dep._matched = true; break;
         }
 
-        // Credit the deposit
-        log('SCANNER', `User matched: dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
+        log('SCANNER', `[Fallback] Matched dep=${dep.id} user=${dep.user_id} amt=${dep.unique_amt}`);
         await creditAutoDeposit(dep, tx.transaction_hash);
-        log('SCANNER', `Credited: user=${dep.user_id} amount=$${dep.amount}`);
-
         dep._matched = true;
         processedHashes.add(tx.transaction_hash);
         break;
       }
     }
-
   } catch(e) {
-    log('SCANNER', `Error: ${e.message}`);
+    log('SCANNER', `Fallback error: ${e.message}`);
   } finally {
     _scanRunning = false;
   }
