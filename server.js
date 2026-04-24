@@ -2859,7 +2859,7 @@ app.post('/webhook/moralis-deposit',
         let matched = false;
         for (const dep of pending) {
           if (dep._matched) continue;
-          if (Math.abs(txAmt - dep.unique_amt) > 0.05) continue;
+          if (Math.abs(txAmt - dep.unique_amt) > 0.001) continue;
 
           matched = true;
           dep._matched = true;
@@ -2942,7 +2942,7 @@ async function scanBEP20() {
           txAmt = parseFloat(tx.value) / 1e18;
         } else continue;
         if (isNaN(txAmt) || txAmt <= 0) continue;
-        if (Math.abs(txAmt - dep.unique_amt) > 0.05) continue;
+        if (Math.abs(txAmt - dep.unique_amt) > 0.001) continue;
 
         if (new Date() > new Date(dep.expires_at)) {
           await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
