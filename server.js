@@ -2634,11 +2634,15 @@ async function scanBEP20() {
     if (!pending.length) return;
 
     // Fetch latest 50 BEP20 transfers to deposit wallet
-    const url  = `https://deep-index.moralis.io/api/v2.2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
+    const url  = `https://deep-index.moralis.io/api/v2/${DEPOSIT_WALLET}/erc20/transfers?chain=bsc&limit=50&order=DESC`;
     const data = await httpsGet(url, { 'X-API-Key': MORALIS_KEY });
 
     if (!data || !Array.isArray(data.result)) {
-      if (data && data.message) log('SCANNER', `Moralis error: ${data.message}`);
+      // 'Something went wrong' = transient Moralis server error — silent retry next cycle
+      const msg = data && data.message ? data.message : '';
+      if (msg && msg !== 'Something went wrong') {
+        log('SCANNER', `Moralis error: ${msg}`);
+      }
       return;
     }
 
@@ -2745,41 +2749,6 @@ async function scanWithdrawalFallback() {
   }
 }
 
-// Sends Telegram withdrawal proof for approved withdrawals that have no tx hash yet
-// Runs every 2 min — ensures group always gets notified even without Moralis tx detection
-async function scanWithdrawalFallback() {
-  try {
-    const stale = await db.all(`
-      SELECT t.id, t.user_id, t.amount, t.address, t.approved_at,
-             u.username, u.first_name
-      FROM transactions t
-      LEFT JOIN users u ON u.id = t.user_id
-      WHERE t.type    = 'withdraw'
-        AND t.status  = 'approved'
-        AND (t.bsc_tx_hash IS NULL OR t.bsc_tx_hash = '')
-        AND t.approved_at IS NOT NULL
-        AND t.approved_at >= NOW() - INTERVAL '2 hours'
-        AND t.approved_at <= NOW() - INTERVAL '5 minutes'
-        AND NOT EXISTS (
-          SELECT 1 FROM tg_proof_logs pl WHERE pl.withdraw_id = t.id
-        )
-    `);
-    for (const wd of stale) {
-      log('WITH_SCAN', `Fallback proof wd=${wd.id} user=${wd.user_id}`);
-      setImmediate(() => sendWithdrawProof({
-        withdraw_id: wd.id,
-        username:    wd.username   || '',
-        first_name:  wd.first_name || '',
-        user_id:     wd.user_id,
-        amount:      wd.amount,
-        address:     wd.address    || '',
-        bsc_tx_hash: ''
-      }));
-    }
-  } catch(e) {
-    log('WITH_SCAN', 'Fallback error: ' + e.message);
-  }
-}
 
 async function startScanners() {
   const MORALIS_KEY = process.env.MORALIS_API_KEY || '';
