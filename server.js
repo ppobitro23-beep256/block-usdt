@@ -2634,15 +2634,15 @@ function verifyMoralisWebhook(rawBody, signature) {
 }
 
 app.post('/webhook/moralis-deposit',
-  // BUG FIX 1: capture raw body for signature verification
   express.raw({ type: 'application/json' }),
   async (req, res) => {
     // Always respond 200 fast — Moralis retries on non-200
     res.status(200).json({ ok: true });
 
     try {
-      const rawBody  = req.body.toString('utf8');
-      const body     = JSON.parse(rawBody);
+      // req.body is a Buffer from express.raw()
+      const rawBody   = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body);
+      const body      = JSON.parse(rawBody);
       const signature = req.headers['x-signature'] || '';
 
       if (!verifyMoralisWebhook(rawBody, signature)) {
