@@ -495,6 +495,22 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_updated_at TIMESTAMP DEFAULT NULL`),
     db.run(`CREATE INDEX IF NOT EXISTS idx_investments_user_status ON investments (user_id, status)`),
     db.run(`CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users (referred_by)`),
+    // ── Special Override System ──────────────────────────────────────────────
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_commission_enabled BOOLEAN DEFAULT FALSE`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_plan_tier TEXT DEFAULT NULL`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_vip_level TEXT DEFAULT NULL`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_override_expiry TIMESTAMP DEFAULT NULL`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_badge_label TEXT DEFAULT NULL`),
+    db.run(`CREATE TABLE IF NOT EXISTS override_logs (
+      id           SERIAL PRIMARY KEY,
+      admin_action TEXT NOT NULL,
+      target_user  BIGINT NOT NULL,
+      field        TEXT,
+      old_value    TEXT,
+      new_value    TEXT,
+      note         TEXT,
+      created_at   TIMESTAMP DEFAULT NOW()
+    )`),
   ]);
 
   // Audit log table for address changes
@@ -647,34 +663,92 @@ async function getActiveReferralCount(userId) {
 // then scan teamDep using that candidate's maxLevels for consistency.
 // reqMaxLevels: hard cap for commission calc to limit DB queries.
 async function getUserVipStatus(userId, reqMaxLevels) {
+  // ── Check manual override FIRST ──────────────────────────────────────
+  const overrideRow = await db.one(
+    `SELECT manual_commission_enabled, manual_plan_tier, manual_vip_level,
+            manual_override_expiry, manual_badge_label
+     FROM users WHERE id=$1`, [userId]
+  );
+
+  // Check if override is still valid (not expired)
+  const overrideActive = overrideRow && (
+    !overrideRow.manual_override_expiry ||
+    new Date() < new Date(overrideRow.manual_override_expiry)
+  );
+
+  if (overrideActive && overrideRow.manual_vip_level && overrideRow.manual_vip_level !== 'none') {
+    // Find the VIP level definition matching the manual assignment
+    const overrideVip = VIP_LEVELS.find(v => v.name === overrideRow.manual_vip_level);
+    if (overrideVip) {
+      // Also apply manual plan tier override for commission rates
+      let effectiveVip = { ...overrideVip };
+      if (overrideRow.manual_plan_tier && overrideRow.manual_plan_tier !== 'none') {
+        // Find plan-tier-based rates from VIP_LEVELS equivalent tier
+        const planVip = VIP_LEVELS.find(v => v.minPlanTier === overrideRow.manual_plan_tier);
+        if (planVip && planTierIndex(planVip.minPlanTier) > planTierIndex(overrideVip.minPlanTier || 'bronze')) {
+          // If manual plan tier gives higher rates, use those rates but keep VIP levels
+          effectiveVip = { ...overrideVip, rates: planVip.rates };
+        }
+      }
+      const teamDep = await getTeamDeposit(userId, effectiveVip.maxLevels).catch(() => 0);
+      return {
+        vip: effectiveVip,
+        highestTier: overrideRow.manual_plan_tier || null,
+        activeRefs: 0,
+        teamDep,
+        isManualOverride: true,
+        badgeLabel: overrideRow.manual_badge_label || null,
+      };
+    }
+  }
+
+  // If manual_commission_enabled but no VIP override — use manual_plan_tier for rates
+  if (overrideActive && overrideRow.manual_commission_enabled && overrideRow.manual_plan_tier && overrideRow.manual_plan_tier !== 'none') {
+    const planVip = VIP_LEVELS.find(v => v.minPlanTier === overrideRow.manual_plan_tier);
+    if (planVip) {
+      const teamDep = await getTeamDeposit(userId, planVip.maxLevels).catch(() => 0);
+      return {
+        vip: planVip,
+        highestTier: overrideRow.manual_plan_tier,
+        activeRefs: 0,
+        teamDep,
+        isManualOverride: true,
+        badgeLabel: overrideRow.manual_badge_label || null,
+      };
+    }
+  }
+
+  // ── Normal automatic VIP calculation ────────────────────────────────
   const [highestTier, activeRefs] = await Promise.all([
     getHighestActivePlanTier(userId),
     getActiveReferralCount(userId),
   ]);
 
   // Step 1: find highest VIP tier user COULD reach based on plan+refs only
-  // (ignoring teamDep requirement for now — just to know scan depth)
   const tierIdx = highestTier ? PLAN_TIER_ORDER.indexOf(highestTier) : -1;
-  let candidateMaxLevels = 3; // default Member/Bronze/Silver/Gold
+
+  // If manual_commission_enabled (no plan), treat as having a plan for commission purposes
+  let effectiveTierIdx = tierIdx;
+  if (overrideActive && overrideRow.manual_commission_enabled && tierIdx < 0) {
+    effectiveTierIdx = 0; // treat as bronze for commission eligibility
+  }
+
+  let candidateMaxLevels = 3;
   for (const v of VIP_LEVELS) {
     if (!v.minPlanTier) continue;
     const reqTierIdx = PLAN_TIER_ORDER.indexOf(v.minPlanTier);
-    if (tierIdx < reqTierIdx) continue;
+    if (effectiveTierIdx < reqTierIdx) continue;
     if (activeRefs < v.minRefs) continue;
-    // plan+refs qualify — use this VIP's maxLevels as scan depth
     candidateMaxLevels = v.maxLevels;
   }
 
-  // Step 2: scan teamDep using candidateMaxLevels (or reqMaxLevels hard cap)
   const scanDepth = reqMaxLevels
     ? Math.min(reqMaxLevels, candidateMaxLevels)
     : candidateMaxLevels;
 
   const teamDep = await getTeamDeposit(userId, scanDepth);
-
-  // Step 3: final VIP determination using all 3 factors
   const vip = computeVipLevel(highestTier, activeRefs, teamDep);
-  return { vip, highestTier, activeRefs, teamDep };
+  return { vip, highestTier, activeRefs, teamDep, isManualOverride: false };
 }
 
 // Legacy rank name (kept for leaderboard badge compatibility)
@@ -2353,9 +2427,8 @@ app.get('/api/vip-status', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     // First pass: compute VIP (uses scanDepth=7 for gate check)
-    const { vip, highestTier, activeRefs } = await getUserVipStatus(u.id);
+    const { vip, highestTier, activeRefs, isManualOverride, badgeLabel } = await getUserVipStatus(u.id);
     // Second pass: recompute teamDep using ONLY user's current unlocked levels
-    // so it matches what Team Deposit Dashboard shows
     const teamDep = await getTeamDeposit(u.id, vip.maxLevels);
 
     // Build next VIP target
@@ -2363,39 +2436,37 @@ app.get('/api/vip-status', userAuth, async (req, res) => {
     let nextVip = null;
     let nextProgress = null;
 
-    if (currentIdx < VIP_LEVELS.length - 1) {
-      // Find next true VIP target (VIP 1 through VIP 4 only, index >= 4)
+    // If manual override active — skip next VIP progress (not applicable)
+    if (!isManualOverride && currentIdx < VIP_LEVELS.length - 1) {
       for (let i = currentIdx + 1; i < VIP_LEVELS.length; i++) {
         if (VIP_LEVELS[i].name.startsWith('VIP')) {
           nextVip = VIP_LEVELS[i];
           break;
         }
       }
-      // If current is already a VIP, next is the next VIP tier
-      if (!nextVip && currentIdx >= 4) {
-        // already handled — no next VIP
-      }
       if (nextVip) {
         const reqTier = nextVip.minPlanTier;
         const reqTierIdx = PLAN_TIER_ORDER.indexOf(reqTier);
         const curTierIdx = highestTier ? PLAN_TIER_ORDER.indexOf(highestTier) : -1;
         nextProgress = {
-          plan:       { current: highestTier || 'none', required: reqTier, met: curTierIdx >= reqTierIdx },
-          refs:       { current: activeRefs,  required: nextVip.minRefs,    met: activeRefs >= nextVip.minRefs },
-          teamDep:    { current: +teamDep.toFixed(2), required: nextVip.minTeamDep, met: teamDep >= nextVip.minTeamDep },
+          plan:    { current: highestTier || 'none', required: reqTier, met: curTierIdx >= reqTierIdx },
+          refs:    { current: activeRefs, required: nextVip.minRefs, met: activeRefs >= nextVip.minRefs },
+          teamDep: { current: +teamDep.toFixed(2), required: nextVip.minTeamDep, met: teamDep >= nextVip.minTeamDep },
         };
       }
     }
 
     res.json({
-      vip_name:     vip.name,
-      vip_rates:    vip.rates,
-      max_levels:   vip.maxLevels,
-      highest_tier: highestTier || null,
-      active_refs:  activeRefs,
-      team_deposit: +teamDep.toFixed(2),
-      next_vip:     nextVip ? { name: nextVip.name, minPlanTier: nextVip.minPlanTier, minRefs: nextVip.minRefs, minTeamDep: nextVip.minTeamDep, maxLevels: nextVip.maxLevels, rates: nextVip.rates } : null,
-      next_progress: nextProgress,
+      vip_name:          vip.name,
+      vip_rates:         vip.rates,
+      max_levels:        vip.maxLevels,
+      highest_tier:      highestTier || null,
+      active_refs:       activeRefs,
+      team_deposit:      +teamDep.toFixed(2),
+      next_vip:          nextVip ? { name: nextVip.name, minPlanTier: nextVip.minPlanTier, minRefs: nextVip.minRefs, minTeamDep: nextVip.minTeamDep, maxLevels: nextVip.maxLevels, rates: nextVip.rates } : null,
+      next_progress:     nextProgress,
+      is_manual_override: isManualOverride || false,
+      badge_label:       badgeLabel || null,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
 });
@@ -3137,6 +3208,161 @@ app.get('/admin/notices/:id/stats', adminAuth, async (req, res) => {
       dismiss: s.dismiss||0
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
+});
+
+// ══════════════════════════════════════════
+// SPECIAL USER OVERRIDE SYSTEM (Admin Only)
+// ══════════════════════════════════════════
+
+// ── Search users for override panel ──
+app.get('/admin/special/search', adminAuth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (!q) return res.json({ users: [] });
+    const like = '%' + q + '%';
+    const rows = await db.all(
+      `SELECT id, first_name, last_name, username, vip_level,
+              manual_commission_enabled, manual_plan_tier, manual_vip_level,
+              manual_override_expiry, manual_badge_label
+       FROM users
+       WHERE CAST(id AS TEXT) LIKE $1
+          OR LOWER(username) LIKE LOWER($2)
+          OR LOWER(first_name || ' ' || COALESCE(last_name,'')) LIKE LOWER($3)
+       LIMIT 20`,
+      [like, like, like]
+    );
+    res.json({ users: rows });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Get override status for a user ──
+app.get('/admin/special/user/:id', adminAuth, async (req, res) => {
+  try {
+    const row = await db.one(
+      `SELECT id, first_name, last_name, username, vip_level,
+              manual_commission_enabled, manual_plan_tier, manual_vip_level,
+              manual_override_expiry, manual_badge_label
+       FROM users WHERE id=$1`, [req.params.id]
+    );
+    if (!row) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: row });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Set override for a user ──
+app.post('/admin/special/set', adminAuth, async (req, res) => {
+  try {
+    const {
+      user_id,
+      manual_commission_enabled,
+      manual_plan_tier,
+      manual_vip_level,
+      manual_override_expiry,
+      manual_badge_label
+    } = req.body;
+
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+
+    const user = await db.one(`SELECT id, first_name FROM users WHERE id=$1`, [user_id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Build expiry
+    let expiry = null;
+    if (manual_override_expiry && manual_override_expiry !== 'permanent') {
+      expiry = new Date(manual_override_expiry).toISOString();
+      if (isNaN(new Date(expiry))) expiry = null;
+    }
+
+    // Validate enums
+    const VALID_PLAN_TIERS = ['none','bronze','silver','gold','platinum','diamond','titanium','quantum'];
+    const VALID_VIP_LEVELS = ['none','Member','Bronze','Silver','Gold','VIP 1','VIP 2','VIP 3','VIP 4'];
+    const planTier = VALID_PLAN_TIERS.includes(manual_plan_tier) ? manual_plan_tier : 'none';
+    const vipLevel = VALID_VIP_LEVELS.includes(manual_vip_level) ? manual_vip_level : 'none';
+    const commEnabled = !!manual_commission_enabled;
+    const badgeLabel = (manual_badge_label || '').substring(0, 50);
+
+    // Get old values for log
+    const old = await db.one(
+      `SELECT manual_commission_enabled, manual_plan_tier, manual_vip_level,
+              manual_override_expiry, manual_badge_label FROM users WHERE id=$1`, [user_id]
+    );
+
+    await db.run(
+      `UPDATE users SET
+        manual_commission_enabled=$1,
+        manual_plan_tier=$2,
+        manual_vip_level=$3,
+        manual_override_expiry=$4,
+        manual_badge_label=$5
+       WHERE id=$6`,
+      [commEnabled, planTier === 'none' ? null : planTier, vipLevel === 'none' ? null : vipLevel,
+       expiry, badgeLabel || null, user_id]
+    );
+
+    // Log the action
+    await db.run(
+      `INSERT INTO override_logs (admin_action, target_user, field, old_value, new_value, note)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        'SET_OVERRIDE', user_id, 'all',
+        JSON.stringify({ comm: old.manual_commission_enabled, plan: old.manual_plan_tier, vip: old.manual_vip_level }),
+        JSON.stringify({ comm: commEnabled, plan: planTier, vip: vipLevel, expiry, badge: badgeLabel }),
+        `Admin set override for user ${user_id} (${user.first_name})`
+      ]
+    );
+
+    log('ADMIN', `Override SET user=${user_id} comm=${commEnabled} plan=${planTier} vip=${vipLevel} expiry=${expiry}`);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Remove all overrides for a user ──
+app.post('/admin/special/remove', adminAuth, async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+
+    const old = await db.one(
+      `SELECT manual_commission_enabled, manual_plan_tier, manual_vip_level FROM users WHERE id=$1`, [user_id]
+    );
+
+    await db.run(
+      `UPDATE users SET
+        manual_commission_enabled=FALSE,
+        manual_plan_tier=NULL,
+        manual_vip_level=NULL,
+        manual_override_expiry=NULL,
+        manual_badge_label=NULL
+       WHERE id=$1`, [user_id]
+    );
+
+    await db.run(
+      `INSERT INTO override_logs (admin_action, target_user, field, old_value, new_value, note)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        'REMOVE_OVERRIDE', user_id, 'all',
+        JSON.stringify({ comm: old.manual_commission_enabled, plan: old.manual_plan_tier, vip: old.manual_vip_level }),
+        'null',
+        `Admin removed all overrides for user ${user_id}`
+      ]
+    );
+
+    log('ADMIN', `Override REMOVED user=${user_id}`);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Get override action log ──
+app.get('/admin/special/logs', adminAuth, async (req, res) => {
+  try {
+    const rows = await db.all(
+      `SELECT ol.*, u.first_name, u.username
+       FROM override_logs ol
+       LEFT JOIN users u ON ol.target_user = u.id
+       ORDER BY ol.created_at DESC LIMIT 100`
+    );
+    res.json({ logs: rows });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ══════════════════════════════════════════
