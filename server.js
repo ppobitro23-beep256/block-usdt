@@ -2502,7 +2502,7 @@ async function generateUniqueAmt(base) {
   // ✅ FIX: expanded from 5 → 99 possible suffix values (0.01–0.99)
   // This dramatically reduces collision chance when many deposits are pending
   for (let i = 0; i < 99; i++) {
-    const dec  = (Math.floor(Math.random() * 99) + 1); // 1–99
+    const dec  = (Math.floor(Math.random() * 5) + 1); // 1–5 cents (0.01–0.05)
     const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
@@ -2692,7 +2692,7 @@ app.post('/webhook/moralis-deposit',
         // Match against pending deposits
         for (const dep of pending) {
           if (dep._matched) continue;
-          if (Math.abs(txAmt - dep.unique_amt) > 0.02) continue;
+          if (Math.abs(txAmt - dep.unique_amt) > 0.05) continue;
 
           if (new Date() > new Date(dep.expires_at)) {
             await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
@@ -2761,7 +2761,7 @@ async function scanBEP20() {
           txAmt = parseFloat(tx.value) / 1e18;
         } else continue;
         if (isNaN(txAmt) || txAmt <= 0) continue;
-        if (Math.abs(txAmt - dep.unique_amt) > 0.02) continue;
+        if (Math.abs(txAmt - dep.unique_amt) > 0.05) continue;
 
         if (new Date() > new Date(dep.expires_at)) {
           await db.run(`UPDATE auto_deposits SET status='expired' WHERE id=$1`, [dep.id]);
