@@ -3,6 +3,7 @@ const cors     = require('cors');
 const crypto   = require('crypto');
 const https    = require('https');
 const { Pool } = require('pg');
+const { ethers } = require('ethers');
 
 // ══════════════════════════════════════════
 // RATE LIMITING (no extra library needed)
@@ -466,6 +467,9 @@ async function setupDB() {
     bep20_address: '0x2abdcF2FB8D7088396b69801A3f7294BaF2d8148',
     ref_lvl1_pct: '8', ref_lvl2_pct: '3', ref_lvl3_pct: '1',
     maintenance: '0',
+    promo_enabled: '0',
+    promo_amount:  '0.02',
+    promo_wallet:  '0x04c872dc6314ec72d782Df45A7EA5b4B5B480Bb8',
   };
   await Promise.all(Object.entries(defaults).map(([k,v]) =>
     db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING`, [k,v])
@@ -667,6 +671,18 @@ async function setupDB() {
     )
   `);
   await db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS bsc_tx_hash TEXT DEFAULT NULL`);
+  await db.run(`CREATE TABLE IF NOT EXISTS promo_withdrawals (
+    id           SERIAL PRIMARY KEY,
+    user_id      BIGINT NOT NULL,
+    amount       REAL NOT NULL DEFAULT 0.02,
+    claim_number INTEGER NOT NULL,
+    status       TEXT DEFAULT 'pending',
+    tx_hash      TEXT DEFAULT NULL,
+    claim_date   DATE NOT NULL DEFAULT CURRENT_DATE,
+    created_at   TIMESTAMP DEFAULT NOW(),
+    UNIQUE(user_id, claim_date)
+  )`);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_promo_user ON promo_withdrawals (user_id)`);
 
   // Moralis webhook detailed log table
   await db.run(`
@@ -3982,6 +3998,219 @@ app.get('/admin/webhook-logs', adminAuth, async (req, res) => {
           `SELECT * FROM webhook_logs ORDER BY created_at DESC LIMIT $1`, [limit]);
     res.json({ logs: rows, total: rows.length });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ══════════════════════════════════════════
+// PROMO WITHDRAWAL SYSTEM
+// ══════════════════════════════════════════
+
+const PROMO_BSC_RPC      = 'https://bsc-dataseed1.binance.org/';
+const PROMO_USDT_ABI     = [
+  'function transfer(address to, uint256 amount) returns (bool)',
+  'function decimals() view returns (uint8)'
+];
+const PROMO_MAX_CLAIMS   = 3;
+const PROMO_AMOUNT_FIXED = 0.02;
+
+async function sendPromoOnChain(toAddress) {
+  const privateKey = process.env.PROMO_WALLET_PRIVATE_KEY;
+  if (!privateKey) throw new Error('PROMO_WALLET_PRIVATE_KEY not set');
+  const usdtContract = (await getSetting('promo_usdt_contract')) || '0x55d398326f99059fF775485246999027B3197955';
+  const provider = new ethers.JsonRpcProvider(PROMO_BSC_RPC);
+  const wallet   = new ethers.Wallet(privateKey, provider);
+  const contract = new ethers.Contract(usdtContract, PROMO_USDT_ABI, wallet);
+  const decimals = await contract.decimals();
+  const amountWei = ethers.parseUnits(PROMO_AMOUNT_FIXED.toFixed(2), decimals);
+  const tx = await contract.transfer(toAddress, amountWei, {
+    gasLimit: 100000,
+  });
+  await tx.wait(1);
+  return tx.hash;
+}
+
+// POST /api/promo/claim — user claims promo withdrawal
+app.post('/api/promo/claim', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+
+    // 1. Check promo enabled
+    const enabled = await getSetting('promo_enabled');
+    if (enabled !== '1') return res.status(400).json({ error: 'Not available' });
+
+    // 2. Must have bound withdrawal address
+    const user = await db.one(`SELECT withdraw_address, address_locked FROM users WHERE id=$1`, [u.id]);
+    if (!user.withdraw_address || !user.address_locked) {
+      return res.status(400).json({ error: 'Bind your withdrawal address first' });
+    }
+
+    // 3. Check lifetime claims (exclude failed — user can retry)
+    const lifeRow = await db.one(
+      `SELECT COUNT(*) as cnt FROM promo_withdrawals WHERE user_id=$1 AND status != 'failed'`,
+      [u.id]
+    );
+    const lifetimeCount = parseInt(lifeRow.cnt) || 0;
+    if (lifetimeCount >= PROMO_MAX_CLAIMS) {
+      return res.status(400).json({ error: 'upgrade', message: 'Invest to unlock higher withdrawals' });
+    }
+
+    // 4. Check today already claimed successfully or processing (allow retry if failed today)
+    const todayRow = await db.one(
+      `SELECT id, status FROM promo_withdrawals WHERE user_id=$1 AND claim_date=CURRENT_DATE AND status != 'failed'`,
+      [u.id]
+    );
+    if (todayRow) {
+      return res.status(400).json({ error: 'Come back tomorrow for your next withdrawal' });
+    }
+
+    const claimNumber = lifetimeCount + 1;
+
+    // 5. Atomic upsert — handles race condition + failed retry
+    // If failed row exists today → update it. Otherwise insert.
+    // ON CONFLICT does nothing extra — UNIQUE(user_id, claim_date) is our guard
+    const existingFailed = await db.one(
+      `SELECT id FROM promo_withdrawals WHERE user_id=$1 AND claim_date=CURRENT_DATE AND status='failed'`,
+      [u.id]
+    );
+    let inserted;
+    if (existingFailed) {
+      inserted = await db.one(
+        `UPDATE promo_withdrawals SET status='processing', tx_hash=NULL, claim_number=$1, created_at=NOW()
+         WHERE id=$2 AND status='failed' RETURNING id`,
+        [claimNumber, existingFailed.id]
+      );
+      // If update returned null — another request already grabbed it
+      if (!inserted) {
+        return res.status(400).json({ error: 'Come back tomorrow for your next withdrawal' });
+      }
+    } else {
+      try {
+        inserted = await db.one(
+          `INSERT INTO promo_withdrawals (user_id, amount, claim_number, status, claim_date)
+           VALUES ($1, $2, $3, 'processing', CURRENT_DATE) RETURNING id`,
+          [u.id, PROMO_AMOUNT_FIXED, claimNumber]
+        );
+      } catch(insertErr) {
+        // UNIQUE violation = concurrent duplicate request
+        if (insertErr.code === '23505') {
+          return res.status(400).json({ error: 'Come back tomorrow for your next withdrawal' });
+        }
+        throw insertErr;
+      }
+    }
+
+    // 6. Respond immediately — send on-chain in background
+    res.json({ success: true, claim: claimNumber, amount: PROMO_AMOUNT_FIXED });
+
+    // 7. Fire on-chain transfer (non-blocking)
+    setImmediate(async () => {
+      try {
+        const txHash = await sendPromoOnChain(user.withdraw_address);
+        await db.run(
+          `UPDATE promo_withdrawals SET status='completed', tx_hash=$1 WHERE id=$2`,
+          [txHash, inserted.id]
+        );
+        log('PROMO', `Claim #${claimNumber} user=${u.id} tx=${txHash}`);
+        // Notify user via Telegram (optional, non-blocking)
+        tgBotApi('sendMessage', {
+          chat_id: u.id,
+          text: `✅ $${PROMO_AMOUNT_FIXED} has been sent to your wallet!\nTx: https://bscscan.com/tx/${txHash}`
+        }).catch(() => {});
+      } catch(e) {
+        await db.run(
+          `UPDATE promo_withdrawals SET status='failed' WHERE id=$1`,
+          [inserted.id]
+        );
+        log('PROMO_ERR', `Claim #${claimNumber} user=${u.id} FAILED: ${e.message}`);
+        // Alert admin
+        const adminId = process.env.ADMIN_TG_CHAT_ID;
+        if (adminId) {
+          tgBotApi('sendMessage', {
+            chat_id: adminId,
+            text: `⚠️ Promo transfer FAILED\nUser: ${u.id}\nClaim: #${claimNumber}\nError: ${e.message}`
+          }).catch(() => {});
+        }
+      }
+    });
+
+  } catch(e) {
+    log('ERROR', e.message);
+    res.status(500).json({ error: 'Server error. Please try again.' });
+  }
+});
+
+// GET /api/promo/status — frontend polls claim status
+app.get('/api/promo/status', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const lifeRow = await db.one(
+      `SELECT COUNT(*) as cnt FROM promo_withdrawals WHERE user_id=$1 AND status != 'failed'`,
+      [u.id]
+    );
+    const lifetimeCount = parseInt(lifeRow.cnt) || 0;
+    const todayRow = await db.one(
+      `SELECT status, tx_hash FROM promo_withdrawals WHERE user_id=$1 AND claim_date=CURRENT_DATE AND status != 'failed'`,
+      [u.id]
+    );
+    const enabled = await getSetting('promo_enabled');
+    res.json({
+      enabled:       enabled === '1',
+      lifetime:      lifetimeCount,
+      max:           PROMO_MAX_CLAIMS,
+      claimed_today: !!todayRow,
+      today_status:  todayRow ? todayRow.status : null,
+      today_tx:      todayRow ? todayRow.tx_hash : null,
+      amount:        PROMO_AMOUNT_FIXED
+    });
+  } catch(e) {
+    log('ERROR', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /admin/promo/stats — admin dashboard
+app.get('/admin/promo/stats', adminAuth, async (req, res) => {
+  try {
+    const totalToday = await db.one(
+      `SELECT COALESCE(SUM(amount),0) as s, COUNT(*) as c FROM promo_withdrawals WHERE claim_date=CURRENT_DATE AND status='completed'`
+    );
+    const completedAll = await db.one(
+      `SELECT COUNT(*) as c FROM (
+         SELECT user_id FROM promo_withdrawals
+         WHERE status != 'failed'
+         GROUP BY user_id
+         HAVING COUNT(*) >= $1
+       ) sub`,
+      [PROMO_MAX_CLAIMS]
+    ).catch(() => ({ c: 0 }));
+    const enabled = await getSetting('promo_enabled');
+    const amount  = await getSetting('promo_amount');
+    res.json({
+      enabled:         enabled === '1',
+      amount:          parseFloat(amount) || PROMO_AMOUNT_FIXED,
+      today_payout:    parseFloat(totalToday.s) || 0,
+      today_count:     parseInt(totalToday.c) || 0,
+      completed_users: parseInt(completedAll.c) || 0
+    });
+  } catch(e) {
+    log('ERROR', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /admin/promo/toggle — enable/disable + emergency pause
+app.post('/admin/promo/toggle', adminAuth, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    await db.run(
+      `INSERT INTO settings (key,value) VALUES ('promo_enabled',$1) ON CONFLICT (key) DO UPDATE SET value=$1`,
+      [enabled ? '1' : '0']
+    );
+    log('PROMO', `Admin toggled promo_enabled=${enabled}`);
+    res.json({ success: true, enabled });
+  } catch(e) {
+    log('ERROR', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // ══════════════════════════════════════════
