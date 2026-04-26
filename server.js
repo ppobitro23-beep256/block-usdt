@@ -4154,8 +4154,7 @@ app.get('/api/promo/status', userAuth, async (req, res) => {
     const enabled = await getSetting('promo_enabled');
     res.json({
       enabled:       enabled === '1',
-      lifetime:      lifetimeCount,
-      max:           PROMO_MAX_CLAIMS,
+      promo_done:    lifetimeCount >= PROMO_MAX_CLAIMS,  // backend tells frontend — no numbers exposed
       claimed_today: !!todayRow,
       today_status:  todayRow ? todayRow.status : null,
       today_tx:      todayRow ? todayRow.tx_hash : null,
