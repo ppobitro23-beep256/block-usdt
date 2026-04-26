@@ -1153,6 +1153,148 @@ app.post('/api/auth', authLimit, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════
+// BOOTSTRAP — Single fast startup endpoint
+// Combines auth + user data in one request
+// ══════════════════════════════════════════
+app.post('/api/bootstrap', authLimit, async (req, res) => {
+  try {
+    // ── 1. Verify initData ──────────────────────────────
+    const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
+    if (BOT_TOKEN && raw && raw.length > 10 && process.env.NODE_ENV !== 'development') {
+      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+      if (!verifyTg(raw, `POST /api/bootstrap ip=${ip}`)) {
+        return res.status(401).json({ error: 'Invalid session' });
+      }
+    }
+
+    // ── 2. Parse user ───────────────────────────────────
+    let u = null;
+    if (raw && raw.length > 10) {
+      try { const p = new URLSearchParams(raw); const us = p.get('user'); if (us) u = JSON.parse(us); } catch(e) {}
+    }
+    if (!u || !u.id) u = req.body?.tgUser || null;
+    if (!u || !u.id) return res.status(400).json({ error: 'No user data' });
+
+    const uid     = u.id;
+    const refCode = 'REF' + uid;
+    const ref     = req.body?.ref || null;
+    const refById = ref && String(ref).startsWith('REF') ? parseInt(String(ref).replace('REF','')) || null : null;
+    const finalRef = (refById && refById !== uid) ? refById : null;
+
+    // ── 3. Check pending ref ────────────────────────────
+    let pendingRef = finalRef;
+    if (!pendingRef) {
+      const pr = await db.one('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
+      if (pr) {
+        const prid = parseInt(String(pr.ref_code).replace('REF',''));
+        if (prid && prid !== uid) pendingRef = prid;
+      }
+    }
+
+    // ── 4. Upsert user ──────────────────────────────────
+    await db.run(`
+      INSERT INTO users (id,first_name,last_name,username,language,is_premium,ref_code,referred_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (id) DO UPDATE SET
+        first_name=CASE WHEN EXCLUDED.first_name != '' THEN EXCLUDED.first_name ELSE users.first_name END,
+        last_name=CASE WHEN EXCLUDED.last_name != '' THEN EXCLUDED.last_name ELSE users.last_name END,
+        username=CASE WHEN EXCLUDED.username != '' THEN EXCLUDED.username ELSE users.username END,
+        language=EXCLUDED.language, is_premium=EXCLUDED.is_premium,
+        referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
+    `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
+
+    await db.run('DELETE FROM pending_refs WHERE user_id=$1', [uid]).catch(()=>{});
+
+    let user = await db.one('SELECT * FROM users WHERE id=$1', [uid]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.uid) {
+      const newUID = generateUID();
+      await db.run('UPDATE users SET uid=$1 WHERE id=$2', [newUID, uid]);
+      user.uid = newUID;
+    }
+    if (user.is_banned) return res.status(403).json({ error: 'banned', reason: user.ban_reason || '' });
+
+    // ── 5. Parallel data fetch ──────────────────────────
+    const [investments, transactions, taskRows, referrals, plansRows, settingRows, activeRefRow] = await Promise.all([
+      db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect
+              FROM investments WHERE user_id=$1 AND status='active'`, [uid]),
+      db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [uid]),
+      db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [uid]),
+      db.all(`SELECT r.id, r.first_name, r.username, r.created_at,
+                COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=r.id AND type='deposit' AND status='approved'),0) as total_deposit
+              FROM users r WHERE r.referred_by=$1 ORDER BY r.created_at DESC LIMIT 50`, [uid]),
+      db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY min_amt ASC`),
+      db.all(`SELECT key,value FROM settings`),
+      db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1
+              AND id IN (SELECT DISTINCT user_id FROM transactions WHERE type='deposit' AND status='approved')`, [uid]),
+    ]);
+
+    const settings = {};
+    (settingRows || []).forEach(function(r) { settings[r.key] = r.value; });
+
+    // Plan today_count
+    const planCounts = await db.all(
+      `SELECT plan_name, COUNT(*) as c FROM investments
+       WHERE user_id=$1 AND created_at >= NOW() - INTERVAL '24 hours' GROUP BY plan_name`, [uid]
+    ).catch(() => []);
+    const countMap = {};
+    planCounts.forEach(function(r) { countMap[r.plan_name] = parseInt(r.c) || 0; });
+
+    const plansOut = (plansRows || []).map(function(p) {
+      return Object.assign({}, p, { today_count: countMap[p.name] || 0 });
+    });
+
+    // Referral commission
+    const pendingComm = parseFloat(user.pending_commission || 0);
+
+    // VIP status (non-blocking — same as /api/user/:id)
+    let vipData = null;
+    try {
+      const vs = await getUserVipStatus(uid);
+      vipData = {
+        vip_name:     vs.vip.name,
+        vip_rates:    vs.vip.rates,
+        max_levels:   vs.vip.maxLevels,
+        highest_tier: vs.highestTier || null,
+        team_deposit: +vs.teamDep.toFixed(2),
+      };
+      db.run(`UPDATE users SET vip_level=$1, vip_updated_at=NOW() WHERE id=$2`, [vs.vip.name, uid]).catch(()=>{});
+    } catch(e) { log('WARN', 'Bootstrap VIP skipped: ' + e.message); }
+
+    // ── 6. Single response ──────────────────────────────
+    res.json({
+      success: true,
+      user: {
+        id: user.id, uid: user.uid,
+        first_name: user.first_name, last_name: user.last_name,
+        username: user.username, balance: parseFloat(user.balance) || 0,
+        total_earned: parseFloat(user.total_earned) || 0,
+        today_earned: parseFloat(user.today_earned) || 0,
+        ref_code: user.ref_code,
+        pending_commission: pendingComm,
+        total_commission: parseFloat(user.total_commission || 0),
+        app_language: user.app_language || null,
+        is_banned: user.is_banned || 0,
+        withdraw_address: user.withdraw_address || null,
+        address_locked: !!user.address_locked,
+      },
+      investments,
+      transactions,
+      tasks: (taskRows || []).map(function(r) { return r.task_key; }),
+      referrals,
+      active_referrals: parseInt((activeRefRow || {}).c) || 0,
+      plans: plansOut,
+      settings,
+      vip: vipData,
+    });
+
+  } catch(e) {
+    log('ERROR', 'Bootstrap error: ' + e.message);
+    res.status(500).json({ error: 'Server error. Please try again.' });
+  }
+});
+
 app.get('/api/user/:id', async (req, res) => {
   // IDOR guard: if initData header is present, verify it and ensure user matches
   // Frontend intentionally omits header on this GET to avoid CORS preflight (Telegram WebView quirk)
