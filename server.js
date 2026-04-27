@@ -2318,29 +2318,49 @@ app.get('/admin/user-detail/:id', adminAuth, async (req, res) => {
   try {
     const uid = parseInt(req.params.id);
     if (!uid) return res.status(400).json({ error: 'Invalid user id' });
-    const [user, investments, promoClaims, depRow, withRow] = await Promise.all([
-      db.one(`SELECT id, first_name, last_name, username, balance, created_at FROM users WHERE id=$1`, [uid]),
-      db.all(`SELECT plan_name, amount, daily_pct, created_at FROM investments WHERE user_id=$1 AND status='active' ORDER BY created_at DESC`, [uid]),
-      db.one(`SELECT COUNT(*) as c FROM promo_withdrawals WHERE user_id=$1 AND status != 'failed'`, [uid]),
-      db.one(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [uid]),
-      db.one(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='approved'`, [uid]),
-    ]);
+
+    // Each query independent — one failure never crashes the whole modal
+    const user = await db.one(
+      `SELECT id, first_name, last_name, username, balance, created_at FROM users WHERE id=$1`, [uid]
+    ).catch(e => { log('WARN', 'user-detail user query: ' + e.message); return null; });
+
     if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const investments = await db.all(
+      `SELECT plan_name, amount, daily_pct, created_at FROM investments WHERE user_id=$1 AND status='active' ORDER BY created_at DESC`, [uid]
+    ).catch(() => []);
+
+    const depRow = await db.one(
+      `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [uid]
+    ).catch(() => ({ total: 0 }));
+
+    const withRow = await db.one(
+      `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='approved'`, [uid]
+    ).catch(() => ({ total: 0 }));
+
+    const promoClaims = await db.one(
+      `SELECT COUNT(*) as c FROM promo_withdrawals WHERE user_id=$1 AND status != 'failed'`, [uid]
+    ).catch(() => ({ c: 0 }));
+
     res.json({
       user: {
-        id: user.id,
-        name: (user.first_name||'') + (user.last_name ? ' '+user.last_name : ''),
+        id:       user.id,
+        name:     (user.first_name || '') + (user.last_name ? ' ' + user.last_name : ''),
         username: user.username || null,
-        balance: parseFloat(user.balance) || 0,
-        joined: user.created_at,
+        balance:  parseFloat(user.balance) || 0,
+        joined:   user.created_at,
       },
-      investments,
-      total_invested:  investments.reduce((s,i) => s + parseFloat(i.amount||0), 0),
-      total_deposited: parseFloat(depRow.total)   || 0,
-      total_withdrawn: parseFloat(withRow.total)  || 0,
-      promo_claims:    parseInt(promoClaims.c)    || 0,
+      investments:     investments || [],
+      total_invested:  (investments || []).reduce((s, i) => s + (parseFloat(i.amount) || 0), 0),
+      total_deposited: parseFloat((depRow  && depRow.total)  || 0),
+      total_withdrawn: parseFloat((withRow && withRow.total) || 0),
+      promo_claims:    parseInt((promoClaims && promoClaims.c) || 0),
     });
-  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
+
+  } catch(e) {
+    log('ERROR', 'user-detail crash: ' + e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
 });
 
 app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
