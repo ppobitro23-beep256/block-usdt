@@ -228,34 +228,42 @@ async function sendWithdrawProof(txData) {
       [withdraw_id]
     );
     if (existing.length > 0 && existing[0].sent_status === 'sent') {
-      // Already sent successfully — only re-send if now we have a tx_hash that wasn't there before
       if (!bsc_tx_hash || !bsc_tx_hash.trim()) return;
-      // Check if previously sent version had no tx_hash (error_msg stores context)
-      // We allow one re-send with tx_hash for better proof
       const alreadyHasTx = await db.all(
         `SELECT id FROM tg_proof_logs WHERE withdraw_id=$1 AND sent_status='sent' AND error_msg LIKE '%has_tx%'`,
         [withdraw_id]
       );
-      if (alreadyHasTx.length > 0) return; // already sent with tx_hash
+      if (alreadyHasTx.length > 0) return;
     }
-    // HTML-escape user-supplied strings to prevent broken Telegram HTML
-    const safeName    = username ? '@' + tgEscape(username) : tgEscape(first_name || 'No Username');
+
+    // Mask username: @pho****kes
+    function maskUsername(u) {
+      if (!u) return null;
+      var clean = u.replace(/^@/, '');
+      if (clean.length <= 4) return '@' + clean;
+      var show = Math.max(2, Math.floor(clean.length * 0.35));
+      return '@' + clean.slice(0, show) + '****' + clean.slice(-Math.max(2, Math.floor(clean.length * 0.2)));
+    }
+
+    const safeName    = tgEscape(first_name || 'Unknown');
+    const maskedUser  = username ? maskUsername(username) : null;
     const safeAddr    = address ? address.slice(0,8) + '...' + address.slice(-6) : 'N/A';
     const now         = new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka', hour12: false });
 
     let msg =
       `💸 <b>Withdrawal Paid</b>\n` +
-      `👤 Username: <b>${safeName}</b>\n` +
-      `🆔 User ID: <code>${user_id}</code>\n` +
+      `👤 Name: <b>${safeName}</b>\n` +
+      (maskedUser ? `📛 Username: <b>${tgEscape(maskedUser)}</b>\n` : '') +
+      `🆔 ID: <code>${user_id}</code>\n` +
       `💰 Amount: <b>${parseFloat(amount).toFixed(2)} USDT</b>\n` +
       `🌐 Network: BEP20 (BSC)\n` +
-      `🏦 Wallet: <code>${safeAddr}</code>\n` +
-      `⏰ Time: ${now}`;
+      `🏦 Wallet: <code>${safeAddr}</code>\n`;
 
     if (bsc_tx_hash && bsc_tx_hash.trim()) {
-      msg += `\n🔗 Verify on BscScan:\nhttps://bscscan.com/tx/${bsc_tx_hash.trim()}`;
+      msg += `🔗 TXID: <code>${bsc_tx_hash.trim()}</code>\n`;
+      msg += `🔗 BscScan: https://bscscan.com/tx/${bsc_tx_hash.trim()}\n`;
     }
-    msg += `\n\n✅ Successfully Sent`;
+    msg += `⏰ Time: ${now}\n✅ Successfully Sent`;
 
     const payload = {
       chat_id:    cfg.chatId,
@@ -468,7 +476,7 @@ async function setupDB() {
     ref_lvl1_pct: '8', ref_lvl2_pct: '3', ref_lvl3_pct: '1',
     maintenance: '0',
     promo_enabled: '0',
-    promo_amount:  '0.02',
+    promo_amount:  '0.005',
     promo_wallet:  '0x04c872dc6314ec72d782Df45A7EA5b4B5B480Bb8',
   };
   await Promise.all(Object.entries(defaults).map(([k,v]) =>
@@ -674,7 +682,7 @@ async function setupDB() {
   await db.run(`CREATE TABLE IF NOT EXISTS promo_withdrawals (
     id           SERIAL PRIMARY KEY,
     user_id      BIGINT NOT NULL,
-    amount       REAL NOT NULL DEFAULT 0.02,
+    amount       REAL NOT NULL DEFAULT 0.005,
     claim_number INTEGER NOT NULL,
     status       TEXT DEFAULT 'pending',
     tx_hash      TEXT DEFAULT NULL,
@@ -2277,15 +2285,62 @@ app.post('/admin/user/balance', adminAuth, async (req, res) => {
 
 app.get('/admin/transactions', adminAuth, async (req, res) => {
   try {
-    const {type, status, limit=50} = req.query;
-    let q = `SELECT t.*, u.first_name, u.username FROM transactions t LEFT JOIN users u ON t.user_id=u.id WHERE 1=1`;
+    const { type, status, limit=20, page=1, search='' } = req.query;
+    const pageNum  = Math.max(1, parseInt(page)  || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 20));
+    const offset   = (pageNum - 1) * limitNum;
+
     const params = [];
-    if (type)   { params.push(type);   q += ` AND t.type=$${params.length}`; }
-    if (status) { params.push(status); q += ` AND t.status=$${params.length}`; }
-    params.push(limit); q += ` ORDER BY t.created_at DESC LIMIT $${params.length}`;
-    const txs = await db.all(q, params);
-    res.json({transactions: txs});
+    let where = 'WHERE 1=1';
+    if (type)   { params.push(type);   where += ` AND t.type=$${params.length}`; }
+    if (status) { params.push(status); where += ` AND t.status=$${params.length}`; }
+    if (search && search.trim()) {
+      params.push('%' + search.trim() + '%');
+      const i = params.length;
+      where += ` AND (u.username ILIKE $${i} OR u.first_name ILIKE $${i} OR CAST(t.user_id AS TEXT) LIKE $${i})`;
+    }
+
+    const baseQ = `FROM transactions t LEFT JOIN users u ON t.user_id=u.id ${where}`;
+    const countRow = await db.one(`SELECT COUNT(*) as total ${baseQ}`, params).catch(() => ({ total: 0 }));
+    const total    = parseInt((countRow && countRow.total) || 0);
+
+    const dataParams = [...params, limitNum, offset];
+    const txs = await db.all(
+      `SELECT t.*, u.first_name, u.last_name, u.username ${baseQ} ORDER BY t.created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+      dataParams
+    );
+    res.json({ transactions: txs, total, page: pageNum, limit: limitNum, pages: Math.max(1, Math.ceil(total / limitNum)) });
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// GET /admin/user-detail/:id — withdrawal popup detail
+app.get('/admin/user-detail/:id', adminAuth, async (req, res) => {
+  try {
+    const uid = parseInt(req.params.id);
+    if (!uid) return res.status(400).json({ error: 'Invalid user id' });
+    const [user, investments, promoClaims, depRow, withRow] = await Promise.all([
+      db.one(`SELECT id, first_name, last_name, username, balance, created_at FROM users WHERE id=$1`, [uid]),
+      db.all(`SELECT plan_name, amount, daily_pct, created_at FROM investments WHERE user_id=$1 AND status='active' ORDER BY created_at DESC`, [uid]),
+      db.one(`SELECT COUNT(*) as c FROM promo_withdrawals WHERE user_id=$1 AND status != 'failed'`, [uid]),
+      db.one(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [uid]),
+      db.one(`SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='approved'`, [uid]),
+    ]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({
+      user: {
+        id: user.id,
+        name: (user.first_name||'') + (user.last_name ? ' '+user.last_name : ''),
+        username: user.username || null,
+        balance: parseFloat(user.balance) || 0,
+        joined: user.created_at,
+      },
+      investments,
+      total_invested:  investments.reduce((s,i) => s + parseFloat(i.amount||0), 0),
+      total_deposited: parseFloat(depRow.total)   || 0,
+      total_withdrawn: parseFloat(withRow.total)  || 0,
+      promo_claims:    parseInt(promoClaims.c)    || 0,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error. Please try again.' }); }
 });
 
 app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
@@ -4152,7 +4207,7 @@ const PROMO_USDT_ABI     = [
   'function decimals() view returns (uint8)'
 ];
 const PROMO_MAX_CLAIMS   = 3;
-const PROMO_AMOUNT_FIXED = 0.02;
+const PROMO_AMOUNT_FIXED = 0.005;
 
 async function sendPromoOnChain(toAddress) {
   const privateKey = process.env.PROMO_WALLET_PRIVATE_KEY;
@@ -4162,7 +4217,7 @@ async function sendPromoOnChain(toAddress) {
   const wallet   = new ethers.Wallet(privateKey, provider);
   const contract = new ethers.Contract(usdtContract, PROMO_USDT_ABI, wallet);
   const decimals = await contract.decimals();
-  const amountWei = ethers.parseUnits(PROMO_AMOUNT_FIXED.toFixed(2), decimals);
+  const amountWei = ethers.parseUnits(PROMO_AMOUNT_FIXED.toFixed(3), decimals);
   const tx = await contract.transfer(toAddress, amountWei, {
     gasLimit: 100000,
   });
@@ -4311,26 +4366,43 @@ app.get('/api/promo/status', userAuth, async (req, res) => {
 // GET /admin/promo/stats — admin dashboard
 app.get('/admin/promo/stats', adminAuth, async (req, res) => {
   try {
-    const totalToday = await db.one(
-      `SELECT COALESCE(SUM(amount),0) as s, COUNT(*) as c FROM promo_withdrawals WHERE claim_date=CURRENT_DATE AND status='completed'`
-    );
-    const completedAll = await db.one(
-      `SELECT COUNT(*) as c FROM (
-         SELECT user_id FROM promo_withdrawals
-         WHERE status != 'failed'
-         GROUP BY user_id
-         HAVING COUNT(*) >= $1
-       ) sub`,
-      [PROMO_MAX_CLAIMS]
-    ).catch(() => ({ c: 0 }));
-    const enabled = await getSetting('promo_enabled');
-    const amount  = await getSetting('promo_amount');
+    const [todayRow, completedAll, lastClaimRow, recentClaims, enabled, amount] = await Promise.all([
+      // Today's stats
+      db.one(`SELECT
+        COALESCE(SUM(amount),0) as total_paid,
+        COUNT(*) as claim_count,
+        COUNT(DISTINCT user_id) as unique_users
+        FROM promo_withdrawals
+        WHERE claim_date=CURRENT_DATE AND status IN ('completed','processing')`),
+      // Completed users (3/3)
+      db.one(`SELECT COUNT(*) as c FROM (
+        SELECT user_id FROM promo_withdrawals
+        WHERE status != 'failed'
+        GROUP BY user_id HAVING COUNT(*) >= $1
+      ) sub`, [PROMO_MAX_CLAIMS]),
+      // Last claim time
+      db.one(`SELECT created_at, status FROM promo_withdrawals ORDER BY created_at DESC LIMIT 1`),
+      // Last 10 claims with user info
+      db.all(`SELECT p.id, p.user_id, p.amount, p.claim_number, p.status, p.tx_hash,
+              p.claim_date, p.created_at,
+              u.first_name, u.username
+              FROM promo_withdrawals p
+              LEFT JOIN users u ON u.id = p.user_id
+              ORDER BY p.created_at DESC LIMIT 10`),
+      getSetting('promo_enabled'),
+      getSetting('promo_amount'),
+    ]);
+
     res.json({
       enabled:         enabled === '1',
       amount:          parseFloat(amount) || PROMO_AMOUNT_FIXED,
-      today_payout:    parseFloat(totalToday.s) || 0,
-      today_count:     parseInt(totalToday.c) || 0,
-      completed_users: parseInt(completedAll.c) || 0
+      today_paid:      parseFloat(todayRow.total_paid) || 0,
+      today_count:     parseInt(todayRow.claim_count)  || 0,
+      today_unique:    parseInt(todayRow.unique_users) || 0,
+      completed_users: parseInt(completedAll.c)        || 0,
+      last_claim_time: lastClaimRow ? lastClaimRow.created_at : null,
+      last_claim_status: lastClaimRow ? lastClaimRow.status   : null,
+      recent_claims:   recentClaims || [],
     });
   } catch(e) {
     log('ERROR', e.message);
