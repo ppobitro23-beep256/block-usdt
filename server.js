@@ -1224,7 +1224,7 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     if (user.is_banned) return res.status(403).json({ error: 'banned', reason: user.ban_reason || '' });
 
     // ── 5. Parallel data fetch ──────────────────────────
-    const [investments, transactions, taskRows, referrals, plansRows, settingRows, activeRefRow] = await Promise.all([
+    const [investments, transactions, taskRows, referrals, plansRows, settingRows, activeRefRow, totalL1Row, activeL1Row] = await Promise.all([
       db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect
               FROM investments WHERE user_id=$1 AND status='active'`, [uid]),
       db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [uid]),
@@ -1236,6 +1236,12 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
       db.all(`SELECT key,value FROM settings`),
       db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1
               AND id IN (SELECT DISTINCT user_id FROM transactions WHERE type='deposit' AND status='approved')`, [uid]),
+      // TRUE total count — no LIMIT
+      db.one(`SELECT COUNT(*) as total FROM users WHERE referred_by=$1`, [uid]),
+      // TRUE active L1 count — has active investment
+      db.one(`SELECT COUNT(DISTINCT u.id) as active FROM users u
+              JOIN investments i ON i.user_id = u.id
+              WHERE u.referred_by=$1 AND i.status='active'`, [uid]),
     ]);
 
     const settings = {};
@@ -1292,6 +1298,9 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
       tasks: (taskRows || []).map(function(r) { return r.task_key; }),
       referrals,
       active_referrals: parseInt((activeRefRow || {}).c) || 0,
+      // Accurate counts — not affected by LIMIT 50 on referrals list
+      total_l1:  parseInt((totalL1Row  || {}).total)  || 0,
+      active_l1: parseInt((activeL1Row || {}).active) || 0,
       plans: plansOut,
       settings,
       vip: vipData,
