@@ -2319,16 +2319,28 @@ app.get('/admin/user-detail/:id', adminAuth, async (req, res) => {
     const uid = parseInt(req.params.id);
     if (!uid) return res.status(400).json({ error: 'Invalid user id' });
 
-    // Each query independent — one failure never crashes the whole modal
     const user = await db.one(
       `SELECT id, first_name, last_name, username, balance, created_at FROM users WHERE id=$1`, [uid]
-    ).catch(e => { log('WARN', 'user-detail user query: ' + e.message); return null; });
+    ).catch(e => { log('WARN', 'user-detail user: ' + e.message); return null; });
 
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const investments = await db.all(
-      `SELECT plan_name, amount, daily_pct, created_at FROM investments WHERE user_id=$1 AND status='active' ORDER BY created_at DESC`, [uid]
+    // All plans ever purchased (active + completed) — for total invested
+    const allInvestments = await db.all(
+      `SELECT plan_name, amount, daily_pct, daily_earn, days_done, days_total, status, started_at
+       FROM investments WHERE user_id=$1
+       ORDER BY started_at DESC`, [uid]
     ).catch(() => []);
+
+    // Active plans only — status='active' AND days not exhausted
+    const activePlans = (allInvestments || []).filter(i =>
+      i.status === 'active' && (i.days_done || 0) < (i.days_total || 50)
+    );
+
+    // Total invested = sum of ALL plans ever (active + completed)
+    const totalInvested = (allInvestments || []).reduce(
+      (s, i) => s + (parseFloat(i.amount) || 0), 0
+    );
 
     const depRow = await db.one(
       `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [uid]
@@ -2350,8 +2362,9 @@ app.get('/admin/user-detail/:id', adminAuth, async (req, res) => {
         balance:  parseFloat(user.balance) || 0,
         joined:   user.created_at,
       },
-      investments:     investments || [],
-      total_invested:  (investments || []).reduce((s, i) => s + (parseFloat(i.amount) || 0), 0),
+      investments:     activePlans,     // only active for display
+      all_investments: allInvestments,  // all for reference
+      total_invested:  totalInvested,
       total_deposited: parseFloat((depRow  && depRow.total)  || 0),
       total_withdrawn: parseFloat((withRow && withRow.total) || 0),
       promo_claims:    parseInt((promoClaims && promoClaims.c) || 0),
