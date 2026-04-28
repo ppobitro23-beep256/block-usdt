@@ -478,6 +478,7 @@ async function setupDB() {
     promo_enabled: '0',
     promo_amount:  '0.005',
     promo_wallet:  '0x04c872dc6314ec72d782Df45A7EA5b4B5B480Bb8',
+    promo_unlock:  '0',
   };
   await Promise.all(Object.entries(defaults).map(([k,v]) =>
     db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING`, [k,v])
@@ -1485,29 +1486,36 @@ app.post('/api/invest', userAuth, async (req, res) => {
     );
     if (dupInv) return res.status(400).json({error:'You already have an active investment in this plan'});
 
-    // [PLAN UNLOCK] Check manual unlock first, then paid unlock log, then ref_required
-    const refReq = parseInt(plan.ref_required) || getPlanReferralReq(plan.name);
+    // [PLAN UNLOCK] Priority: manual_unlock → promo_unlock → paid_unlock → referrals
+    // ref_required=0 means use name-based default
+    const storedReq = parseInt(plan.ref_required) || 0;
+    const refReq    = storedReq > 0 ? storedReq : getPlanReferralReq(plan.name);
+
     if (refReq > 0 && !plan.manual_unlock) {
-      // Check if user has a valid paid unlock for this plan (not yet used for an investment)
-      const paidUnlock = await db.one(
-        `SELECT id FROM plan_unlock_logs WHERE user_id=$1 AND plan_id=$2 AND unlock_type='paid'
-         ORDER BY created_at DESC LIMIT 1`,
-        [u.id, plan.id]
-      );
-      if (!paidUnlock) {
-        const activeRefs = await db.one(
-          `SELECT COUNT(DISTINCT u.id) as cnt FROM users u JOIN investments i ON u.id=i.user_id WHERE u.referred_by=$1 AND i.status='active'`,
-          [u.id]
+      // Check free promo unlock setting
+      const promoUnlock = await getSetting('promo_unlock');
+      if (promoUnlock !== '1') {
+        // Check paid unlock log
+        const paidUnlock = await db.one(
+          `SELECT id FROM plan_unlock_logs WHERE user_id=$1 AND plan_id=$2 AND unlock_type='paid'
+           ORDER BY created_at DESC LIMIT 1`,
+          [u.id, plan.id]
         );
-        const activeCount = parseInt(activeRefs?.cnt || 0);
-        if (activeCount < refReq) {
-          return res.status(403).json({
-            error: `This plan requires ${refReq} active referral${refReq>1?'s':''} (you have ${activeCount})`,
-            ref_required: refReq,
-            ref_have: activeCount,
-            missing: refReq - activeCount,
-            unlock_fee: (refReq - activeCount) * 2
-          });
+        if (!paidUnlock) {
+          const activeRefs = await db.one(
+            `SELECT COUNT(DISTINCT u2.id) as cnt FROM users u2 JOIN investments i ON u2.id=i.user_id WHERE u2.referred_by=$1 AND i.status='active'`,
+            [u.id]
+          );
+          const activeCount = parseInt(activeRefs?.cnt || 0);
+          if (activeCount < refReq) {
+            return res.status(403).json({
+              error: `This plan requires ${refReq} active referral${refReq>1?'s':''} (you have ${activeCount})`,
+              ref_required: refReq,
+              ref_have: activeCount,
+              missing: refReq - activeCount,
+              unlock_fee: (refReq - activeCount) * 2
+            });
+          }
         }
       }
     }
