@@ -579,6 +579,31 @@ async function setupDB() {
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS last_reset TIMESTAMP DEFAULT NOW()`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS reset_hours REAL DEFAULT 24`),
     db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS buy_count INT DEFAULT 0`),
+    // Plan System v2 — Manual unlock, paid unlock, cancel
+    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS manual_unlock BOOLEAN DEFAULT FALSE`),
+    db.run(`ALTER TABLE plans ADD COLUMN IF NOT EXISTS ref_required INTEGER DEFAULT 0`),
+    db.run(`ALTER TABLE investments ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP DEFAULT NULL`),
+    db.run(`ALTER TABLE investments ADD COLUMN IF NOT EXISTS cancel_refund REAL DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_cancel_at TIMESTAMP DEFAULT NULL`),
+    db.run(`CREATE TABLE IF NOT EXISTS plan_unlock_logs (
+      id          SERIAL PRIMARY KEY,
+      user_id     BIGINT NOT NULL,
+      plan_id     INTEGER NOT NULL,
+      plan_name   TEXT,
+      unlock_type TEXT NOT NULL, -- 'paid' | 'manual' | 'referral'
+      fee_paid    REAL DEFAULT 0,
+      created_at  TIMESTAMP DEFAULT NOW()
+    )`),
+    db.run(`CREATE TABLE IF NOT EXISTS plan_cancel_logs (
+      id          SERIAL PRIMARY KEY,
+      user_id     BIGINT NOT NULL,
+      investment_id INTEGER NOT NULL,
+      plan_name   TEXT,
+      amount      REAL,
+      earned      REAL DEFAULT 0,
+      refund      REAL DEFAULT 0,
+      created_at  TIMESTAMP DEFAULT NOW()
+    )`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS link TEXT DEFAULT ''`),
     db.run(`ALTER TABLE tasks_config ADD COLUMN IF NOT EXISTS chat_id TEXT DEFAULT ''`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS app_language VARCHAR(10) DEFAULT ''`),
@@ -1453,18 +1478,30 @@ app.post('/api/invest', userAuth, async (req, res) => {
     );
     if (dupInv) return res.status(400).json({error:'You already have an active investment in this plan'});
 
-    // [PLAN UNLOCK] Check active referral requirement (backend safety — cannot bypass)
-    const refReq = getPlanReferralReq(plan.name);
-    if (refReq > 0) {
-      const activeRefs = await db.one(
-        `SELECT COUNT(DISTINCT u.id) as cnt FROM users u JOIN investments i ON u.id=i.user_id WHERE u.referred_by=$1 AND i.status='active'`,
-        [u.id]
+    // [PLAN UNLOCK] Check manual unlock first, then paid unlock log, then ref_required
+    const refReq = parseInt(plan.ref_required) || getPlanReferralReq(plan.name);
+    if (refReq > 0 && !plan.manual_unlock) {
+      // Check if user has a valid paid unlock for this plan (not yet used for an investment)
+      const paidUnlock = await db.one(
+        `SELECT id FROM plan_unlock_logs WHERE user_id=$1 AND plan_id=$2 AND unlock_type='paid'
+         ORDER BY created_at DESC LIMIT 1`,
+        [u.id, plan.id]
       );
-      const activeCount = parseInt(activeRefs?.cnt || 0);
-      if (activeCount < refReq) {
-        return res.status(403).json({
-          error: `This plan requires ${refReq} active referral${refReq>1?'s':''} (you have ${activeCount})`
-        });
+      if (!paidUnlock) {
+        const activeRefs = await db.one(
+          `SELECT COUNT(DISTINCT u.id) as cnt FROM users u JOIN investments i ON u.id=i.user_id WHERE u.referred_by=$1 AND i.status='active'`,
+          [u.id]
+        );
+        const activeCount = parseInt(activeRefs?.cnt || 0);
+        if (activeCount < refReq) {
+          return res.status(403).json({
+            error: `This plan requires ${refReq} active referral${refReq>1?'s':''} (you have ${activeCount})`,
+            ref_required: refReq,
+            ref_have: activeCount,
+            missing: refReq - activeCount,
+            unlock_fee: (refReq - activeCount) * 2
+          });
+        }
       }
     }
 
@@ -1655,6 +1692,23 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
       return res.status(400).json({error:'No withdrawal address bound. Please bind your address first.'});
     }
     const address = user.withdraw_address; // use DB address, never trust user input
+
+    // ✅ ACTIVE PLAN CHECK — must have at least 1 active investment
+    const activePlan = await db.one(
+      `SELECT id FROM investments WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]
+    );
+    if (!activePlan) {
+      return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment plan.' });
+    }
+
+    // ✅ CANCEL LOCK CHECK — 12h after plan cancellation
+    if (user.last_cancel_at) {
+      const hoursSince = (Date.now() - new Date(user.last_cancel_at).getTime()) / (1000 * 60 * 60);
+      if (hoursSince < 12) {
+        const hoursLeft = Math.ceil(12 - hoursSince);
+        return res.status(400).json({ error: `⏳ Plan recently cancelled. Withdrawals available after ${hoursLeft} more hour${hoursLeft !== 1 ? 's' : ''}.` });
+      }
+    }
 
     // Block check
     const blockMsg = await checkBlocked(u.id);
@@ -4277,9 +4331,26 @@ app.post('/api/promo/claim', userAuth, async (req, res) => {
     if (enabled !== '1') return res.status(400).json({ error: 'Not available' });
 
     // 2. Must have bound withdrawal address
-    const user = await db.one(`SELECT withdraw_address, address_locked FROM users WHERE id=$1`, [u.id]);
+    const user = await db.one(`SELECT withdraw_address, address_locked, last_cancel_at FROM users WHERE id=$1`, [u.id]);
     if (!user.withdraw_address || !user.address_locked) {
       return res.status(400).json({ error: 'Bind your withdrawal address first' });
+    }
+
+    // 2b. Active plan check
+    const activePlanCheck = await db.one(
+      `SELECT id FROM investments WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]
+    );
+    if (!activePlanCheck) {
+      return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment plan.' });
+    }
+
+    // 2c. Cancel lock check
+    if (user.last_cancel_at) {
+      const hoursSince = (Date.now() - new Date(user.last_cancel_at).getTime()) / (1000 * 60 * 60);
+      if (hoursSince < 12) {
+        const hoursLeft = Math.ceil(12 - hoursSince);
+        return res.status(400).json({ error: `⏳ Plan recently cancelled. Withdrawals available after ${hoursLeft} more hour${hoursLeft !== 1 ? 's' : ''}.` });
+      }
     }
 
     // 3. Check lifetime claims (exclude failed — user can retry)
@@ -4466,6 +4537,181 @@ app.post('/admin/promo/toggle', adminAuth, async (req, res) => {
     log('ERROR', e.message);
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// ══════════════════════════════════════════
+// PLAN SYSTEM V2
+// ══════════════════════════════════════════
+
+// POST /api/invest/paid-unlock — pay to unlock plan without referrals
+app.post('/api/invest/paid-unlock', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { plan_id, amount } = req.body;
+    if (!plan_id || !amount) return res.status(400).json({ error: 'Missing fields' });
+
+    const amt = parseFloat(amount);
+    if (!isValidAmount(amt)) return res.status(400).json({ error: 'Invalid amount' });
+
+    const [user, plan] = await Promise.all([
+      db.one(`SELECT * FROM users WHERE id=$1`, [u.id]),
+      db.one(`SELECT * FROM plans WHERE id=$1 AND is_active=1`, [plan_id])
+    ]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!plan)  return res.status(404).json({ error: 'Plan not found' });
+    if (user.is_banned) return res.status(403).json({ error: 'banned' });
+
+    // If manually unlocked, no fee needed
+    if (plan.manual_unlock) return res.status(400).json({ error: 'Plan is already unlocked — activate normally' });
+
+    // Calculate required fee
+    const refReq = parseInt(plan.ref_required) || getPlanReferralReq(plan.name);
+    if (refReq === 0) return res.status(400).json({ error: 'This plan has no referral requirement' });
+
+    const activeRefs = await db.one(
+      `SELECT COUNT(DISTINCT u2.id) as cnt FROM users u2 JOIN investments i ON u2.id=i.user_id WHERE u2.referred_by=$1 AND i.status='active'`,
+      [u.id]
+    );
+    const have    = parseInt(activeRefs?.cnt || 0);
+    const missing = Math.max(0, refReq - have);
+    if (missing === 0) return res.status(400).json({ error: 'You already meet the referral requirement' });
+
+    const requiredFee = missing * 2;
+    if (Math.abs(amt - requiredFee) > 0.01) return res.status(400).json({ error: `Unlock fee is $${requiredFee}` });
+    if (user.balance < requiredFee) return res.status(400).json({ error: 'Insufficient balance' });
+
+    // Deduct fee and log
+    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [requiredFee, u.id]);
+    await db.run(
+      `INSERT INTO plan_unlock_logs (user_id, plan_id, plan_name, unlock_type, fee_paid) VALUES ($1,$2,$3,'paid',$4)`,
+      [u.id, plan.id, plan.name, requiredFee]
+    );
+
+    log('PLAN_UNLOCK', `User ${u.id} paid $${requiredFee} to unlock plan ${plan.name}`);
+    res.json({ success: true, fee_paid: requiredFee, plan_id: plan.id });
+
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
+});
+
+// POST /api/invest/cancel — cancel active plan with refund
+app.post('/api/invest/cancel', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const { investment_id } = req.body;
+    if (!investment_id) return res.status(400).json({ error: 'Missing investment_id' });
+
+    const [user, inv] = await Promise.all([
+      db.one(`SELECT * FROM users WHERE id=$1`, [u.id]),
+      db.one(`SELECT * FROM investments WHERE id=$1 AND user_id=$2`, [investment_id, u.id])
+    ]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!inv)  return res.status(404).json({ error: 'Investment not found' });
+    if (inv.status !== 'active') return res.status(400).json({ error: 'Investment is not active' });
+
+    // Calculate refund
+    const maxROI      = parseFloat(inv.amount) * (parseFloat(inv.daily_pct) / 100) * (parseInt(inv.days_total) || 50);
+    const earned      = parseFloat(inv.pending_earn || 0) + (parseFloat(inv.daily_earn || 0) * (parseInt(inv.days_done || 0)));
+    const remaining   = Math.max(0, maxROI - earned);
+    const refund      = +(remaining * 0.90).toFixed(4);
+
+    // Cancel plan
+    await db.run(
+      `UPDATE investments SET status='cancelled', cancelled_at=NOW(), cancel_refund=$1 WHERE id=$2`,
+      [refund, inv.id]
+    );
+    // Credit refund if > 0
+    if (refund > 0) {
+      await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, u.id]);
+    }
+    // Set last_cancel_at for withdraw restriction (12h lock)
+    await db.run(`UPDATE users SET last_cancel_at=NOW() WHERE id=$1`, [u.id]);
+
+    // Log
+    await db.run(
+      `INSERT INTO plan_cancel_logs (user_id, investment_id, plan_name, amount, earned, refund) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [u.id, inv.id, inv.plan_name, inv.amount, earned, refund]
+    );
+
+    log('PLAN_CANCEL', `User ${u.id} cancelled ${inv.plan_name} — refund $${refund}`);
+    res.json({ success: true, refund, plan_name: inv.plan_name });
+
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
+});
+
+// GET /api/invest/cancel-preview/:id — preview refund before cancel
+app.get('/api/invest/cancel-preview/:id', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const inv = await db.one(
+      `SELECT * FROM investments WHERE id=$1 AND user_id=$2 AND status='active'`,
+      [req.params.id, u.id]
+    );
+    if (!inv) return res.status(404).json({ error: 'Investment not found' });
+
+    const maxROI    = parseFloat(inv.amount) * (parseFloat(inv.daily_pct) / 100) * (parseInt(inv.days_total) || 50);
+    const earned    = parseFloat(inv.pending_earn || 0) + (parseFloat(inv.daily_earn || 0) * (parseInt(inv.days_done || 0)));
+    const remaining = Math.max(0, maxROI - earned);
+    const refund    = +(remaining * 0.90).toFixed(4);
+
+    res.json({
+      plan_name:  inv.plan_name,
+      amount:     inv.amount,
+      max_roi:    +maxROI.toFixed(4),
+      earned:     +earned.toFixed(4),
+      remaining:  +remaining.toFixed(4),
+      refund,
+      refund_pct: 90,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
+});
+
+// POST /admin/plans/toggle-unlock — manual unlock toggle
+app.post('/admin/plans/toggle-unlock', adminAuth, async (req, res) => {
+  try {
+    const { plan_id, manual_unlock } = req.body;
+    if (!plan_id) return res.status(400).json({ error: 'Missing plan_id' });
+
+    await db.run(`UPDATE plans SET manual_unlock=$1 WHERE id=$2`, [!!manual_unlock, plan_id]);
+    const plan = await db.one(`SELECT id, name, manual_unlock FROM plans WHERE id=$1`, [plan_id]);
+
+    log('ADMIN_PLAN', `Plan ${plan.name} manual_unlock set to ${manual_unlock}`);
+    await db.run(
+      `INSERT INTO plan_unlock_logs (user_id, plan_id, plan_name, unlock_type, fee_paid) VALUES (0,$1,$2,$3,0)`,
+      [plan_id, plan.name, manual_unlock ? 'admin_unlock' : 'admin_relock']
+    );
+    res.json({ success: true, plan });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
+});
+
+// POST /admin/plans/set-ref-required — set referral requirement per plan
+app.post('/admin/plans/set-ref-required', adminAuth, async (req, res) => {
+  try {
+    const { plan_id, ref_required } = req.body;
+    if (!plan_id) return res.status(400).json({ error: 'Missing plan_id' });
+    const req_n = parseInt(ref_required) || 0;
+    await db.run(`UPDATE plans SET ref_required=$1 WHERE id=$2`, [req_n, plan_id]);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
+});
+
+// GET /admin/plan-stats — unlock/cancel dashboard
+app.get('/admin/plan-stats', adminAuth, async (req, res) => {
+  try {
+    const [activations, unlockPurchases, manualUnlocked, cancelRefunds] = await Promise.all([
+      db.one(`SELECT COUNT(*) as c FROM investments WHERE created_at >= CURRENT_DATE`),
+      db.one(`SELECT COUNT(*) as c, COALESCE(SUM(fee_paid),0) as total FROM plan_unlock_logs WHERE unlock_type='paid' AND created_at >= CURRENT_DATE`),
+      db.one(`SELECT COUNT(*) as c FROM plans WHERE manual_unlock=TRUE`),
+      db.one(`SELECT COUNT(*) as c, COALESCE(SUM(refund),0) as total FROM plan_cancel_logs WHERE created_at >= CURRENT_DATE`),
+    ]);
+    res.json({
+      activations_today:  parseInt(activations.c) || 0,
+      unlock_purchases_today: parseInt(unlockPurchases.c) || 0,
+      unlock_revenue_today:   parseFloat(unlockPurchases.total) || 0,
+      manually_unlocked:      parseInt(manualUnlocked.c) || 0,
+      cancel_refunds_today:   parseInt(cancelRefunds.c) || 0,
+      cancel_refund_total:    parseFloat(cancelRefunds.total) || 0,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ══════════════════════════════════════════
