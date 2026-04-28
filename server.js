@@ -1281,7 +1281,11 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     planCounts.forEach(function(r) { countMap[r.plan_name] = parseInt(r.c) || 0; });
 
     const plansOut = (plansRows || []).map(function(p) {
-      return Object.assign({}, p, { today_count: countMap[p.name] || 0 });
+      return Object.assign({}, p, {
+        today_count:   countMap[p.name] || 0,
+        manual_unlock: !!p.manual_unlock,   // ensure boolean — never null
+        ref_required:  parseInt(p.ref_required) || 0,
+      });
     });
 
     // Referral commission
@@ -1400,6 +1404,9 @@ app.get('/api/user/:id', async (req, res) => {
         const hoursPassed = (nowTime - new Date(p.last_reset)) / (1000*60*60);
         if (hoursPassed >= (p.reset_hours || 24)) p.today_count = 0;
       }
+      // Ensure manual_unlock is always boolean — never null from DB
+      p.manual_unlock = !!p.manual_unlock;
+      p.ref_required  = parseInt(p.ref_required) || 0;
     });
 
     // Auto-reset today_earned if it's a new UTC day
