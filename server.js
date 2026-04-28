@@ -4623,10 +4623,14 @@ app.post('/api/invest/cancel', userAuth, async (req, res) => {
     if (!inv)  return res.status(404).json({ error: 'Investment not found' });
     if (inv.status !== 'active') return res.status(400).json({ error: 'Investment is not active' });
 
-    // Calculate refund
-    const maxROI      = parseFloat(inv.amount) * (parseFloat(inv.daily_pct) / 100) * (parseInt(inv.days_total) || 50);
-    const earned      = parseFloat(inv.pending_earn || 0) + (parseFloat(inv.daily_earn || 0) * (parseInt(inv.days_done || 0)));
-    const remaining   = Math.max(0, maxROI - earned);
+    // Calculate refund: Remaining = Principal - Already Earned, Refund = 90%
+    const investedC   = parseFloat(inv.amount || 0);
+    const dailyEarnC  = parseFloat(inv.daily_earn || 0);
+    const daysDoneC   = parseInt(inv.days_done)  || 0;
+    const pendingC    = parseFloat(inv.pending_earn || 0);
+    const collectedC  = +(dailyEarnC * daysDoneC).toFixed(4);
+    const earned      = +(collectedC + pendingC).toFixed(4);
+    const remaining   = +Math.max(0, investedC - earned).toFixed(4);
     const refund      = +(remaining * 0.90).toFixed(4);
 
     // Cancel plan
@@ -4663,19 +4667,31 @@ app.get('/api/invest/cancel-preview/:id', userAuth, async (req, res) => {
     );
     if (!inv) return res.status(404).json({ error: 'Investment not found' });
 
-    const maxROI    = parseFloat(inv.amount) * (parseFloat(inv.daily_pct) / 100) * (parseInt(inv.days_total) || 50);
-    const earned    = parseFloat(inv.pending_earn || 0) + (parseFloat(inv.daily_earn || 0) * (parseInt(inv.days_done || 0)));
-    const remaining = Math.max(0, maxROI - earned);
-    const refund    = +(remaining * 0.90).toFixed(4);
+    const invested   = parseFloat(inv.amount || 0);
+    const dailyEarn  = parseFloat(inv.daily_earn || 0);
+    const daysTotal  = parseInt(inv.days_total) || 50;
+    const daysDone   = parseInt(inv.days_done)  || 0;
+    const pendingEarn = parseFloat(inv.pending_earn || 0);
+
+    // Total already earned (collected + uncollected)
+    const collected  = +(dailyEarn * daysDone).toFixed(4);
+    const earned     = +(collected + pendingEarn).toFixed(4);
+
+    // Remaining = Principal - Already Earned
+    const remaining  = +Math.max(0, invested - earned).toFixed(4);
+    const refund     = +(remaining * 0.90).toFixed(4);
 
     res.json({
-      plan_name:  inv.plan_name,
-      amount:     inv.amount,
-      max_roi:    +maxROI.toFixed(4),
-      earned:     +earned.toFixed(4),
-      remaining:  +remaining.toFixed(4),
-      refund,
-      refund_pct: 90,
+      plan_name:   inv.plan_name,
+      amount:      invested,
+      daily_earn:  dailyEarn,
+      days_total:  daysTotal,
+      days_done:   daysDone,
+      invested:    invested,
+      earned:      earned,
+      remaining:   remaining,
+      refund:      refund,
+      refund_pct:  90,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error: ' + e.message }); }
 });
