@@ -748,6 +748,50 @@ async function setupDB() {
   `);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
+
+  // ── ONE-TIME MIGRATION: Move old cancel refunds from balance to reinvest_credit ──
+  // Runs safely every startup — skips already-migrated users via cancel_refund_migrated flag
+  try {
+    await db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS cancel_refund_migrated BOOLEAN DEFAULT FALSE`);
+
+    // Find users who have cancel refunds but not yet migrated
+    const toMigrate = await db.all(`
+      SELECT cl.user_id, SUM(cl.refund) as total_refund
+      FROM plan_cancel_logs cl
+      JOIN users u ON u.id = cl.user_id
+      WHERE cl.refund > 0
+        AND u.cancel_refund_migrated = FALSE
+      GROUP BY cl.user_id
+    `);
+
+    for (const row of toMigrate) {
+      const uid        = row.user_id;
+      const toMove     = parseFloat(row.total_refund) || 0;
+      if (toMove <= 0) continue;
+
+      // Atomic: move min(refund, balance) from balance to reinvest_credit
+      // Use separate steps to avoid SQL evaluation order ambiguity
+      const userRow = await db.one(`SELECT balance, reinvest_credit FROM users WHERE id=$1`, [uid]);
+      const actualMove = Math.min(toMove, parseFloat(userRow.balance || 0));
+      if (actualMove > 0) {
+        await pool.query(
+          `UPDATE users SET balance=balance-$1, reinvest_credit=reinvest_credit+$1, cancel_refund_migrated=TRUE WHERE id=$2`,
+          [+actualMove.toFixed(4), uid]
+        );
+      } else {
+        // No balance to move but still mark migrated
+        await pool.query(`UPDATE users SET cancel_refund_migrated=TRUE WHERE id=$1`, [uid]);
+      }
+
+      log('MIGRATION', `User ${uid}: moved up to $${toMove} to reinvest_credit`);
+    }
+
+    if (toMigrate.length > 0) {
+      log('MIGRATION', `Cancel refund migration complete — ${toMigrate.length} user(s) migrated`);
+    }
+  } catch(migErr) {
+    log('MIGRATION_ERR', 'Cancel refund migration failed (non-critical): ' + migErr.message);
+  }
 }
 
 // Handle unhandled promise rejections
