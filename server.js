@@ -586,6 +586,7 @@ async function setupDB() {
     db.run(`ALTER TABLE investments ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP DEFAULT NULL`),
     db.run(`ALTER TABLE investments ADD COLUMN IF NOT EXISTS cancel_refund REAL DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_cancel_at TIMESTAMP DEFAULT NULL`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reinvest_credit REAL DEFAULT 0`),
     db.run(`CREATE TABLE IF NOT EXISTS plan_unlock_logs (
       id          SERIAL PRIMARY KEY,
       user_id     BIGINT NOT NULL,
@@ -1322,6 +1323,7 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
         is_banned: user.is_banned || 0,
         withdraw_address: user.withdraw_address || null,
         address_locked: !!user.address_locked,
+        reinvest_credit: parseFloat(user.reinvest_credit || 0),
       },
       investments,
       transactions,
@@ -1478,7 +1480,10 @@ app.post('/api/invest', userAuth, async (req, res) => {
     if (!plan) return res.status(404).json({error:'Plan not found'});
     if (amount < plan.min_amt) return res.status(400).json({error:`Min $${plan.min_amt}`});
     if (amount > plan.max_amt) return res.status(400).json({error:`Max $${plan.max_amt}`});
-    if (user.balance < amount) return res.status(400).json({error:'Insufficient balance'});
+    // Allow reinvest_credit to supplement balance for plan purchase
+    const credit = parseFloat(user.reinvest_credit || 0);
+    const totalAvailable = user.balance + credit;
+    if (totalAvailable < amount) return res.status(400).json({error:'Insufficient balance'});
     // Prevent duplicate active investment in same plan
     const dupInv = await db.one(
       `SELECT id FROM investments WHERE user_id=$1 AND plan_name=$2 AND status='active'`,
@@ -1540,11 +1545,31 @@ app.post('/api/invest', userAuth, async (req, res) => {
     }
 
     const daily = +(amount * plan.daily_pct / 100).toFixed(4);
+
+    // Use reinvest_credit first, then balance
+    const creditToUse   = Math.min(credit, amount);
+    const balanceToUse  = +(amount - creditToUse).toFixed(4);
+
     // [DB-LEVEL GUARD] Conditional deduct — prevents negative balance under race condition
-    const deductResult = await pool.query(
-      `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
-      [amount, u.id]
-    );
+    let deductResult;
+    if (creditToUse > 0 && balanceToUse > 0) {
+      deductResult = await pool.query(
+        `UPDATE users SET balance=balance-$1, reinvest_credit=reinvest_credit-$2
+         WHERE id=$3 AND balance>=$1 AND reinvest_credit>=$2 RETURNING id`,
+        [balanceToUse, creditToUse, u.id]
+      );
+    } else if (creditToUse > 0) {
+      deductResult = await pool.query(
+        `UPDATE users SET reinvest_credit=reinvest_credit-$1
+         WHERE id=$2 AND reinvest_credit>=$1 RETURNING id`,
+        [creditToUse, u.id]
+      );
+    } else {
+      deductResult = await pool.query(
+        `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
+        [balanceToUse, u.id]
+      );
+    }
     if (deductResult.rowCount === 0) return res.status(400).json({error:'Insufficient balance'});
     await db.run(
       `INSERT INTO investments (user_id,plan_name,amount,daily_pct,daily_earn,days_total) VALUES ($1,$2,$3,$4,$5,$6)`,
@@ -4633,14 +4658,13 @@ app.post('/api/invest/cancel', userAuth, async (req, res) => {
     const remaining   = +Math.max(0, investedC - earned).toFixed(4);
     const refund      = +(remaining * 0.90).toFixed(4);
 
-    // Cancel plan
+    // Cancel plan — refund goes to reinvest_credit (cannot withdraw, only reinvest)
     await db.run(
       `UPDATE investments SET status='cancelled', cancelled_at=NOW(), cancel_refund=$1 WHERE id=$2`,
       [refund, inv.id]
     );
-    // Credit refund if > 0
     if (refund > 0) {
-      await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [refund, u.id]);
+      await db.run(`UPDATE users SET reinvest_credit=reinvest_credit+$1 WHERE id=$2`, [refund, u.id]);
     }
     // Set last_cancel_at for withdraw restriction (12h lock)
     await db.run(`UPDATE users SET last_cancel_at=NOW() WHERE id=$1`, [u.id]);
