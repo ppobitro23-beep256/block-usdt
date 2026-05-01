@@ -1528,12 +1528,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
     const credit = parseFloat(user.reinvest_credit || 0);
     const totalAvailable = user.balance + credit;
     if (totalAvailable < amount) return res.status(400).json({error:'Insufficient balance'});
-    // Prevent duplicate active investment in same plan
-    const dupInv = await db.one(
-      `SELECT id FROM investments WHERE user_id=$1 AND plan_name=$2 AND status='active'`,
-      [u.id, ((plan.emoji||'')+' '+plan.name).trim()]
-    );
-    if (dupInv) return res.status(400).json({error:'You already have an active investment in this plan'});
+    // Multiple plans allowed — same plan can be purchased multiple times
 
     // [PLAN UNLOCK] Priority: manual_unlock → promo_unlock → paid_unlock → referrals
     // ref_required=0 means use name-based default
