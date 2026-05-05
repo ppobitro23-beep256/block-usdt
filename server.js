@@ -3070,6 +3070,7 @@ app.post('/api/mining/earn', userAuth, async (req, res) => {
       taps_used:    parseInt(updated.mining_taps_today || 0),
       taps_left:    Math.max(0, maxTaps - parseInt(updated.mining_taps_today || 0)),
       max_taps:     maxTaps,
+      earn_per_tap: earnPerTap,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
