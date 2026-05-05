@@ -678,6 +678,28 @@ async function setupDB() {
       note         TEXT,
       created_at   TIMESTAMP DEFAULT NOW()
     )`),
+    // Block Token Mining System
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS block_tokens REAL DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS block_tokens_today REAL DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS block_tokens_total REAL DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS block_tokens_today_date TEXT DEFAULT ''`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mining_taps_today INT DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mining_taps_date TEXT DEFAULT ''`),
+    db.run(`INSERT INTO settings (key,value) VALUES ('token_rate','100')      ON CONFLICT (key) DO NOTHING`),
+    db.run(`INSERT INTO settings (key,value) VALUES ('token_min_swap','10')   ON CONFLICT (key) DO NOTHING`),
+    db.run(`INSERT INTO settings (key,value) VALUES ('blk_price','0.01') ON CONFLICT (key) DO NOTHING`),
+    db.run(`INSERT INTO settings (key,value) VALUES ('mining_day_mode','normal') ON CONFLICT (key) DO NOTHING`),
+    db.run(`INSERT INTO settings (key,value) VALUES ('lucky_blk_price','0.02')   ON CONFLICT (key) DO NOTHING`),
+    db.run(`INSERT INTO settings (key,value) VALUES ('red_blk_price','0.005')    ON CONFLICT (key) DO NOTHING`),
+    db.run(`INSERT INTO settings (key,value) VALUES ('max_taps_per_day','100')   ON CONFLICT (key) DO NOTHING`),
+    // Spin wheel system
+    db.run(`CREATE TABLE IF NOT EXISTS spin_logs (
+      id         SERIAL PRIMARY KEY,
+      user_id    BIGINT NOT NULL,
+      reward     REAL NOT NULL,
+      spun_at    TIMESTAMP DEFAULT NOW()
+    )`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_spin_logs_user ON spin_logs (user_id, spun_at DESC)`),
   ]);
 
   // Audit log table for address changes
@@ -692,20 +714,6 @@ async function setupDB() {
       created_at   TIMESTAMP DEFAULT NOW()
     )
   `);
-
-  // Account transfer / migration log table
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS account_transfers (
-      id             SERIAL PRIMARY KEY,
-      old_user_id    BIGINT NOT NULL,
-      new_user_id    BIGINT NOT NULL,
-      admin_note     TEXT,
-      transferred_at TIMESTAMP DEFAULT NOW(),
-      snapshot       JSONB
-    )
-  `);
-  await db.run(`CREATE INDEX IF NOT EXISTS idx_acct_transfer_old ON account_transfers (old_user_id)`);
-  await db.run(`CREATE INDEX IF NOT EXISTS idx_acct_transfer_new ON account_transfers (new_user_id)`);
 
   // Telegram Group proof log table
   await db.run(`
@@ -762,6 +770,35 @@ async function setupDB() {
   `);
 
   console.log('✅ Database ready (Neon PostgreSQL)');
+
+  // ── MIGRATION: Always ensure correct plan data ──
+  try {
+    const correctPlans = [
+      { key:'bronze',   name:'Bronze',   emoji:'🌟', daily_pct:3.0, min_amt:2,    max_amt:5,    duration:40 },
+      { key:'silver',   name:'Silver',   emoji:'⭐', daily_pct:3.5, min_amt:5,    max_amt:10,   duration:40 },
+      { key:'gold',     name:'Gold',     emoji:'🥇', daily_pct:4.0, min_amt:10,   max_amt:30,   duration:40 },
+      { key:'platinum', name:'Platinum', emoji:'💠', daily_pct:4.5, min_amt:30,   max_amt:100,  duration:40 },
+      { key:'diamond',  name:'Diamond',  emoji:'💎', daily_pct:5.0, min_amt:100,  max_amt:300,  duration:40 },
+      { key:'titanium', name:'Titanium', emoji:'🔩', daily_pct:5.5, min_amt:300,  max_amt:1000, duration:40 },
+      { key:'quantum',  name:'Quantum',  emoji:'👑', daily_pct:6.0, min_amt:1000, max_amt:2000, duration:40 },
+    ];
+    const allPlans = await db.all(`SELECT id, name, daily_pct, min_amt FROM plans`);
+    for (const fix of correctPlans) {
+      const match = allPlans.find(p => (p.name||'').toLowerCase().includes(fix.key));
+      if (match) {
+        await db.run(
+          `UPDATE plans SET daily_pct=$1, min_amt=$2, max_amt=$3, duration=$4 WHERE id=$5`,
+          [fix.daily_pct, fix.min_amt, fix.max_amt, fix.duration, match.id]
+        );
+      } else {
+        await db.run(
+          `INSERT INTO plans (name,emoji,daily_pct,min_amt,max_amt,duration) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [fix.name, fix.emoji, fix.daily_pct, fix.min_amt, fix.max_amt, fix.duration]
+        );
+      }
+    }
+    log('MIGRATION', 'Plans synced OK');
+  } catch(e) { log('MIGRATION_ERR', e.message); }
 
   // ── ONE-TIME MIGRATION: Move old cancel refunds from balance to reinvest_credit ──
   // Runs safely every startup — skips already-migrated users via cancel_refund_migrated flag
@@ -1372,6 +1409,7 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
         id: user.id, uid: user.uid,
         first_name: user.first_name, last_name: user.last_name,
         username: user.username, balance: parseFloat(user.balance) || 0,
+        block_tokens: parseFloat(user.block_tokens || 0),
         total_earned: parseFloat(user.total_earned) || 0,
         today_earned: parseFloat(user.today_earned) || 0,
         ref_code: user.ref_code,
@@ -2726,6 +2764,316 @@ app.post('/admin/plan/update-count', adminAuth, async (req, res) => {
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
+
+// ══════════════════════════════════════════
+// BLOCK TOKEN MINING — SWAP
+// ══════════════════════════════════════════
+app.post('/api/mining/swap', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    // Get settings
+    const rateRow    = await db.one(`SELECT value FROM settings WHERE key='token_rate'`);
+    const minRow     = await db.one(`SELECT value FROM settings WHERE key='token_min_swap'`);
+    const rate       = parseFloat(rateRow?.value || '100');
+    const minSwap    = parseFloat(minRow?.value   || '10');
+    const user       = await db.one(`SELECT block_tokens, balance FROM users WHERE id=$1`, [u.id]);
+    const tokens     = parseFloat(user.block_tokens || 0);
+
+    if (tokens < minSwap) {
+      return res.status(400).json({ error: `Minimum ${minSwap} Block Tokens required` });
+    }
+
+    const usdtAmount = parseFloat((tokens / rate).toFixed(4));
+    if (usdtAmount <= 0) return res.status(400).json({ error: 'Amount too small' });
+
+    // Deduct tokens, add USDT balance
+    await db.run(
+      `UPDATE users SET block_tokens = block_tokens - $1, balance = balance + $2 WHERE id = $3`,
+      [tokens, usdtAmount, u.id]
+    );
+
+    // Log transaction
+    await db.run(
+      `INSERT INTO transactions (user_id, type, amount, status, note, created_at)
+       VALUES ($1, 'swap', $2, 'completed', $3, NOW())`,
+      [u.id, usdtAmount, `${tokens} Block Token → $${usdtAmount} USDT (rate: ${rate} token/USDT)`]
+    );
+
+    return res.json({ success: true, tokens_used: tokens, usdt_credited: usdtAmount, rate });
+  } catch(e) {
+    console.error('[swap]', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ══════════════════════════════════════════
+// SPIN WHEEL ENDPOINTS
+// ══════════════════════════════════════════
+
+// GET /api/spin/status — check if user can spin today
+app.get('/api/spin/status', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    const lastSpin = await db.one(
+      `SELECT spun_at FROM spin_logs WHERE user_id=$1 ORDER BY spun_at DESC LIMIT 1`,
+      [u.id]
+    );
+    if (!lastSpin) return res.json({ can_spin: true, next_spin_at: null });
+
+    const spunAt   = new Date(lastSpin.spun_at);
+    const nextSpin = new Date(spunAt.getTime() + 24 * 60 * 60 * 1000);
+    const canSpin  = new Date() >= nextSpin;
+    res.json({
+      can_spin:    canSpin,
+      last_spin:   spunAt.toISOString(),
+      next_spin_at: canSpin ? null : nextSpin.toISOString(),
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /api/spin/claim — claim spin reward (server validates cooldown + calculates reward)
+app.post('/api/spin/claim', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+
+    // Cooldown check — 24h between spins
+    const lastSpin = await db.one(
+      `SELECT spun_at FROM spin_logs WHERE user_id=$1 ORDER BY spun_at DESC LIMIT 1`,
+      [u.id]
+    );
+    if (lastSpin) {
+      const nextSpin = new Date(new Date(lastSpin.spun_at).getTime() + 24 * 60 * 60 * 1000);
+      if (new Date() < nextSpin) {
+        const mins = Math.ceil((nextSpin - new Date()) / 60000);
+        return res.status(429).json({ error: `Spin available in ${mins} minute(s)`, next_spin_at: nextSpin.toISOString() });
+      }
+    }
+
+    // Weighted reward: 80% → 0.10–0.50 | 18% → 0.50–1.00 | 2% → 1.00–2.00 BLK
+    let reward;
+    const rng = Math.random();
+    if      (rng < 0.80) reward = +(0.10 + Math.random() * 0.40).toFixed(2);
+    else if (rng < 0.98) reward = +(0.50 + Math.random() * 0.50).toFixed(2);
+    else                 reward = +(1.00 + Math.random() * 1.00).toFixed(2);
+
+    const today = new Date().toISOString().slice(0, 10);
+
+    // Credit BLOCK tokens + log spin
+    await db.run(
+      `UPDATE users SET
+        block_tokens            = block_tokens + $1,
+        block_tokens_total      = block_tokens_total + $1,
+        block_tokens_today      = CASE WHEN $3::TEXT != COALESCE(block_tokens_today_date,'') THEN $1::REAL ELSE block_tokens_today + $1 END,
+        block_tokens_today_date = $3::TEXT
+       WHERE id=$2`,
+      [reward, u.id, today]
+    );
+    await db.run(`INSERT INTO spin_logs (user_id, reward) VALUES ($1, $2)`, [u.id, reward]);
+
+    const updated = await db.one(
+      `SELECT block_tokens, block_tokens_today, block_tokens_total FROM users WHERE id=$1`, [u.id]
+    );
+    log('SPIN', `User ${u.id} won ${reward} BLK`);
+    res.json({
+      success:      true,
+      reward,
+      block_tokens: parseFloat(updated.block_tokens || 0),
+      today:        parseFloat(updated.block_tokens_today || 0),
+      total:        parseFloat(updated.block_tokens_total || 0),
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /api/mining/info — full mining state for client
+app.get('/api/mining/info', userAuth, async (req, res) => {
+  try {
+    const u     = req.tgUser;
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [user, rateRow, minRow, maxTapsRow, modeRow] = await Promise.all([
+      db.one(`SELECT block_tokens, block_tokens_today, block_tokens_today_date,
+                     block_tokens_total, mining_taps_today, mining_taps_date
+              FROM users WHERE id=$1`, [u.id]),
+      db.one(`SELECT value FROM settings WHERE key='token_rate'`),
+      db.one(`SELECT value FROM settings WHERE key='token_min_swap'`),
+      db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
+      db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
+    ]);
+
+    const isNewDay   = (user?.block_tokens_today_date || '') !== today;
+    const tapsToday  = isNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
+    const maxTaps    = parseInt(maxTapsRow?.value || '100');
+    const blkPrice   = await getCurrentBlkPrice();
+    const dailyUsd   = await getUserDailyUsd(u.id);
+    const dailyBlk   = dailyUsd > 0 ? +(dailyUsd / blkPrice).toFixed(4) : 0;
+    const earnPerTap = dailyBlk > 0 ? +(dailyBlk / maxTaps).toFixed(6) : 0.0001;
+
+    res.json({
+      block_tokens:   parseFloat(user?.block_tokens || 0),
+      today:          isNewDay ? 0 : parseFloat(user?.block_tokens_today || 0),
+      total:          parseFloat(user?.block_tokens_total || 0),
+      token_rate:     parseFloat(rateRow?.value || '100'),
+      min_swap:       parseFloat(minRow?.value   || '10'),
+      taps_used:      tapsToday,
+      taps_left:      Math.max(0, maxTaps - tapsToday),
+      max_taps:       maxTaps,
+      blk_price:      blkPrice,
+      daily_blk:      dailyBlk,
+      earn_per_tap:   earnPerTap,
+      day_mode:       modeRow?.value || 'normal',
+      has_investment: dailyUsd > 0,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ── Mining helper: get current BLK price based on day mode ──
+async function getCurrentBlkPrice() {
+  const rows = await db.all(
+    `SELECT key, value FROM settings WHERE key IN ('blk_price','mining_day_mode','lucky_blk_price','red_blk_price')`
+  );
+  const s = {};
+  rows.forEach(r => { s[r.key] = r.value; });
+  const mode = s.mining_day_mode || 'normal';
+  if (mode === 'lucky') return parseFloat(s.lucky_blk_price || '0.02');
+  if (mode === 'red')   return parseFloat(s.red_blk_price   || '0.005');
+  return parseFloat(s.blk_price || '0.01');
+}
+
+// ── Mining helper: get user's total daily USD from active investments ──
+async function getUserDailyUsd(userId) {
+  const invs = await db.all(
+    `SELECT amount, days_done, days_total FROM investments WHERE user_id=$1 AND status='active'`,
+    [userId]
+  );
+  if (!invs || !invs.length) return 0;
+  let dailyUsd = 0;
+  for (const inv of invs) {
+    const amount    = parseFloat(inv.amount || 0);
+    const daysTotal = parseInt(inv.days_total) || 50;
+    // Daily USD = Investment / 50 (always based on 50-day ROI)
+    dailyUsd += amount / 50;
+  }
+  return +dailyUsd.toFixed(6);
+}
+
+// POST /api/mining/boost/buy — buy a mining boost package from wallet balance
+app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
+  try {
+    const u      = req.tgUser;
+    const amount = parseFloat(req.body?.amount);
+    const VALID  = [10, 30, 50, 100, 200, 300, 500, 1000];
+
+    if (!amount || !VALID.includes(amount))
+      return res.status(400).json({ error: 'Invalid package amount' });
+
+    // Check wallet balance
+    const user = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
+    const bal  = parseFloat(user?.balance || 0);
+
+    if (bal < amount)
+      return res.status(400).json({
+        error: 'Insufficient balance. Recharge your wallet.',
+        balance: bal,
+        required: amount
+      });
+
+    // Deduct from wallet
+    await db.run(`UPDATE users SET balance = balance - $1 WHERE id=$2`, [amount, u.id]);
+
+    // Create investment record (50-day ROI, daily_pct=0 means BLK-based)
+    await db.run(
+      `INSERT INTO investments (user_id, plan_name, amount, daily_pct, daily_earn, days_total, days_done, status, started_at)
+       VALUES ($1, $2, $3, 0, 0, 50, 0, 'active', NOW())`,
+      [u.id, `Mining Boost $${amount}`, amount]
+    );
+
+    const updated = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
+    log('BOOST', `User ${u.id} bought $${amount} mining boost`);
+
+    res.json({
+      success: true,
+      message: `Mining boost activated! $${amount} USDT deducted.`,
+      balance: parseFloat(updated.balance || 0),
+      amount
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /api/mining/earn — tap to earn BLK (investment-based, tap-limited)
+app.post('/api/mining/earn', userAuth, async (req, res) => {
+  try {
+    const u    = req.tgUser;
+    const taps = Math.min(parseInt(req.body?.taps) || 1, 50); // max 50 per batch
+    const today = new Date().toISOString().slice(0, 10);
+
+    // Get settings
+    const maxTapsRow = await db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`);
+    const maxTaps    = parseInt(maxTapsRow?.value || '100');
+
+    // Get user tap state
+    const user = await db.one(
+      `SELECT block_tokens, block_tokens_today, block_tokens_today_date,
+              block_tokens_total, mining_taps_today, mining_taps_date
+       FROM users WHERE id=$1`, [u.id]
+    );
+
+    const isNewDay    = (user?.mining_taps_date || '') !== today;
+    const tapsUsed    = isNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
+    const tapsLeft    = Math.max(0, maxTaps - tapsUsed);
+
+    if (tapsLeft <= 0) {
+      return res.status(429).json({ error: 'Daily tap limit reached', taps_left: 0, max_taps: maxTaps });
+    }
+
+    const actualTaps = Math.min(taps, tapsLeft);
+
+    // Get daily USD from investments
+    const dailyUsd = await getUserDailyUsd(u.id);
+
+    let earnPerTap, earn;
+    if (dailyUsd > 0) {
+      // Investment-based: Daily BLK = dailyUsd / blkPrice / maxTaps
+      const blkPrice = await getCurrentBlkPrice();
+      const dailyBlk = dailyUsd / blkPrice;
+      earnPerTap     = dailyBlk / maxTaps;
+      earn           = +(earnPerTap * actualTaps).toFixed(6);
+    } else {
+      // No investment: base rate 0.0001 BLK per tap
+      earn = +(0.0001 * actualTaps).toFixed(4);
+    }
+
+    if (earn <= 0) earn = +(0.0001 * actualTaps).toFixed(4);
+
+    // Atomic update
+    await db.run(
+      `UPDATE users SET
+        block_tokens            = block_tokens + $1,
+        block_tokens_total      = block_tokens_total + $1,
+        block_tokens_today      = CASE WHEN $3::TEXT != COALESCE(block_tokens_today_date,'') THEN $1::REAL ELSE block_tokens_today + $1 END,
+        block_tokens_today_date = $3::TEXT,
+        mining_taps_today       = CASE WHEN $3::TEXT != COALESCE(mining_taps_date,'') THEN $4::INT ELSE mining_taps_today + $4 END,
+        mining_taps_date        = $3::TEXT
+       WHERE id=$2`,
+      [earn, u.id, today, actualTaps]
+    );
+
+    const updated = await db.one(
+      `SELECT block_tokens, block_tokens_today, block_tokens_total, mining_taps_today FROM users WHERE id=$1`, [u.id]
+    );
+
+    res.json({
+      success:      true,
+      earn,
+      block_tokens: parseFloat(updated.block_tokens || 0),
+      today:        parseFloat(updated.block_tokens_today || 0),
+      total:        parseFloat(updated.block_tokens_total || 0),
+      taps_used:    parseInt(updated.mining_taps_today || 0),
+      taps_left:    Math.max(0, maxTaps - parseInt(updated.mining_taps_today || 0)),
+      max_taps:     maxTaps,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
 app.get('/admin/settings', adminAuth, async (req, res) => {
   try {
     const rows = await db.all(`SELECT * FROM settings`);
@@ -2748,6 +3096,106 @@ app.post('/admin/maintenance', adminAuth, async (req, res) => {
     await db.run(`INSERT INTO settings (key,value) VALUES ('maintenance',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [req.body.on?'1':'0']);
     res.json({success:true});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
+});
+
+// ── Admin Mining Control ──────────────────────────────────
+// POST /admin/mining/set-price — set BLK price in USD
+app.post('/admin/mining/set-price', adminAuth, async (req, res) => {
+  try {
+    const { blk_price } = req.body;
+    if (!blk_price || isNaN(parseFloat(blk_price)) || parseFloat(blk_price) <= 0)
+      return res.status(400).json({ error: 'Invalid blk_price' });
+    await db.run(`INSERT INTO settings (key,value) VALUES ('blk_price',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [String(blk_price)]);
+    log('ADMIN_MINING', `BLK price set to $${blk_price}`);
+    res.json({ success: true, blk_price: parseFloat(blk_price) });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /admin/mining/set-mode — set day mode: normal | lucky | red
+app.post('/admin/mining/set-mode', adminAuth, async (req, res) => {
+  try {
+    const { mode, lucky_price, red_price } = req.body;
+    if (!['normal','lucky','red'].includes(mode))
+      return res.status(400).json({ error: 'mode must be normal|lucky|red' });
+    await db.run(`INSERT INTO settings (key,value) VALUES ('mining_day_mode',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [mode]);
+    if (lucky_price) await db.run(`INSERT INTO settings (key,value) VALUES ('lucky_blk_price',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [String(lucky_price)]);
+    if (red_price)   await db.run(`INSERT INTO settings (key,value) VALUES ('red_blk_price',$1)   ON CONFLICT (key) DO UPDATE SET value=$1`, [String(red_price)]);
+    log('ADMIN_MINING', `Day mode set to ${mode}`);
+    res.json({ success: true, mode });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /admin/mining/set-tap-limit — set max taps per day
+app.post('/admin/mining/set-tap-limit', adminAuth, async (req, res) => {
+  try {
+    const { max_taps } = req.body;
+    if (!max_taps || isNaN(parseInt(max_taps)) || parseInt(max_taps) < 1)
+      return res.status(400).json({ error: 'Invalid max_taps' });
+    await db.run(`INSERT INTO settings (key,value) VALUES ('max_taps_per_day',$1) ON CONFLICT (key) DO UPDATE SET value=$1`, [String(max_taps)]);
+    log('ADMIN_MINING', `Max taps/day set to ${max_taps}`);
+    res.json({ success: true, max_taps: parseInt(max_taps) });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/mining/stats — overview
+app.get('/admin/mining/stats', adminAuth, async (req, res) => {
+  try {
+    const [totals, modeRow, priceRow, tapRow] = await Promise.all([
+      db.one(`SELECT COUNT(*) as users,
+                     COALESCE(SUM(block_tokens),0) as total_tokens,
+                     COALESCE(SUM(block_tokens_today),0) as today_tokens
+              FROM users`),
+      db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
+      db.one(`SELECT value FROM settings WHERE key='blk_price'`),
+      db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
+    ]);
+    const blkPrice = await getCurrentBlkPrice();
+    res.json({
+      total_users:      parseInt(totals.users),
+      total_blk_issued: parseFloat(totals.total_tokens || 0),
+      today_blk_issued: parseFloat(totals.today_tokens || 0),
+      current_blk_price: blkPrice,
+      day_mode:          modeRow?.value || 'normal',
+      max_taps_per_day:  parseInt(tapRow?.value || '100'),
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/mining/users — per-user mining stats
+app.get('/admin/mining/users', adminAuth, async (req, res) => {
+  try {
+    const page  = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = 20;
+    const offset = (page - 1) * limit;
+    const rows = await db.all(`
+      SELECT u.id, u.first_name, u.username, u.uid,
+             COALESCE(u.block_tokens, 0)       as block_tokens,
+             COALESCE(u.block_tokens_today, 0) as today,
+             COALESCE(u.block_tokens_total, 0) as total,
+             COALESCE(u.mining_taps_today, 0)  as taps_today,
+             (SELECT COALESCE(SUM(amount),0) FROM investments 
+              WHERE user_id=u.id AND status='active') as active_investment
+      FROM users u
+      ORDER BY u.block_tokens_total DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    const countRow = await db.one(`SELECT COUNT(*) as c FROM users`);
+    res.json({
+      users: rows.map(u => ({
+        id:                u.id,
+        name:              u.first_name || 'Unknown',
+        username:          u.username || '',
+        uid:               u.uid || '',
+        block_tokens:      parseFloat(u.block_tokens).toFixed(4),
+        today:             parseFloat(u.today).toFixed(4),
+        total:             parseFloat(u.total).toFixed(4),
+        taps_today:        parseInt(u.taps_today),
+        active_investment: parseFloat(u.active_investment).toFixed(2),
+      })),
+      total: parseInt(countRow.c),
+      page, limit,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
 // ══════════════════════════════════════════
@@ -3641,18 +4089,20 @@ app.get('/leaderboard', async (req, res) => {
 app.get('/api/top-earners', async (req, res) => {
   try {
     const rows = await db.all(`
-      SELECT first_name, uid, total_earned,
-        (SELECT COUNT(DISTINCT i.user_id) FROM investments i JOIN users u2 ON u2.id=i.user_id WHERE u2.referred_by=u.id AND i.status='active') as active_refs
+      SELECT u.first_name, u.uid, u.block_tokens_total,
+        (SELECT COUNT(DISTINCT i.user_id) FROM investments i 
+         JOIN users u2 ON u2.id=i.user_id 
+         WHERE u2.referred_by=u.id AND i.status='active') as active_refs
       FROM users u
-      WHERE total_earned > 0
-      ORDER BY total_earned DESC
-      LIMIT 20
+      WHERE COALESCE(u.block_tokens_total, 0) > 0
+      ORDER BY u.block_tokens_total DESC
+      LIMIT 25
     `);
     const earners = rows.map((u, i) => ({
       pos:          i + 1,
       name:         maskName(u.first_name),
       uid:          u.uid || '------',
-      total_earned: parseFloat(u.total_earned || 0).toFixed(2),
+      total_earned: parseFloat(u.block_tokens_total || 0).toFixed(4),
       badge:        getUserRank(u.active_refs)
     }));
     res.json({ earners });
@@ -4820,308 +5270,6 @@ app.get('/admin/plan-stats', adminAuth, async (req, res) => {
       cancel_refund_total:    parseFloat(cancelRefunds.total) || 0,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
-});
-
-// ══════════════════════════════════════════════════════
-// ACCOUNT MIGRATION / TRANSFER SYSTEM (Admin Only)
-// ══════════════════════════════════════════════════════
-
-// ── POST /admin/account-transfer/preview ───────────────
-app.post('/admin/account-transfer/preview', adminAuth, async (req, res) => {
-  try {
-    const old_user_id = parseInt(req.body.old_user_id) || 0;
-    const new_user_id = parseInt(req.body.new_user_id) || 0;
-    if (!old_user_id || !new_user_id)
-      return res.status(400).json({ error: 'Both old_user_id and new_user_id are required' });
-    if (old_user_id === new_user_id)
-      return res.status(400).json({ error: 'Old and new user IDs must be different' });
-
-    const [oldUser, newUser] = await Promise.all([
-      db.one(`SELECT id, first_name, username, balance, total_earned, today_earned,
-                     pending_commission, total_commission, reinvest_credit,
-                     ref_code, referred_by, is_banned
-              FROM users WHERE id=$1`, [old_user_id]),
-      db.one(`SELECT id, first_name, username, balance, total_earned, today_earned,
-                     pending_commission, total_commission, reinvest_credit,
-                     ref_code, referred_by, is_banned
-              FROM users WHERE id=$1`, [new_user_id]),
-    ]);
-    if (!oldUser) return res.status(404).json({ error: `Old user ${old_user_id} not found` });
-    if (!newUser) return res.status(404).json({ error: `New user ${new_user_id} not found` });
-
-    const [oldInvestments, oldDownlineCount, newInvestments, newDownlineCount] = await Promise.all([
-      db.all(`SELECT id, plan_name, amount, daily_pct, daily_earn, days_total, days_done, status, started_at
-              FROM investments WHERE user_id=$1 AND status='active'`, [old_user_id]),
-      db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1`, [old_user_id]),
-      db.all(`SELECT id, plan_name, amount, status FROM investments WHERE user_id=$1 AND status='active'`, [new_user_id]),
-      db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1`, [new_user_id]),
-    ]);
-
-    res.json({
-      old_user: {
-        ...oldUser,
-        active_investments: oldInvestments.length,
-        investments: oldInvestments,
-        downline_count: parseInt(oldDownlineCount.c) || 0,
-      },
-      new_user: {
-        ...newUser,
-        active_investments: newInvestments.length,
-        investments: newInvestments,
-        downline_count: parseInt(newDownlineCount.c) || 0,
-      },
-      will_merge: newInvestments.length > 0 || parseFloat(newUser.balance) > 0,
-    });
-  } catch (e) {
-    log('ERROR', 'Transfer preview error: ' + e.message);
-    res.status(500).json({ error: 'Server error: ' + e.message });
-  }
-});
-
-// ── POST /admin/account-transfer/execute ───────────────
-app.post('/admin/account-transfer/execute', adminAuth, async (req, res) => {
-  const client = await pool.connect();
-  let txStarted = false; // declared OUTSIDE try so catch{} can see it
-  try {
-    const old_user_id = parseInt(req.body.old_user_id) || 0;
-    const new_user_id = parseInt(req.body.new_user_id) || 0;
-    const { confirm, admin_note } = req.body;
-    if (!old_user_id || !new_user_id)
-      return res.status(400).json({ error: 'Both user IDs required' });
-    if (old_user_id === new_user_id)
-      return res.status(400).json({ error: 'Cannot transfer to same account' });
-    if (confirm !== true && confirm !== 'true')
-      return res.status(400).json({ error: 'Transfer not confirmed' });
-
-    const [oldUser, newUser] = await Promise.all([
-      db.one(`SELECT * FROM users WHERE id=$1`, [old_user_id]),
-      db.one(`SELECT * FROM users WHERE id=$1`, [new_user_id]),
-    ]);
-    if (!oldUser) return res.status(404).json({ error: `Old user ${old_user_id} not found` });
-    if (!newUser) return res.status(404).json({ error: `New user ${new_user_id} not found` });
-
-    // Guard: old user already transferred/banned
-    if (oldUser.is_banned && (oldUser.ban_reason || '').startsWith('Account transferred')) {
-      return res.status(400).json({ error: 'Old account was already transferred. Check transfer logs.' });
-    }
-    // Guard: do not transfer to a banned account
-    if (newUser.is_banned) {
-      return res.status(400).json({ error: `New user ${new_user_id} is banned. Unban first.` });
-    }
-
-    const oldInvestments = await db.all(
-      `SELECT * FROM investments WHERE user_id=$1 AND status='active'`, [old_user_id]
-    );
-    const oldBalance   = parseFloat(oldUser.balance || 0);
-    const oldEarned    = parseFloat(oldUser.total_earned || 0);
-    const oldToday     = parseFloat(oldUser.today_earned || 0);
-    const oldComm      = parseFloat(oldUser.pending_commission || 0);
-    const oldTotalComm = parseFloat(oldUser.total_commission || 0);
-    const oldReinvest  = parseFloat(oldUser.reinvest_credit || 0);
-
-    const snapshot = {
-      old_user_id, new_user_id,
-      old_balance: oldBalance, old_earned: oldEarned, old_today: oldToday,
-      old_comm: oldComm, old_investments: oldInvestments.length,
-      timestamp: new Date().toISOString(),
-    };
-
-    await client.query('BEGIN');
-    txStarted = true;
-
-    // 1. Merge balance + earnings into new user
-    await client.query(
-      `UPDATE users SET
-         balance            = balance + $1,
-         total_earned       = total_earned + $2,
-         today_earned       = today_earned + $3,
-         pending_commission = pending_commission + $4,
-         total_commission   = total_commission + $5,
-         reinvest_credit    = reinvest_credit + $6,
-         last_earn_date     = CASE WHEN $3 > 0 THEN $7 ELSE last_earn_date END
-       WHERE id = $8`,
-      [oldBalance, oldEarned, oldToday, oldComm, oldTotalComm, oldReinvest,
-       oldUser.last_earn_date || '', new_user_id]
-    );
-
-    // 2. Atomically deactivate old account — WHERE is_banned=0 is the concurrency lock:
-    //    if two requests race, only one UPDATE matches (rowCount=1); the other gets rowCount=0
-    const lockResult = await client.query(
-      `UPDATE users SET
-         balance            = 0, total_earned = 0, today_earned = 0,
-         pending_commission = 0, total_commission = 0, reinvest_credit = 0,
-         is_banned          = 1,
-         ban_reason         = $1
-       WHERE id = $2 AND (is_banned = 0 OR is_banned IS NULL)
-       RETURNING id`,
-      [`Account transferred to user ${new_user_id}`, old_user_id]
-    );
-    if (lockResult.rowCount === 0) {
-      // Another concurrent request already processed this transfer
-      throw new Error('Transfer already in progress or already completed for this account');
-    }
-
-    // 3. Move active investments
-    await client.query(
-      `UPDATE investments SET user_id=$1 WHERE user_id=$2 AND status='active'`,
-      [new_user_id, old_user_id]
-    );
-
-    // 4. Move all transactions
-    await client.query(
-      `UPDATE transactions SET user_id=$1 WHERE user_id=$2`,
-      [new_user_id, old_user_id]
-    );
-
-    // 5. Move commissions earned by old user
-    await client.query(
-      `UPDATE commissions SET user_id=$1 WHERE user_id=$2`,
-      [new_user_id, old_user_id]
-    );
-
-    // 6. Move commissions referencing old user as source
-    await client.query(
-      `UPDATE commissions SET from_user_id=$1 WHERE from_user_id=$2`,
-      [new_user_id, old_user_id]
-    );
-
-    // 7. Reassign downline users → point to new user
-    //    Exclude new_user itself — if new_user was referred by old_user,
-    //    reassigning would create a self-referral (new_user.referred_by = new_user_id)
-    await client.query(
-      `UPDATE users SET referred_by=$1 WHERE referred_by=$2 AND id != $1`,
-      [new_user_id, old_user_id]
-    );
-
-    // 8. Inherit upline if new user has none
-    if (oldUser.referred_by && !newUser.referred_by) {
-      await client.query(
-        `UPDATE users SET referred_by=$1 WHERE id=$2`,
-        [oldUser.referred_by, new_user_id]
-      );
-    }
-
-    // 8b. Inherit is_active_ref flag (marks user as an active referral in upline's tree)
-    if (oldUser.is_active_ref && !newUser.is_active_ref) {
-      await client.query(`UPDATE users SET is_active_ref=TRUE WHERE id=$1`, [new_user_id]);
-    }
-
-    // 9. Move tasks (skip duplicates)
-    await client.query(
-      `INSERT INTO tasks (user_id, task_key, completed, completed_at)
-       SELECT $1, task_key, completed, completed_at FROM tasks WHERE user_id=$2
-       ON CONFLICT (user_id, task_key) DO NOTHING`,
-      [new_user_id, old_user_id]
-    );
-
-    // 10. Move auto_deposits
-    await client.query(
-      `UPDATE auto_deposits SET user_id=$1 WHERE user_id=$2`,
-      [new_user_id, old_user_id]
-    );
-
-    // 11. Move plan_unlock_logs
-    await client.query(
-      `UPDATE plan_unlock_logs SET user_id=$1 WHERE user_id=$2`,
-      [new_user_id, old_user_id]
-    );
-
-    // 11b. Move plan_cancel_logs
-    await client.query(
-      `UPDATE plan_cancel_logs SET user_id=$1 WHERE user_id=$2`,
-      [new_user_id, old_user_id]
-    );
-
-    // 11c. Move promo_withdrawals (ON CONFLICT: skip if new user already has same claim_date)
-    await client.query(
-      `INSERT INTO promo_withdrawals (user_id, amount, claim_number, status, tx_hash, claim_date, created_at)
-       SELECT $1, amount, claim_number, status, tx_hash, claim_date, created_at
-       FROM promo_withdrawals WHERE user_id=$2
-       ON CONFLICT (user_id, claim_date) DO NOTHING`,
-      [new_user_id, old_user_id]
-    );
-
-    // 12. Move story_tasks (skip duplicates)
-    await client.query(
-      `INSERT INTO story_tasks (user_id, claim_date, attempts, claimed, last_attempt, claimed_at)
-       SELECT $1, claim_date, attempts, claimed, last_attempt, claimed_at
-       FROM story_tasks WHERE user_id=$2
-       ON CONFLICT (user_id, claim_date) DO NOTHING`,
-      [new_user_id, old_user_id]
-    );
-
-    // 13. Move withdraw address if new user has none
-    if (oldUser.withdraw_address && !newUser.withdraw_address) {
-      await client.query(
-        `UPDATE users SET withdraw_address=$1, address_locked=TRUE, address_updated_at=NOW() WHERE id=$2`,
-        [oldUser.withdraw_address, new_user_id]
-      );
-      await client.query(
-        `UPDATE users SET withdraw_address=NULL, address_locked=FALSE WHERE id=$1`,
-        [old_user_id]
-      );
-      // Audit log: old user loses address
-      await client.query(
-        `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action)
-         VALUES ('system_transfer', $1, $2, NULL, 'transfer_cleared')`,
-        [old_user_id, oldUser.withdraw_address]
-      );
-      // Audit log: new user gains address
-      await client.query(
-        `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action)
-         VALUES ('system_transfer', $1, NULL, $2, 'transfer_received')`,
-        [new_user_id, oldUser.withdraw_address]
-      );
-    }
-
-    // 14. Log the transfer (table guaranteed by setupDB)
-    await client.query(
-      `INSERT INTO account_transfers (old_user_id, new_user_id, admin_note, snapshot)
-       VALUES ($1,$2,$3,$4)`,
-      [old_user_id, new_user_id, admin_note || '', JSON.stringify(snapshot)]
-    );
-
-    await client.query('COMMIT');
-
-    log('ADMIN', `Account transfer COMPLETE: ${old_user_id} → ${new_user_id} | balance=${oldBalance} investments=${oldInvestments.length}`);
-    logSecurity('ACCOUNT_TRANSFER', { old_user_id, new_user_id, balance: oldBalance, investments: oldInvestments.length });
-
-    res.json({
-      success: true,
-      transferred: {
-        balance: oldBalance, earned: oldEarned,
-        investments: oldInvestments.length, commission: oldComm,
-      },
-      message: `Transfer complete. Old account (${old_user_id}) is now inactive.`,
-    });
-  } catch (e) {
-    if (txStarted) await client.query('ROLLBACK').catch(() => {});
-    log('ERROR', 'Account transfer FAILED: ' + e.message);
-    res.status(500).json({ error: 'Transfer failed: ' + e.message });
-  } finally {
-    client.release();
-  }
-});
-
-// ── GET /admin/account-transfer/logs ──────────────────
-app.get('/admin/account-transfer/logs', adminAuth, async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const rows = await db.all(
-      `SELECT t.id, t.old_user_id, t.new_user_id, t.admin_note, t.transferred_at, t.snapshot,
-              ou.first_name as old_name, ou.username as old_username,
-              nu.first_name as new_name, nu.username as new_username
-       FROM account_transfers t
-       LEFT JOIN users ou ON ou.id = t.old_user_id
-       LEFT JOIN users nu ON nu.id = t.new_user_id
-       ORDER BY t.transferred_at DESC LIMIT $1`,
-      [limit]
-    );
-    res.json({ logs: rows });
-  } catch (e) {
-    log('ERROR', e.message);
-    res.status(500).json({ error: 'Server error' });
-  }
 });
 
 // ══════════════════════════════════════════
