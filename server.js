@@ -693,6 +693,20 @@ async function setupDB() {
     )
   `);
 
+  // Account transfer / migration log table
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS account_transfers (
+      id             SERIAL PRIMARY KEY,
+      old_user_id    BIGINT NOT NULL,
+      new_user_id    BIGINT NOT NULL,
+      admin_note     TEXT,
+      transferred_at TIMESTAMP DEFAULT NOW(),
+      snapshot       JSONB
+    )
+  `);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_acct_transfer_old ON account_transfers (old_user_id)`);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_acct_transfer_new ON account_transfers (new_user_id)`);
+
   // Telegram Group proof log table
   await db.run(`
     CREATE TABLE IF NOT EXISTS tg_proof_logs (
@@ -4806,6 +4820,308 @@ app.get('/admin/plan-stats', adminAuth, async (req, res) => {
       cancel_refund_total:    parseFloat(cancelRefunds.total) || 0,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ══════════════════════════════════════════════════════
+// ACCOUNT MIGRATION / TRANSFER SYSTEM (Admin Only)
+// ══════════════════════════════════════════════════════
+
+// ── POST /admin/account-transfer/preview ───────────────
+app.post('/admin/account-transfer/preview', adminAuth, async (req, res) => {
+  try {
+    const old_user_id = parseInt(req.body.old_user_id) || 0;
+    const new_user_id = parseInt(req.body.new_user_id) || 0;
+    if (!old_user_id || !new_user_id)
+      return res.status(400).json({ error: 'Both old_user_id and new_user_id are required' });
+    if (old_user_id === new_user_id)
+      return res.status(400).json({ error: 'Old and new user IDs must be different' });
+
+    const [oldUser, newUser] = await Promise.all([
+      db.one(`SELECT id, first_name, username, balance, total_earned, today_earned,
+                     pending_commission, total_commission, reinvest_credit,
+                     ref_code, referred_by, is_banned
+              FROM users WHERE id=$1`, [old_user_id]),
+      db.one(`SELECT id, first_name, username, balance, total_earned, today_earned,
+                     pending_commission, total_commission, reinvest_credit,
+                     ref_code, referred_by, is_banned
+              FROM users WHERE id=$1`, [new_user_id]),
+    ]);
+    if (!oldUser) return res.status(404).json({ error: `Old user ${old_user_id} not found` });
+    if (!newUser) return res.status(404).json({ error: `New user ${new_user_id} not found` });
+
+    const [oldInvestments, oldDownlineCount, newInvestments, newDownlineCount] = await Promise.all([
+      db.all(`SELECT id, plan_name, amount, daily_pct, daily_earn, days_total, days_done, status, started_at
+              FROM investments WHERE user_id=$1 AND status='active'`, [old_user_id]),
+      db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1`, [old_user_id]),
+      db.all(`SELECT id, plan_name, amount, status FROM investments WHERE user_id=$1 AND status='active'`, [new_user_id]),
+      db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1`, [new_user_id]),
+    ]);
+
+    res.json({
+      old_user: {
+        ...oldUser,
+        active_investments: oldInvestments.length,
+        investments: oldInvestments,
+        downline_count: parseInt(oldDownlineCount.c) || 0,
+      },
+      new_user: {
+        ...newUser,
+        active_investments: newInvestments.length,
+        investments: newInvestments,
+        downline_count: parseInt(newDownlineCount.c) || 0,
+      },
+      will_merge: newInvestments.length > 0 || parseFloat(newUser.balance) > 0,
+    });
+  } catch (e) {
+    log('ERROR', 'Transfer preview error: ' + e.message);
+    res.status(500).json({ error: 'Server error: ' + e.message });
+  }
+});
+
+// ── POST /admin/account-transfer/execute ───────────────
+app.post('/admin/account-transfer/execute', adminAuth, async (req, res) => {
+  const client = await pool.connect();
+  let txStarted = false; // declared OUTSIDE try so catch{} can see it
+  try {
+    const old_user_id = parseInt(req.body.old_user_id) || 0;
+    const new_user_id = parseInt(req.body.new_user_id) || 0;
+    const { confirm, admin_note } = req.body;
+    if (!old_user_id || !new_user_id)
+      return res.status(400).json({ error: 'Both user IDs required' });
+    if (old_user_id === new_user_id)
+      return res.status(400).json({ error: 'Cannot transfer to same account' });
+    if (confirm !== true && confirm !== 'true')
+      return res.status(400).json({ error: 'Transfer not confirmed' });
+
+    const [oldUser, newUser] = await Promise.all([
+      db.one(`SELECT * FROM users WHERE id=$1`, [old_user_id]),
+      db.one(`SELECT * FROM users WHERE id=$1`, [new_user_id]),
+    ]);
+    if (!oldUser) return res.status(404).json({ error: `Old user ${old_user_id} not found` });
+    if (!newUser) return res.status(404).json({ error: `New user ${new_user_id} not found` });
+
+    // Guard: old user already transferred/banned
+    if (oldUser.is_banned && (oldUser.ban_reason || '').startsWith('Account transferred')) {
+      return res.status(400).json({ error: 'Old account was already transferred. Check transfer logs.' });
+    }
+    // Guard: do not transfer to a banned account
+    if (newUser.is_banned) {
+      return res.status(400).json({ error: `New user ${new_user_id} is banned. Unban first.` });
+    }
+
+    const oldInvestments = await db.all(
+      `SELECT * FROM investments WHERE user_id=$1 AND status='active'`, [old_user_id]
+    );
+    const oldBalance   = parseFloat(oldUser.balance || 0);
+    const oldEarned    = parseFloat(oldUser.total_earned || 0);
+    const oldToday     = parseFloat(oldUser.today_earned || 0);
+    const oldComm      = parseFloat(oldUser.pending_commission || 0);
+    const oldTotalComm = parseFloat(oldUser.total_commission || 0);
+    const oldReinvest  = parseFloat(oldUser.reinvest_credit || 0);
+
+    const snapshot = {
+      old_user_id, new_user_id,
+      old_balance: oldBalance, old_earned: oldEarned, old_today: oldToday,
+      old_comm: oldComm, old_investments: oldInvestments.length,
+      timestamp: new Date().toISOString(),
+    };
+
+    await client.query('BEGIN');
+    txStarted = true;
+
+    // 1. Merge balance + earnings into new user
+    await client.query(
+      `UPDATE users SET
+         balance            = balance + $1,
+         total_earned       = total_earned + $2,
+         today_earned       = today_earned + $3,
+         pending_commission = pending_commission + $4,
+         total_commission   = total_commission + $5,
+         reinvest_credit    = reinvest_credit + $6,
+         last_earn_date     = CASE WHEN $3 > 0 THEN $7 ELSE last_earn_date END
+       WHERE id = $8`,
+      [oldBalance, oldEarned, oldToday, oldComm, oldTotalComm, oldReinvest,
+       oldUser.last_earn_date || '', new_user_id]
+    );
+
+    // 2. Atomically deactivate old account — WHERE is_banned=0 is the concurrency lock:
+    //    if two requests race, only one UPDATE matches (rowCount=1); the other gets rowCount=0
+    const lockResult = await client.query(
+      `UPDATE users SET
+         balance            = 0, total_earned = 0, today_earned = 0,
+         pending_commission = 0, total_commission = 0, reinvest_credit = 0,
+         is_banned          = 1,
+         ban_reason         = $1
+       WHERE id = $2 AND (is_banned = 0 OR is_banned IS NULL)
+       RETURNING id`,
+      [`Account transferred to user ${new_user_id}`, old_user_id]
+    );
+    if (lockResult.rowCount === 0) {
+      // Another concurrent request already processed this transfer
+      throw new Error('Transfer already in progress or already completed for this account');
+    }
+
+    // 3. Move active investments
+    await client.query(
+      `UPDATE investments SET user_id=$1 WHERE user_id=$2 AND status='active'`,
+      [new_user_id, old_user_id]
+    );
+
+    // 4. Move all transactions
+    await client.query(
+      `UPDATE transactions SET user_id=$1 WHERE user_id=$2`,
+      [new_user_id, old_user_id]
+    );
+
+    // 5. Move commissions earned by old user
+    await client.query(
+      `UPDATE commissions SET user_id=$1 WHERE user_id=$2`,
+      [new_user_id, old_user_id]
+    );
+
+    // 6. Move commissions referencing old user as source
+    await client.query(
+      `UPDATE commissions SET from_user_id=$1 WHERE from_user_id=$2`,
+      [new_user_id, old_user_id]
+    );
+
+    // 7. Reassign downline users → point to new user
+    //    Exclude new_user itself — if new_user was referred by old_user,
+    //    reassigning would create a self-referral (new_user.referred_by = new_user_id)
+    await client.query(
+      `UPDATE users SET referred_by=$1 WHERE referred_by=$2 AND id != $1`,
+      [new_user_id, old_user_id]
+    );
+
+    // 8. Inherit upline if new user has none
+    if (oldUser.referred_by && !newUser.referred_by) {
+      await client.query(
+        `UPDATE users SET referred_by=$1 WHERE id=$2`,
+        [oldUser.referred_by, new_user_id]
+      );
+    }
+
+    // 8b. Inherit is_active_ref flag (marks user as an active referral in upline's tree)
+    if (oldUser.is_active_ref && !newUser.is_active_ref) {
+      await client.query(`UPDATE users SET is_active_ref=TRUE WHERE id=$1`, [new_user_id]);
+    }
+
+    // 9. Move tasks (skip duplicates)
+    await client.query(
+      `INSERT INTO tasks (user_id, task_key, completed, completed_at)
+       SELECT $1, task_key, completed, completed_at FROM tasks WHERE user_id=$2
+       ON CONFLICT (user_id, task_key) DO NOTHING`,
+      [new_user_id, old_user_id]
+    );
+
+    // 10. Move auto_deposits
+    await client.query(
+      `UPDATE auto_deposits SET user_id=$1 WHERE user_id=$2`,
+      [new_user_id, old_user_id]
+    );
+
+    // 11. Move plan_unlock_logs
+    await client.query(
+      `UPDATE plan_unlock_logs SET user_id=$1 WHERE user_id=$2`,
+      [new_user_id, old_user_id]
+    );
+
+    // 11b. Move plan_cancel_logs
+    await client.query(
+      `UPDATE plan_cancel_logs SET user_id=$1 WHERE user_id=$2`,
+      [new_user_id, old_user_id]
+    );
+
+    // 11c. Move promo_withdrawals (ON CONFLICT: skip if new user already has same claim_date)
+    await client.query(
+      `INSERT INTO promo_withdrawals (user_id, amount, claim_number, status, tx_hash, claim_date, created_at)
+       SELECT $1, amount, claim_number, status, tx_hash, claim_date, created_at
+       FROM promo_withdrawals WHERE user_id=$2
+       ON CONFLICT (user_id, claim_date) DO NOTHING`,
+      [new_user_id, old_user_id]
+    );
+
+    // 12. Move story_tasks (skip duplicates)
+    await client.query(
+      `INSERT INTO story_tasks (user_id, claim_date, attempts, claimed, last_attempt, claimed_at)
+       SELECT $1, claim_date, attempts, claimed, last_attempt, claimed_at
+       FROM story_tasks WHERE user_id=$2
+       ON CONFLICT (user_id, claim_date) DO NOTHING`,
+      [new_user_id, old_user_id]
+    );
+
+    // 13. Move withdraw address if new user has none
+    if (oldUser.withdraw_address && !newUser.withdraw_address) {
+      await client.query(
+        `UPDATE users SET withdraw_address=$1, address_locked=TRUE, address_updated_at=NOW() WHERE id=$2`,
+        [oldUser.withdraw_address, new_user_id]
+      );
+      await client.query(
+        `UPDATE users SET withdraw_address=NULL, address_locked=FALSE WHERE id=$1`,
+        [old_user_id]
+      );
+      // Audit log: old user loses address
+      await client.query(
+        `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action)
+         VALUES ('system_transfer', $1, $2, NULL, 'transfer_cleared')`,
+        [old_user_id, oldUser.withdraw_address]
+      );
+      // Audit log: new user gains address
+      await client.query(
+        `INSERT INTO address_change_logs (admin_id, user_id, old_address, new_address, action)
+         VALUES ('system_transfer', $1, NULL, $2, 'transfer_received')`,
+        [new_user_id, oldUser.withdraw_address]
+      );
+    }
+
+    // 14. Log the transfer (table guaranteed by setupDB)
+    await client.query(
+      `INSERT INTO account_transfers (old_user_id, new_user_id, admin_note, snapshot)
+       VALUES ($1,$2,$3,$4)`,
+      [old_user_id, new_user_id, admin_note || '', JSON.stringify(snapshot)]
+    );
+
+    await client.query('COMMIT');
+
+    log('ADMIN', `Account transfer COMPLETE: ${old_user_id} → ${new_user_id} | balance=${oldBalance} investments=${oldInvestments.length}`);
+    logSecurity('ACCOUNT_TRANSFER', { old_user_id, new_user_id, balance: oldBalance, investments: oldInvestments.length });
+
+    res.json({
+      success: true,
+      transferred: {
+        balance: oldBalance, earned: oldEarned,
+        investments: oldInvestments.length, commission: oldComm,
+      },
+      message: `Transfer complete. Old account (${old_user_id}) is now inactive.`,
+    });
+  } catch (e) {
+    if (txStarted) await client.query('ROLLBACK').catch(() => {});
+    log('ERROR', 'Account transfer FAILED: ' + e.message);
+    res.status(500).json({ error: 'Transfer failed: ' + e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ── GET /admin/account-transfer/logs ──────────────────
+app.get('/admin/account-transfer/logs', adminAuth, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const rows = await db.all(
+      `SELECT t.id, t.old_user_id, t.new_user_id, t.admin_note, t.transferred_at, t.snapshot,
+              ou.first_name as old_name, ou.username as old_username,
+              nu.first_name as new_name, nu.username as new_username
+       FROM account_transfers t
+       LEFT JOIN users ou ON ou.id = t.old_user_id
+       LEFT JOIN users nu ON nu.id = t.new_user_id
+       ORDER BY t.transferred_at DESC LIMIT $1`,
+      [limit]
+    );
+    res.json({ logs: rows });
+  } catch (e) {
+    log('ERROR', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // ══════════════════════════════════════════
