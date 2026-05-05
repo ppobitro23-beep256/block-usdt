@@ -700,6 +700,17 @@ async function setupDB() {
       spun_at    TIMESTAMP DEFAULT NOW()
     )`),
     db.run(`CREATE INDEX IF NOT EXISTS idx_spin_logs_user ON spin_logs (user_id, spun_at DESC)`),
+    // Mining plans — separate from investment plans
+    db.run(`CREATE TABLE IF NOT EXISTS mining_plans (
+      id         SERIAL PRIMARY KEY,
+      user_id    BIGINT NOT NULL,
+      amount     REAL NOT NULL,
+      daily_blk  REAL NOT NULL,
+      tap_reward REAL NOT NULL,
+      status     TEXT DEFAULT 'active',
+      started_at TIMESTAMP DEFAULT NOW()
+    )`),
+    db.run(`CREATE INDEX IF NOT EXISTS idx_mining_plans_user ON mining_plans (user_id, status)`),
   ]);
 
   // Audit log table for address changes
@@ -2890,38 +2901,54 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
     const u     = req.tgUser;
     const today = new Date().toISOString().slice(0, 10);
 
-    const [user, rateRow, minRow, maxTapsRow, modeRow] = await Promise.all([
+    const [user, maxTapsRow, modeRow] = await Promise.all([
       db.one(`SELECT block_tokens, block_tokens_today, block_tokens_today_date,
                      block_tokens_total, mining_taps_today, mining_taps_date
               FROM users WHERE id=$1`, [u.id]),
-      db.one(`SELECT value FROM settings WHERE key='token_rate'`),
-      db.one(`SELECT value FROM settings WHERE key='token_min_swap'`),
       db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
       db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
     ]);
 
-    const isNewDay   = (user?.block_tokens_today_date || '') !== today;
-    const tapsToday  = isNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
-    const maxTaps    = parseInt(maxTapsRow?.value || '100');
-    const blkPrice   = await getCurrentBlkPrice();
-    const dailyUsd   = await getUserDailyUsd(u.id);
-    const dailyBlk   = dailyUsd > 0 ? +(dailyUsd / blkPrice).toFixed(4) : 0;
-    const earnPerTap = dailyBlk > 0 ? +(dailyBlk / maxTaps).toFixed(6) : 0.0001;
+    const isNewDay  = (user?.block_tokens_today_date || '') !== today;
+    const tapsToday = isNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
+    const maxTaps   = parseInt(maxTapsRow?.value || '100');
+
+    // Check if user has active mining plan (boost)
+    const miningPlan = await getUserMiningPlan(u.id);
+
+    let earnPerTap, dailyBlk, hasMiningPlan, miningPlanData;
+
+    if (miningPlan) {
+      // PAID — use mining plan values
+      earnPerTap   = parseFloat(miningPlan.tap_reward);
+      dailyBlk     = parseFloat(miningPlan.daily_blk);
+      hasMiningPlan = true;
+      miningPlanData = {
+        amount:     parseFloat(miningPlan.amount),
+        daily_blk:  dailyBlk,
+        tap_reward: earnPerTap,
+      };
+    } else {
+      // FREE — fixed low rate
+      earnPerTap    = 0.0001;
+      dailyBlk      = 0;
+      hasMiningPlan = false;
+      miningPlanData = null;
+    }
 
     res.json({
-      block_tokens:   parseFloat(user?.block_tokens || 0),
-      today:          isNewDay ? 0 : parseFloat(user?.block_tokens_today || 0),
-      total:          parseFloat(user?.block_tokens_total || 0),
-      token_rate:     parseFloat(rateRow?.value || '100'),
-      min_swap:       parseFloat(minRow?.value   || '10'),
-      taps_used:      tapsToday,
-      taps_left:      Math.max(0, maxTaps - tapsToday),
-      max_taps:       maxTaps,
-      blk_price:      blkPrice,
-      daily_blk:      dailyBlk,
-      earn_per_tap:   earnPerTap,
-      day_mode:       modeRow?.value || 'normal',
-      has_investment: dailyUsd > 0,
+      block_tokens:    parseFloat(user?.block_tokens || 0),
+      today:           isNewDay ? 0 : parseFloat(user?.block_tokens_today || 0),
+      total:           parseFloat(user?.block_tokens_total || 0),
+      taps_used:       tapsToday,
+      taps_left:       Math.max(0, maxTaps - tapsToday),
+      max_taps:        maxTaps,
+      earn_per_tap:    earnPerTap,
+      daily_blk:       dailyBlk,
+      day_mode:        modeRow?.value || 'normal',
+      has_investment:  hasMiningPlan,  // kept for compatibility
+      has_mining_plan: hasMiningPlan,
+      mining_plan:     miningPlanData,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
@@ -2939,21 +2966,15 @@ async function getCurrentBlkPrice() {
   return parseFloat(s.blk_price || '0.01');
 }
 
-// ── Mining helper: get user's total daily USD from active investments ──
-async function getUserDailyUsd(userId) {
-  const invs = await db.all(
-    `SELECT amount, days_done, days_total FROM investments WHERE user_id=$1 AND status='active'`,
+// ── Mining helper: get user's active mining plan (boost only) ──
+async function getUserMiningPlan(userId) {
+  const plan = await db.one(
+    `SELECT id, amount, daily_blk, tap_reward FROM mining_plans 
+     WHERE user_id=$1 AND status='active' 
+     ORDER BY started_at DESC LIMIT 1`,
     [userId]
   );
-  if (!invs || !invs.length) return 0;
-  let dailyUsd = 0;
-  for (const inv of invs) {
-    const amount    = parseFloat(inv.amount || 0);
-    const daysTotal = parseInt(inv.days_total) || 50;
-    // Daily USD = Investment / 50 (always based on 50-day ROI)
-    dailyUsd += amount / 50;
-  }
-  return +dailyUsd.toFixed(6);
+  return plan || null;
 }
 
 // POST /api/mining/boost/buy — buy a mining boost package from wallet balance
@@ -2980,11 +3001,18 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
     // Deduct from wallet
     await db.run(`UPDATE users SET balance = balance - $1 WHERE id=$2`, [amount, u.id]);
 
-    // Create investment record (50-day ROI, daily_pct=0 means BLK-based)
+    // Calculate tap_reward and daily_blk based on BLK price
+    const blkPrice  = await getCurrentBlkPrice();
+    const maxTaps   = 100;
+    const dailyUsd  = amount / 50;
+    const dailyBlk  = +(dailyUsd / blkPrice).toFixed(4);
+    const tapReward = +(dailyBlk / maxTaps).toFixed(6);
+
+    // Insert into mining_plans (NOT investments)
     await db.run(
-      `INSERT INTO investments (user_id, plan_name, amount, daily_pct, daily_earn, days_total, days_done, status, started_at)
-       VALUES ($1, $2, $3, 0, 0, 50, 0, 'active', NOW())`,
-      [u.id, `Mining Boost $${amount}`, amount]
+      `INSERT INTO mining_plans (user_id, amount, daily_blk, tap_reward, status)
+       VALUES ($1, $2, $3, $4, 'active')`,
+      [u.id, amount, dailyBlk, tapReward]
     );
 
     const updated = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
@@ -2999,52 +3027,41 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
-// POST /api/mining/earn — tap to earn BLK (investment-based, tap-limited)
+// POST /api/mining/earn — tap to earn BLK (free vs paid)
 app.post('/api/mining/earn', userAuth, async (req, res) => {
   try {
-    const u    = req.tgUser;
-    const taps = Math.min(parseInt(req.body?.taps) || 1, 50); // max 50 per batch
+    const u     = req.tgUser;
+    const taps  = Math.min(parseInt(req.body?.taps) || 1, 50);
     const today = new Date().toISOString().slice(0, 10);
 
-    // Get settings
     const maxTapsRow = await db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`);
     const maxTaps    = parseInt(maxTapsRow?.value || '100');
 
-    // Get user tap state
     const user = await db.one(
-      `SELECT block_tokens, block_tokens_today, block_tokens_today_date,
-              block_tokens_total, mining_taps_today, mining_taps_date
+      `SELECT block_tokens_today, block_tokens_today_date, mining_taps_today, mining_taps_date
        FROM users WHERE id=$1`, [u.id]
     );
+    const isNewDay   = (user?.mining_taps_date || '') !== today;
+    const tapsUsed   = isNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
+    const tapsLeft   = Math.max(0, maxTaps - tapsUsed);
 
-    const isNewDay    = (user?.mining_taps_date || '') !== today;
-    const tapsUsed    = isNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
-    const tapsLeft    = Math.max(0, maxTaps - tapsUsed);
-
-    if (tapsLeft <= 0) {
-      return res.status(429).json({ error: 'Daily tap limit reached', taps_left: 0, max_taps: maxTaps });
-    }
+    if (tapsLeft <= 0)
+      return res.status(429).json({ error: 'Daily tap limit reached', taps_left: 0 });
 
     const actualTaps = Math.min(taps, tapsLeft);
 
-    // Get daily USD from investments
-    const dailyUsd = await getUserDailyUsd(u.id);
-
+    // ONLY check mining_plans — never investments/plans page
+    const miningPlan = await getUserMiningPlan(u.id);
     let earnPerTap, earn;
-    if (dailyUsd > 0) {
-      // Investment-based: Daily BLK = dailyUsd / blkPrice / maxTaps
-      const blkPrice = await getCurrentBlkPrice();
-      const dailyBlk = dailyUsd / blkPrice;
-      earnPerTap     = dailyBlk / maxTaps;
-      earn           = +(earnPerTap * actualTaps).toFixed(6);
+
+    if (miningPlan) {
+      earnPerTap = parseFloat(miningPlan.tap_reward);
+      earn       = +(earnPerTap * actualTaps).toFixed(6);
     } else {
-      // No investment: base rate 0.0001 BLK per tap
-      earn = +(0.0001 * actualTaps).toFixed(4);
+      earnPerTap = 0.0001;
+      earn       = +(0.0001 * actualTaps).toFixed(4);
     }
 
-    if (earn <= 0) earn = +(0.0001 * actualTaps).toFixed(4);
-
-    // Atomic update
     await db.run(
       `UPDATE users SET
         block_tokens            = block_tokens + $1,
@@ -3062,15 +3079,16 @@ app.post('/api/mining/earn', userAuth, async (req, res) => {
     );
 
     res.json({
-      success:      true,
+      success:         true,
       earn,
-      block_tokens: parseFloat(updated.block_tokens || 0),
-      today:        parseFloat(updated.block_tokens_today || 0),
-      total:        parseFloat(updated.block_tokens_total || 0),
-      taps_used:    parseInt(updated.mining_taps_today || 0),
-      taps_left:    Math.max(0, maxTaps - parseInt(updated.mining_taps_today || 0)),
-      max_taps:     maxTaps,
-      earn_per_tap: earnPerTap,
+      earn_per_tap:    earnPerTap,
+      has_mining_plan: !!miningPlan,
+      block_tokens:    parseFloat(updated.block_tokens || 0),
+      today:           parseFloat(updated.block_tokens_today || 0),
+      total:           parseFloat(updated.block_tokens_total || 0),
+      taps_used:       parseInt(updated.mining_taps_today || 0),
+      taps_left:       Math.max(0, maxTaps - parseInt(updated.mining_taps_today || 0)),
+      max_taps:        maxTaps,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
