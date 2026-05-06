@@ -2976,8 +2976,11 @@ async function getUserMiningPlan(userId) {
   if (!plans || !plans.length) return null;
 
   // Get current BLK price (changes on lucky/red day)
-  const blkPrice = await getCurrentBlkPrice();
-  const maxTaps  = 100;
+  let blkPrice = await getCurrentBlkPrice();
+  // Guard: blkPrice must never be 0 or negative — prevents division by zero / Infinity
+  if (!blkPrice || blkPrice <= 0) blkPrice = 0.01;
+
+  const maxTaps = 100;
 
   let totalAmount    = 0;
   let totalDailyBlk  = 0;
@@ -2987,8 +2990,10 @@ async function getUserMiningPlan(userId) {
     const amount   = parseFloat(p.amount || 0);
     const dailyUsd = amount / 50;
     // Recalculate dynamically based on current price
-    const dailyBlk  = +(dailyUsd / blkPrice).toFixed(4);
-    const tapReward = +(dailyBlk / maxTaps).toFixed(6);
+    const dailyBlk     = +(dailyUsd / blkPrice).toFixed(4);
+    // Guard: tapReward must never be 0 for paid users
+    const rawTapReward = +(dailyBlk / maxTaps).toFixed(6);
+    const tapReward    = rawTapReward > 0 ? rawTapReward : 0.0001;
 
     totalAmount    += amount;
     totalDailyBlk  += dailyBlk;
@@ -3083,8 +3088,12 @@ app.post('/api/mining/earn', userAuth, async (req, res) => {
       earnPerTap = parseFloat(miningPlan.tap_reward);
       earn       = +(earnPerTap * actualTaps).toFixed(6);
     } else {
+      // BUG #2 FIX: Use toFixed(6) — toFixed(4) rounds 0.0001*1 to 0.0001 correctly
+      // but could zero out sub-0.0001 values; use 6 decimals to be safe.
+      // Also explicitly ensure earnPerTap is never 0 or undefined.
       earnPerTap = 0.0001;
-      earn       = +(0.0001 * actualTaps).toFixed(4);
+      earn       = +(earnPerTap * actualTaps).toFixed(6);
+      if (earn <= 0) earn = earnPerTap; // ultimate fallback: at minimum 1 tap reward
     }
 
     await db.run(
