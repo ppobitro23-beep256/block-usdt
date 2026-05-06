@@ -949,26 +949,26 @@ async function getHighestActivePlanTier(userId) {
 
 // Get team deposit total for N levels deep
 async function getTeamDeposit(userId, maxLevels) {
-  // BFS across referral tree up to maxLevels
-  // Always use numeric bigint-safe id
-  let currentIds = [parseInt(userId)];
-  let allDownlineIds = [];
-  for (let lvl = 0; lvl < maxLevels; lvl++) {
-    if (!currentIds.length) break;
-    const rows = await db.all(
-      `SELECT id FROM users WHERE referred_by = ANY($1::bigint[])`,
-      [currentIds]
-    );
-    const nextIds = rows.map(r => r.id);
-    allDownlineIds = allDownlineIds.concat(nextIds);
-    currentIds = nextIds;
-  }
-  if (!allDownlineIds.length) return 0;
+  // PERFORMANCE FIX: Single recursive CTE query instead of N sequential BFS queries.
+  // Old approach: 1 DB query per level = up to 7 round trips.
+  // New approach: 1 query total regardless of tree depth.
+  const depth = Math.min(parseInt(maxLevels) || 3, 7);
   const r = await db.one(
-    `SELECT COALESCE(SUM(i.amount), 0) as total
+    `WITH RECURSIVE downline AS (
+       SELECT id, 1 AS lvl
+       FROM users
+       WHERE referred_by = $1::bigint
+       UNION ALL
+       SELECT u.id, d.lvl + 1
+       FROM users u
+       JOIN downline d ON u.referred_by = d.id
+       WHERE d.lvl < $2
+     )
+     SELECT COALESCE(SUM(i.amount), 0) AS total
      FROM investments i
-     WHERE i.user_id = ANY($1::bigint[]) AND i.status IN ('active','completed')`,
-    [allDownlineIds]
+     WHERE i.user_id IN (SELECT id FROM downline)
+       AND i.status IN ('active', 'completed')`,
+    [userId, depth]
   );
   return parseFloat(r.total) || 0;
 }
@@ -1356,8 +1356,8 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     }
     if (user.is_banned) return res.status(403).json({ error: 'banned', reason: user.ban_reason || '' });
 
-    // ── 5. Parallel data fetch ──────────────────────────
-    const [investments, transactions, taskRows, referrals, plansRows, settingRows, activeRefRow, totalL1Row, activeL1Row] = await Promise.all([
+    // ── 5. Parallel data fetch — including VIP to avoid sequential slowdown ──
+    const [investments, transactions, taskRows, referrals, plansRows, settingRows, activeRefRow, totalL1Row, activeL1Row, vipResult] = await Promise.all([
       db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect
               FROM investments WHERE user_id=$1 AND status='active'`, [uid]),
       db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [uid]),
@@ -1375,6 +1375,8 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
       db.one(`SELECT COUNT(DISTINCT u.id) as active FROM users u
               JOIN investments i ON i.user_id = u.id
               WHERE u.referred_by=$1 AND i.status='active'`, [uid]),
+      // VIP query runs in parallel — was sequential before causing 300-800ms extra delay
+      getUserVipStatus(uid).catch(function(e) { log('WARN', 'Bootstrap VIP skipped: ' + e.message); return null; }),
     ]);
 
     const settings = {};
@@ -1399,19 +1401,21 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     // Referral commission
     const pendingComm = parseFloat(user.pending_commission || 0);
 
-    // VIP status (non-blocking — same as /api/user/:id)
+    // VIP already fetched in parallel above — just format the result
     let vipData = null;
-    try {
-      const vs = await getUserVipStatus(uid);
-      vipData = {
-        vip_name:     vs.vip.name,
-        vip_rates:    vs.vip.rates,
-        max_levels:   vs.vip.maxLevels,
-        highest_tier: vs.highestTier || null,
-        team_deposit: +vs.teamDep.toFixed(2),
-      };
-      db.run(`UPDATE users SET vip_level=$1, vip_updated_at=NOW() WHERE id=$2`, [vs.vip.name, uid]).catch(()=>{});
-    } catch(e) { log('WARN', 'Bootstrap VIP skipped: ' + e.message); }
+    if (vipResult) {
+      try {
+        const vs = vipResult;
+        vipData = {
+          vip_name:     vs.vip.name,
+          vip_rates:    vs.vip.rates,
+          max_levels:   vs.vip.maxLevels,
+          highest_tier: vs.highestTier || null,
+          team_deposit: +vs.teamDep.toFixed(2),
+        };
+        db.run(`UPDATE users SET vip_level=$1, vip_updated_at=NOW() WHERE id=$2`, [vs.vip.name, uid]).catch(()=>{});
+      } catch(e) { log('WARN', 'Bootstrap VIP format error: ' + e.message); }
+    }
 
     // ── 6. Single response ──────────────────────────────
     res.json({
