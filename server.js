@@ -2966,15 +2966,40 @@ async function getCurrentBlkPrice() {
   return parseFloat(s.blk_price || '0.01');
 }
 
-// ── Mining helper: get user's active mining plan (boost only) ──
+// ── Mining helper: get sum of ALL active mining plans (dynamic price) ──
 async function getUserMiningPlan(userId) {
-  const plan = await db.one(
+  const plans = await db.all(
     `SELECT id, amount, daily_blk, tap_reward FROM mining_plans 
-     WHERE user_id=$1 AND status='active' 
-     ORDER BY started_at DESC LIMIT 1`,
+     WHERE user_id=$1 AND status='active'`,
     [userId]
   );
-  return plan || null;
+  if (!plans || !plans.length) return null;
+
+  // Get current BLK price (changes on lucky/red day)
+  const blkPrice = await getCurrentBlkPrice();
+  const maxTaps  = 100;
+
+  let totalAmount    = 0;
+  let totalDailyBlk  = 0;
+  let totalTapReward = 0;
+
+  for (const p of plans) {
+    const amount   = parseFloat(p.amount || 0);
+    const dailyUsd = amount / 50;
+    // Recalculate dynamically based on current price
+    const dailyBlk  = +(dailyUsd / blkPrice).toFixed(4);
+    const tapReward = +(dailyBlk / maxTaps).toFixed(6);
+
+    totalAmount    += amount;
+    totalDailyBlk  += dailyBlk;
+    totalTapReward += tapReward;
+  }
+
+  return {
+    amount:     +totalAmount.toFixed(2),
+    daily_blk:  +totalDailyBlk.toFixed(4),
+    tap_reward: +totalTapReward.toFixed(6),
+  };
 }
 
 // POST /api/mining/boost/buy — buy a mining boost package from wallet balance
