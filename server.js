@@ -2132,6 +2132,39 @@ app.post('/api/story-task/claim', userAuth, async (req, res) => {
 // ══════════════════════════════════════════
 
 // Health check
+// ── Debug log endpoint — receives silent client-side error reports ──
+app.post('/api/debug-log', globalLimit, async (req, res) => {
+  try {
+    res.json({ ok: true }); // respond immediately — don't block client
+    const { trigger, uid, ver, totalMs, steps, errors, ua, platform, online, ts } = req.body || {};
+    if (!trigger) return;
+
+    // Only log failures — skip routine reports to keep logs clean
+    const hasFail = (errors && errors.length > 0) || String(trigger).includes('fail') || String(trigger).includes('error');
+    if (!hasFail) return;
+
+    const stepsStr = (steps || []).map(s => s.label + '@' + s.ms + 'ms').join(' → ');
+    const errorsStr = (errors || []).map(e => e.label + ': ' + e.detail).join(' | ');
+
+    log('DEBUG', `[CLIENT] uid=${uid} ver=${ver} trigger=${trigger} totalMs=${totalMs}ms platform=${platform} online=${online}`);
+    if (stepsStr) log('DEBUG', `[CLIENT-STEPS] ${stepsStr}`);
+    if (errorsStr) log('DEBUG', `[CLIENT-ERRORS] ${errorsStr}`);
+
+    // Send to admin Telegram if critical error
+    const isCritical = String(trigger).includes('js_error') || String(trigger).includes('promise_reject');
+    if (isCritical && process.env.ADMIN_TG_CHAT_ID && process.env.BOT_TOKEN) {
+      const msg = `⚠️ <b>Client Error</b>\nUser: ${uid}\nTrigger: ${trigger}\nTotal: ${totalMs}ms\nError: ${errorsStr}\nUA: ${(ua||'').slice(0,80)}`;
+      fetch('https://api.telegram.org/bot' + process.env.BOT_TOKEN + '/sendMessage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: process.env.ADMIN_TG_CHAT_ID, text: msg, parse_mode: 'HTML' })
+      }).catch(() => {});
+    }
+  } catch(e) {
+    res.json({ ok: true }); // always succeed silently
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({status: 'ok', time: new Date().toISOString()});
 });
