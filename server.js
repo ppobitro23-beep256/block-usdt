@@ -1132,13 +1132,14 @@ function verifyTg(initData, logContext) {
     }
     p.delete('hash');
 
-    // Check auth_date expiry (24 hours)
-    // Telegram initData stays same for entire session — 5min is too short
+    // Check auth_date expiry (7 days)
+    // Extended from 24h — Telegram menu button reuses same initData across reopens.
+    // /start always issues fresh initData, but menu button may reuse cached session.
     const authDate = parseInt(p.get('auth_date') || '0');
     const now      = Math.floor(Date.now() / 1000);
     const age      = now - authDate;
-    if (authDate && age > 86400) {
-      if (logContext) log('AUTH', `[${logContext}] initData expired: age=${age}s (>24h)`);
+    if (authDate && age > 604800) { // 7 days = 604800s
+      if (logContext) log('AUTH', `[${logContext}] initData expired: age=${age}s (>7d)`);
       return false;
     }
 
