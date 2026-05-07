@@ -3050,7 +3050,7 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
   try {
     const u      = req.tgUser;
     const amount = parseFloat(req.body?.amount);
-    const VALID  = [10, 30, 50, 100, 200, 300, 500, 1000];
+    const VALID  = [1, 5, 10, 30, 50, 100, 200, 300, 500, 1000];
 
     if (!amount || !VALID.includes(amount))
       return res.status(400).json({ error: 'Invalid package amount' });
@@ -3085,6 +3085,52 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
 
     const updated = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
     log('BOOST', `User ${u.id} bought $${amount} mining boost`);
+
+    // Distribute referral commissions — same logic as normal investment plans
+    try {
+      const buyer = await db.one(`SELECT referred_by, is_active_ref, is_banned FROM users WHERE id=$1`, [u.id]);
+
+      // Mark as active referral on first mining plan purchase (same as investment)
+      if (!buyer.is_active_ref && buyer.referred_by && buyer.id !== buyer.referred_by) {
+        await db.run(`UPDATE users SET is_active_ref=TRUE WHERE id=$1`, [u.id]);
+        log('REF', `User ${u.id} marked as active referral (mining boost) of ${buyer.referred_by}`);
+      }
+
+      // Walk up referral tree — same VIP-based commission as invest route
+      let currentId = u.id;
+      const vipCache = new Map();
+      for (let lvl = 0; lvl < 7; lvl++) {
+        const row = await db.one(`SELECT referred_by, is_banned FROM users WHERE id=$1`, [currentId]);
+        if (!row || !row.referred_by) break;
+        const referrerId = row.referred_by;
+        if (row.is_banned) { currentId = referrerId; continue; }
+
+        let refVip;
+        if (vipCache.has(referrerId)) {
+          refVip = vipCache.get(referrerId);
+        } else {
+          const refVipData = await getUserVipStatus(referrerId, 4);
+          refVip = refVipData.vip;
+          vipCache.set(referrerId, refVip);
+        }
+
+        if (lvl >= refVip.maxLevels) { currentId = referrerId; continue; }
+        const pct = (refVip.rates[lvl] || 0) / 100;
+        if (pct <= 0) { currentId = referrerId; continue; }
+
+        const comm = +(amount * pct).toFixed(4);
+        await db.run(
+          `UPDATE users SET pending_commission=pending_commission+$1, total_commission=total_commission+$1 WHERE id=$2`,
+          [comm, referrerId]
+        );
+        await db.run(
+          `INSERT INTO commissions (user_id,from_user_id,level,amount) VALUES ($1,$2,$3,$4)`,
+          [referrerId, u.id, lvl+1, comm]
+        );
+        log('COMM', `[BOOST] L${lvl+1} ${refVip.name} ${pct*100}% $${comm} → user ${referrerId}`);
+        currentId = referrerId;
+      }
+    } catch(e) { log('WARN', `Boost commission error: ${e.message}`); }
 
     res.json({
       success: true,
