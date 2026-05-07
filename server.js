@@ -4223,6 +4223,27 @@ app.get('/leaderboard', async (req, res) => {
 });
 
 // ══ TOP EARNERS (top 20) ══
+// ── BLK Holdings Leaderboard — ranked by CURRENT block_tokens held ──
+app.get('/api/top-blk-holders', globalLimit, async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT id, first_name, username, block_tokens
+      FROM users
+      WHERE COALESCE(block_tokens, 0) > 0
+        AND is_banned = 0
+      ORDER BY block_tokens DESC
+      LIMIT 25
+    `);
+    const holders = rows.map((u, i) => ({
+      rank:       i + 1,
+      name:       u.username ? '@' + u.username : maskName(u.first_name),
+      blk:        parseFloat(u.block_tokens || 0),
+      id:         u.id
+    }));
+    res.json({ holders });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
 app.get('/api/top-earners', async (req, res) => {
   try {
     const rows = await db.all(`
