@@ -2820,32 +2820,37 @@ app.post('/admin/plan/update-count', adminAuth, async (req, res) => {
 app.post('/api/mining/swap', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
-    // Get settings
     const minRow  = await db.one(`SELECT value FROM settings WHERE key='token_min_swap'`);
     const minSwap = parseFloat(minRow?.value || '10');
     const user    = await db.one(`SELECT block_tokens, balance FROM users WHERE id=$1`, [u.id]);
-    const tokens  = parseFloat(user.block_tokens || 0);
+    const totalTokens = parseFloat(user.block_tokens || 0);
 
+    // Use requested amount — fallback to all tokens if not provided
+    const requestedAmt = parseFloat(req.body?.amount || 0);
+    const tokens = (requestedAmt > 0) ? requestedAmt : totalTokens;
+
+    // Validation
     if (tokens < minSwap) {
       return res.status(400).json({ error: `Minimum ${minSwap} Block Tokens required` });
     }
+    if (tokens > totalTokens) {
+      return res.status(400).json({ error: 'Insufficient BLK balance' });
+    }
 
-    // ── Dynamic rate based on current day mode ──
-    // blkPrice = how much 1 BLK is worth in USD (e.g. 0.01 normal, 0.02 lucky, 0.005 red)
-    // rate = how many BLK per 1 USDT (inverse of blkPrice)
-    const blkPrice   = await getCurrentBlkPrice(); // 0.01 / 0.02 / 0.005
-    const rate       = +(1 / blkPrice).toFixed(4); // 100 / 50 / 200
+    const blkPrice   = await getCurrentBlkPrice();
+    const rate       = +(1 / blkPrice).toFixed(4);
     const usdtAmount = parseFloat((tokens * blkPrice).toFixed(4));
 
     if (usdtAmount <= 0) return res.status(400).json({ error: 'Amount too small' });
 
-    // Deduct tokens, add USDT balance
-    await db.run(
-      `UPDATE users SET block_tokens = block_tokens - $1, balance = balance + $2 WHERE id = $3`,
+    // Atomic deduct — prevents negative balance under race condition
+    const result = await pool.query(
+      `UPDATE users SET block_tokens = block_tokens - $1, balance = balance + $2
+       WHERE id = $3 AND block_tokens >= $1 RETURNING id`,
       [tokens, usdtAmount, u.id]
     );
+    if (result.rowCount === 0) return res.status(400).json({ error: 'Insufficient BLK balance' });
 
-    // Log transaction
     await db.run(
       `INSERT INTO transactions (user_id, type, amount, status, note, created_at)
        VALUES ($1, 'swap', $2, 'completed', $3, NOW())`,
