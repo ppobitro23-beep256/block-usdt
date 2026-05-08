@@ -2821,18 +2821,22 @@ app.post('/api/mining/swap', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     // Get settings
-    const rateRow    = await db.one(`SELECT value FROM settings WHERE key='token_rate'`);
-    const minRow     = await db.one(`SELECT value FROM settings WHERE key='token_min_swap'`);
-    const rate       = parseFloat(rateRow?.value || '100');
-    const minSwap    = parseFloat(minRow?.value   || '10');
-    const user       = await db.one(`SELECT block_tokens, balance FROM users WHERE id=$1`, [u.id]);
-    const tokens     = parseFloat(user.block_tokens || 0);
+    const minRow  = await db.one(`SELECT value FROM settings WHERE key='token_min_swap'`);
+    const minSwap = parseFloat(minRow?.value || '10');
+    const user    = await db.one(`SELECT block_tokens, balance FROM users WHERE id=$1`, [u.id]);
+    const tokens  = parseFloat(user.block_tokens || 0);
 
     if (tokens < minSwap) {
       return res.status(400).json({ error: `Minimum ${minSwap} Block Tokens required` });
     }
 
-    const usdtAmount = parseFloat((tokens / rate).toFixed(4));
+    // ── Dynamic rate based on current day mode ──
+    // blkPrice = how much 1 BLK is worth in USD (e.g. 0.01 normal, 0.02 lucky, 0.005 red)
+    // rate = how many BLK per 1 USDT (inverse of blkPrice)
+    const blkPrice   = await getCurrentBlkPrice(); // 0.01 / 0.02 / 0.005
+    const rate       = +(1 / blkPrice).toFixed(4); // 100 / 50 / 200
+    const usdtAmount = parseFloat((tokens * blkPrice).toFixed(4));
+
     if (usdtAmount <= 0) return res.status(400).json({ error: 'Amount too small' });
 
     // Deduct tokens, add USDT balance
@@ -2845,10 +2849,10 @@ app.post('/api/mining/swap', userAuth, async (req, res) => {
     await db.run(
       `INSERT INTO transactions (user_id, type, amount, status, note, created_at)
        VALUES ($1, 'swap', $2, 'completed', $3, NOW())`,
-      [u.id, usdtAmount, `${tokens} Block Token → $${usdtAmount} USDT (rate: ${rate} token/USDT)`]
+      [u.id, usdtAmount, `${tokens} BLK → $${usdtAmount} USDT (1 BLK = $${blkPrice})`]
     );
 
-    return res.json({ success: true, tokens_used: tokens, usdt_credited: usdtAmount, rate });
+    return res.json({ success: true, tokens_used: tokens, usdt_credited: usdtAmount, rate, blk_price: blkPrice });
   } catch(e) {
     console.error('[swap]', e.message);
     res.status(500).json({ error: 'Server error' });
@@ -2984,6 +2988,7 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       earn_per_tap:    earnPerTap,
       daily_blk:       dailyBlk,
       day_mode:        modeRow?.value || 'normal',
+      blk_price:       blkPrice,
       has_investment:  hasMiningPlan,  // kept for compatibility
       has_mining_plan: hasMiningPlan,
       mining_plan:     miningPlanData,
