@@ -2951,6 +2951,9 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
     ]);
 
+    // ── Get current blk_price based on active day mode ──
+    const blkPrice = await getCurrentBlkPrice();
+
     const isNewDay  = (user?.block_tokens_today_date || '') !== today;
     const tapsToday = isNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
     const maxTaps   = parseInt(maxTapsRow?.value || '100');
