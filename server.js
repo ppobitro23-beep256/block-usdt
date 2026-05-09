@@ -2562,7 +2562,7 @@ app.post('/admin/user/balance', adminAuth, async (req, res) => {
     }
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
-      [user_id, type==='deduct'?'admin_deduct':'admin_add', Math.abs(amount), 'completed', 'Admin adjustment']
+      [user_id, type==='deduct'?'admin_deduct':'admin_add', Math.abs(amount), 'completed', type==='deduct' ? 'Admin deduction (MANUAL)' : 'Admin credit (MANUAL)']
     );
     res.json({success:true});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
@@ -3549,7 +3549,7 @@ app.get('/admin/deposit-history', adminAuth, async (req, res) => {
       );
     } else if (type === 'MANUAL') {
       depRows = await db.all(
-        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'deposit' AND t.note ILIKE '%manual%' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type IN ('deposit','admin_add') AND t.note ILIKE '%manual%' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
         [limit, offset]
       );
     } else if (type === 'BONUS') {
@@ -3570,7 +3570,7 @@ app.get('/admin/deposit-history', adminAuth, async (req, res) => {
     }
     const rows = depRows;
 
-    const countRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='deposit'`);
+    const countRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type IN ('deposit','admin_add','commission')`);
     res.json({ history: rows, total: parseInt(countRow.c), page, limit });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
