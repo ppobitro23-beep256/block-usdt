@@ -716,6 +716,7 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS block_tokens_total REAL DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS block_tokens_today_date TEXT DEFAULT ''`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mining_taps_today INT DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS energy_reset_flag INT DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mining_taps_date TEXT DEFAULT ''`),
     db.run(`INSERT INTO settings (key,value) VALUES ('token_rate','100')      ON CONFLICT (key) DO NOTHING`),
     db.run(`INSERT INTO settings (key,value) VALUES ('token_min_swap','10')   ON CONFLICT (key) DO NOTHING`),
@@ -3039,6 +3040,7 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       daily_blk:       dailyBlk,
       day_mode:        modeRow?.value || 'normal',
       blk_price:       blkPrice,
+      energy_reset:    (user?.energy_reset_flag || 0) === 1,
       has_investment:  hasMiningPlan,  // kept for compatibility
       has_mining_plan: hasMiningPlan,
       mining_plan:     miningPlanData,
@@ -3194,6 +3196,15 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
 });
 
 // POST /api/mining/earn — tap to earn BLK (free vs paid)
+// GET /api/mining/clear-reset — clear energy_reset_flag after client processed it
+app.post('/api/mining/clear-reset', userAuth, async (req, res) => {
+  try {
+    const u = req.tgUser;
+    await db.run(`UPDATE users SET energy_reset_flag=0 WHERE id=$1`, [u.id]);
+    res.json({ success: true });
+  } catch(e) { res.json({ success: false }); }
+});
+
 app.post('/api/mining/earn', userAuth, async (req, res) => {
   try {
     const u     = req.tgUser;
@@ -3476,12 +3487,12 @@ app.post('/admin/mining/energy-reset', adminAuth, async (req, res) => {
   try {
     const { user_id, all } = req.body;
     if (all) {
-      await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date=NULL`);
+      await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date=NULL, energy_reset_flag=1`);
       log('ADMIN', 'Energy reset for ALL users');
       return res.json({ success: true, message: 'All users energy reset' });
     }
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
-    await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date=NULL WHERE id=$1`, [user_id]);
+    await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date=NULL, energy_reset_flag=1 WHERE id=$1`, [user_id]);
     log('ADMIN', 'Energy reset for user ' + user_id);
     res.json({ success: true });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
