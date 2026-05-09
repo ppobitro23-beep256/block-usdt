@@ -3388,6 +3388,235 @@ app.get('/admin/mining/users', adminAuth, async (req, res) => {
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
+
+// ══════════════════════════════════════════
+// ADMIN MINING — EXTENDED APIs
+// ══════════════════════════════════════════
+
+// GET /admin/mining/users-detail — full mining detail per user
+app.get('/admin/mining/users-detail', adminAuth, async (req, res) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const search = req.query.search || '';
+    const limit  = 20;
+    const offset = (page - 1) * limit;
+    const blkPrice = await getCurrentBlkPrice();
+    const modeRow  = await db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`);
+
+    const baseQ = `SELECT u.id, u.first_name, u.username, u.uid,
+             COALESCE(u.block_tokens,0) as blk,
+             COALESCE(u.block_tokens_today,0) as today,
+             COALESCE(u.block_tokens_total,0) as total,
+             COALESCE(u.mining_taps_today,0)  as taps_today,
+             (SELECT COALESCE(SUM(mp.daily_blk),0) FROM mining_plans mp WHERE mp.user_id=u.id AND mp.status='active') as daily_blk,
+             (SELECT COALESCE(SUM(mp.tap_reward),0) FROM mining_plans mp WHERE mp.user_id=u.id AND mp.status='active') as tap_reward,
+             (SELECT COALESCE(SUM(mp.amount),0) FROM mining_plans mp WHERE mp.user_id=u.id AND mp.status='active') as pkg_amount,
+             (SELECT COUNT(*) FROM mining_plans mp WHERE mp.user_id=u.id AND mp.status='active') as pkg_count
+      FROM users u`;
+    const orderQ = `ORDER BY u.block_tokens_total DESC LIMIT $1 OFFSET $2`;
+    let rows;
+    if (search) {
+      rows = await db.all(baseQ + ` WHERE (u.username ILIKE $3 OR u.first_name ILIKE $3) ` + orderQ, [limit, offset, '%' + search + '%']);
+    } else {
+      rows = await db.all(baseQ + ` ` + orderQ, [limit, offset]);
+    }
+
+    const countRow = await db.one(`SELECT COUNT(*) as c FROM users`);
+
+    // Rank
+    const rankRows = await db.all(`SELECT id, ROW_NUMBER() OVER(ORDER BY block_tokens_total DESC) as rank FROM users`);
+    const rankMap = {};
+    rankRows.forEach(r => { rankMap[r.id] = parseInt(r.rank); });
+
+    res.json({
+      users: rows.map(u => ({
+        id:         u.id,
+        name:       u.first_name || 'Unknown',
+        username:   u.username || '',
+        uid:        u.uid || '',
+        blk:        parseFloat(u.blk).toFixed(4),
+        today:      parseFloat(u.today).toFixed(4),
+        total:      parseFloat(u.total).toFixed(4),
+        taps_today: parseInt(u.taps_today),
+        daily_blk:  parseFloat(u.daily_blk).toFixed(4),
+        tap_reward: parseFloat(u.tap_reward).toFixed(6),
+        pkg_amount: parseFloat(u.pkg_amount).toFixed(2),
+        pkg_count:  parseInt(u.pkg_count),
+        rank:       rankMap[u.id] || '—',
+      })),
+      total:     parseInt(countRow.c),
+      page, limit,
+      day_mode:  modeRow?.value || 'normal',
+      blk_price: blkPrice,
+    });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /admin/mining/energy-reset — reset energy for user or all
+app.post('/admin/mining/energy-reset', adminAuth, async (req, res) => {
+  try {
+    const { user_id, all } = req.body;
+    if (all) {
+      await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date=NULL`);
+      log('ADMIN', 'Energy reset for ALL users');
+      return res.json({ success: true, message: 'All users energy reset' });
+    }
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+    await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date=NULL WHERE id=$1`, [user_id]);
+    log('ADMIN', 'Energy reset for user ' + user_id);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /admin/mining/blk-balance — adjust BLK balance
+app.post('/admin/mining/blk-balance', adminAuth, async (req, res) => {
+  try {
+    const { user_id, action, amount } = req.body;
+    if (!user_id || !action || !amount) return res.status(400).json({ error: 'Missing fields' });
+    const amt = parseFloat(amount);
+    if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    let query;
+    if (action === 'add') {
+      query = `UPDATE users SET block_tokens = block_tokens + $1, block_tokens_total = block_tokens_total + $1 WHERE id = $2`;
+    } else if (action === 'subtract') {
+      query = `UPDATE users SET block_tokens = GREATEST(0, block_tokens - $1) WHERE id = $2`;
+    } else if (action === 'set') {
+      query = `UPDATE users SET block_tokens = $1 WHERE id = $2`;
+    } else {
+      return res.status(400).json({ error: 'action must be add|subtract|set' });
+    }
+    await db.run(query, [amt, user_id]);
+    const u = await db.one(`SELECT block_tokens FROM users WHERE id=$1`, [user_id]);
+    log('ADMIN', 'BLK balance ' + action + ' ' + amt + ' for user ' + user_id);
+    res.json({ success: true, new_balance: parseFloat(u.block_tokens).toFixed(4) });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/mining/logs — mining tap logs
+app.get('/admin/mining/logs', adminAuth, async (req, res) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const limit  = 30;
+    const offset = (page - 1) * limit;
+    const rows = await db.all(`
+      SELECT t.id, t.user_id, t.amount, t.type, t.note, t.created_at,
+             u.username, u.first_name
+      FROM transactions t
+      JOIN users u ON u.id = t.user_id
+      WHERE t.type IN ('mining','swap','spin')
+      ORDER BY t.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    const countRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type IN ('mining','swap','spin')`);
+    res.json({ logs: rows, total: parseInt(countRow.c), page, limit });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/mining/holders — BLK holder leaderboard
+app.get('/admin/mining/holders', adminAuth, async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT u.id, u.first_name, u.username, u.uid,
+             u.block_tokens, u.block_tokens_total,
+             ROW_NUMBER() OVER(ORDER BY u.block_tokens_total DESC) as rank
+      FROM users u
+      WHERE u.block_tokens_total > 0
+      ORDER BY u.block_tokens_total DESC
+      LIMIT 50
+    `);
+    res.json({ holders: rows });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/deposit-history — all deposit history with types
+app.get('/admin/deposit-history', adminAuth, async (req, res) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const type   = req.query.type || '';
+    const limit  = 30;
+    const offset = (page - 1) * limit;
+    const where  = type ? "AND t.note ILIKE $3" : '';
+    const params = type ? [limit, offset, '%' + type + '%'] : [limit, offset];
+
+    let depRows;
+    if (type) {
+      depRows = await db.all(
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'deposit' AND t.note ILIKE $3 ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        [limit, offset, '%' + type + '%']
+      );
+    } else {
+      depRows = await db.all(
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'deposit' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        [limit, offset]
+      );
+    }
+    const rows = depRows;
+
+    const countRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='deposit'`);
+    res.json({ history: rows, total: parseInt(countRow.c), page, limit });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/plan-history — plan purchase + cancel history
+app.get('/admin/plan-history', adminAuth, async (req, res) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const limit  = 30;
+    const offset = (page - 1) * limit;
+    const rows = await db.all(`
+      SELECT i.id, i.user_id, i.amount, i.status, i.created_at, i.cancelled_at,
+             i.daily_profit, i.total_collected,
+             p.name as plan_name, p.daily_percent,
+             u.username, u.first_name
+      FROM investments i
+      JOIN plans p ON p.id = i.plan_id
+      JOIN users u ON u.id = i.user_id
+      ORDER BY i.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    const countRow = await db.one(`SELECT COUNT(*) as c FROM investments`);
+    res.json({ plans: rows, total: parseInt(countRow.c), page, limit });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/earnings-history — all earnings with filter
+app.get('/admin/earnings-history', adminAuth, async (req, res) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const filter = req.query.filter || '';
+    const limit  = 30;
+    const offset = (page - 1) * limit;
+    const typeMap = {
+      mining: ["'mining'"],
+      referral: ["'commission'"],
+      spin: ["'spin'"],
+      bonus: ["'bonus'"],
+      investment: ["'profit'", "'collect'"],
+    };
+    const typeList = typeMap[filter] ? typeMap[filter].join(',') : "'mining','commission','spin','bonus','profit','collect'";
+    const earningsQ = 'SELECT t.id, t.user_id, t.amount, t.type, t.note, t.status, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type IN (' + typeList + ') ORDER BY t.created_at DESC LIMIT $1 OFFSET $2';
+    const countQ    = 'SELECT COUNT(*) as c FROM transactions WHERE type IN (' + typeList + ')';
+    const rows      = await db.all(earningsQ, [limit, offset]);
+    const countRow  = await db.one(countQ, []);
+    res.json({ earnings: rows, total: parseInt(countRow.c), page, limit });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// POST /admin/mining/spin-reset — reset spin for user or all
+app.post('/admin/mining/spin-reset', adminAuth, async (req, res) => {
+  try {
+    const { user_id, all } = req.body;
+    if (all) {
+      await db.run(`UPDATE users SET last_spin_date=NULL`);
+      return res.json({ success: true, message: 'All users spin reset' });
+    }
+    if (!user_id) return res.status(400).json({ error: 'user_id required' });
+    await db.run(`UPDATE users SET last_spin_date=NULL WHERE id=$1`, [user_id]);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
 // ══════════════════════════════════════════
 // TELEGRAM GROUP INTEGRATION — ADMIN ROUTES
 // ══════════════════════════════════════════
