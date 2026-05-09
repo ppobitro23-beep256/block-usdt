@@ -3492,14 +3492,16 @@ app.post('/admin/mining/energy-reset', adminAuth, async (req, res) => {
   try {
     const { user_id, all } = req.body;
     if (all) {
-      await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date=NULL, energy_reset_flag=1`);
+      await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date='1970-01-01', energy_reset_flag=1`);
       log('ADMIN', 'Energy reset for ALL users');
-      return res.json({ success: true, message: 'All users energy reset' });
+      return res.json({ success: true, message: 'All users energy reset', energy_reset: true });
     }
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
-    await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date=NULL, energy_reset_flag=1 WHERE id=$1`, [user_id]);
+    await db.run(`UPDATE users SET mining_taps_today=0, mining_taps_date='1970-01-01', energy_reset_flag=1 WHERE id=$1`, [user_id]);
     log('ADMIN', 'Energy reset for user ' + user_id);
-    res.json({ success: true });
+    // Return fresh state so frontend can update immediately
+    const updatedUser = await db.one(`SELECT mining_taps_today, energy_reset_flag FROM users WHERE id=$1`, [user_id]);
+    res.json({ success: true, taps_today: 0, taps_left: 100, energy_reset: true });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -3673,7 +3675,7 @@ app.post('/admin/mining/spin-reset', adminAuth, async (req, res) => {
       return res.json({ success: true, message: 'All users spin reset' });
     }
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
-    await db.run(`UPDATE users SET last_spin_date=NULL WHERE id=$1`, [user_id]);
+    await db.run(`UPDATE users SET last_spin_date=NULL, spin_reset_flag=1 WHERE id=$1`, [user_id]);
     res.json({ success: true });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
