@@ -1357,26 +1357,26 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     }
     if (user.is_banned) return res.status(403).json({ error: 'banned', reason: user.ban_reason || '' });
 
-    // ── 5. Parallel data fetch — including VIP to avoid sequential slowdown ──
+    // ── 5. Parallel data fetch with timeout protection ──
+    const withTimeout = (promise, ms, fallback) =>
+      Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(fallback), ms))]);
+
     const [investments, transactions, taskRows, referrals, plansRows, settingRows, activeRefRow, totalL1Row, activeL1Row, vipResult] = await Promise.all([
-      db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect
-              FROM investments WHERE user_id=$1 AND status='active'`, [uid]),
-      db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [uid]),
-      db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [uid]),
-      db.all(`SELECT r.id, r.first_name, r.username, r.created_at,
+      withTimeout(db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect
+              FROM investments WHERE user_id=$1 AND status='active'`, [uid]), 5000, []),
+      withTimeout(db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [uid]), 5000, []),
+      withTimeout(db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [uid]), 5000, []),
+      withTimeout(db.all(`SELECT r.id, r.first_name, r.username, r.created_at,
                 COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=r.id AND type='deposit' AND status='approved'),0) as total_deposit
-              FROM users r WHERE r.referred_by=$1 ORDER BY r.created_at DESC LIMIT 50`, [uid]),
-      db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY min_amt ASC`),
-      db.all(`SELECT key,value FROM settings`),
-      db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1
-              AND id IN (SELECT DISTINCT user_id FROM transactions WHERE type='deposit' AND status='approved')`, [uid]),
-      // TRUE total count — no LIMIT
-      db.one(`SELECT COUNT(*) as total FROM users WHERE referred_by=$1`, [uid]),
-      // TRUE active L1 count — has active investment
-      db.one(`SELECT COUNT(DISTINCT u.id) as active FROM users u
+              FROM users r WHERE r.referred_by=$1 ORDER BY r.created_at DESC LIMIT 50`, [uid]), 5000, []),
+      withTimeout(db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY min_amt ASC`), 5000, []),
+      withTimeout(db.all(`SELECT key,value FROM settings`), 5000, []),
+      withTimeout(db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1
+              AND id IN (SELECT DISTINCT user_id FROM transactions WHERE type='deposit' AND status='approved')`, [uid]), 5000, {c:0}),
+      withTimeout(db.one(`SELECT COUNT(*) as total FROM users WHERE referred_by=$1`, [uid]), 5000, {total:0}),
+      withTimeout(db.one(`SELECT COUNT(DISTINCT u.id) as active FROM users u
               JOIN investments i ON i.user_id = u.id
-              WHERE u.referred_by=$1 AND i.status='active'`, [uid]),
-      // VIP query runs in parallel — was sequential before causing 300-800ms extra delay
+              WHERE u.referred_by=$1 AND i.status='active'`, [uid]), 5000, {active:0}),
       getUserVipStatus(uid).catch(function(e) { log('WARN', 'Bootstrap VIP skipped: ' + e.message); return null; }),
     ]);
 
