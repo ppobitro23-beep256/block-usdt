@@ -3017,7 +3017,7 @@ async function getCurrentBlkPrice() {
   return parseFloat(s.blk_price || '0.01');
 }
 
-// ── Mining helper: get sum of ALL active mining plans (dynamic price) ──
+// ── Mining helper: get sum of ALL active mining plans (use DB saved values) ──
 async function getUserMiningPlan(userId) {
   const plans = await db.all(
     `SELECT id, amount, daily_blk, tap_reward FROM mining_plans 
@@ -3026,29 +3026,26 @@ async function getUserMiningPlan(userId) {
   );
   if (!plans || !plans.length) return null;
 
-  // Get current BLK price (changes on lucky/red day)
-  let blkPrice = await getCurrentBlkPrice();
-  // Guard: blkPrice must never be 0 or negative — prevents division by zero / Infinity
-  if (!blkPrice || blkPrice <= 0) blkPrice = 0.01;
-
-  const maxTaps = 100;
-
   let totalAmount    = 0;
   let totalDailyBlk  = 0;
   let totalTapReward = 0;
 
   for (const p of plans) {
-    const amount   = parseFloat(p.amount || 0);
-    const dailyUsd = amount / 50;
-    // Recalculate dynamically based on current price
-    const dailyBlk     = +(dailyUsd / blkPrice).toFixed(4);
-    // Guard: tapReward must never be 0 for paid users
-    const rawTapReward = +(dailyBlk / maxTaps).toFixed(6);
-    const tapReward    = rawTapReward > 0 ? rawTapReward : 0.0001;
+    const amount     = parseFloat(p.amount     || 0);
+    const dailyBlk   = parseFloat(p.daily_blk  || 0);
+    const tapReward  = parseFloat(p.tap_reward || 0);
 
     totalAmount    += amount;
     totalDailyBlk  += dailyBlk;
     totalTapReward += tapReward;
+  }
+
+  // Guard: tapReward must never be 0 for paid users
+  if (totalTapReward <= 0 && totalAmount > 0) {
+    const blkPrice = await getCurrentBlkPrice();
+    const safePrice = blkPrice > 0 ? blkPrice : 0.01;
+    totalDailyBlk  = +((totalAmount / 50) / safePrice).toFixed(4);
+    totalTapReward = +(totalDailyBlk / 100).toFixed(6);
   }
 
   return {
