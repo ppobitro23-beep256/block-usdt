@@ -2995,7 +2995,8 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
 
     const [user, maxTapsRow, modeRow] = await Promise.all([
       db.one(`SELECT block_tokens, block_tokens_today, block_tokens_today_date,
-                     block_tokens_total, mining_taps_today, mining_taps_date
+                     block_tokens_total, mining_taps_today, mining_taps_date,
+                     energy_reset_flag, spin_reset_flag
               FROM users WHERE id=$1`, [u.id]),
       db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
       db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
