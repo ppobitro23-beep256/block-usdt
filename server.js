@@ -3452,6 +3452,25 @@ app.get('/admin/mining/users-detail', adminAuth, async (req, res) => {
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
+
+// GET /admin/mining/find-user — find user by id, username, or name
+app.get('/admin/mining/find-user', adminAuth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'Query required' });
+    const rows = await db.all(`
+      SELECT id, first_name, username, uid, block_tokens, block_tokens_total, mining_taps_today
+      FROM users
+      WHERE CAST(id AS TEXT) = $1
+         OR CAST(uid AS TEXT) = $1
+         OR username ILIKE $2
+         OR first_name ILIKE $2
+      LIMIT 5
+    `, [q, '%' + q + '%']);
+    res.json({ users: rows });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
 // POST /admin/mining/energy-reset — reset energy for user or all
 app.post('/admin/mining/energy-reset', adminAuth, async (req, res) => {
   try {
