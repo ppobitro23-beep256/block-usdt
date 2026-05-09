@@ -344,9 +344,12 @@ app.use(express.json({ limit: '50kb' }));
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10,                  // max connections
-  idleTimeoutMillis: 30000, // close idle after 30s
-  connectionTimeoutMillis: 5000, // fail fast if DB unreachable
+  max: 10,                   // max connections
+  min: 2,                    // keep minimum 2 connections alive always
+  idleTimeoutMillis: 60000,  // close idle after 60s (was 30s)
+  connectionTimeoutMillis: 8000, // wait longer for connection
+  keepAlive: true,           // TCP keepalive — prevents connection drops
+  keepAliveInitialDelayMillis: 10000,
 });
 pool.on('error', (err) => {
   console.error('[PG POOL ERROR]', err.message);
