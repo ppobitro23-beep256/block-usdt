@@ -341,14 +341,43 @@ app.use(express.json({ limit: '50kb' }));
 // ══════════════════════════════════════════
 // PostgreSQL CONNECTION
 // ══════════════════════════════════════════
+// ── In-memory cache for rarely-changing data ──────────
+const _cache = {
+  settings: null, settingsAt: 0,
+  plans: null,    plansAt: 0,
+  TTL: 60000, // 60 seconds
+};
+
+async function getCachedSettings() {
+  if (_cache.settings && Date.now() - _cache.settingsAt < _cache.TTL) return _cache.settings;
+  const rows = await db.all('SELECT key,value FROM settings');
+  _cache.settings = rows;
+  _cache.settingsAt = Date.now();
+  return rows;
+}
+
+async function getCachedPlans() {
+  if (_cache.plans && Date.now() - _cache.plansAt < _cache.TTL) return _cache.plans;
+  const rows = await db.all('SELECT * FROM plans WHERE is_active=1 ORDER BY min_amt ASC');
+  _cache.plans = rows;
+  _cache.plansAt = Date.now();
+  return rows;
+}
+
+// Invalidate cache when admin changes settings/plans
+function invalidateCache() {
+  _cache.settings = null;
+  _cache.plans = null;
+}
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10,                   // max connections
-  min: 2,                    // keep minimum 2 connections alive always
-  idleTimeoutMillis: 60000,  // close idle after 60s (was 30s)
-  connectionTimeoutMillis: 8000, // wait longer for connection
-  keepAlive: true,           // TCP keepalive — prevents connection drops
+  max: 20,                   // max 20 connections (was 10)
+  min: 3,                    // keep minimum 3 connections alive always
+  idleTimeoutMillis: 60000,  // close idle after 60s
+  connectionTimeoutMillis: 8000,
+  keepAlive: true,
   keepAliveInitialDelayMillis: 10000,
 });
 pool.on('error', (err) => {
@@ -1303,6 +1332,14 @@ app.post('/api/auth', authLimit, async (req, res) => {
 // Combines auth + user data in one request
 // ══════════════════════════════════════════
 app.post('/api/bootstrap', authLimit, async (req, res) => {
+  // Hard timeout — if bootstrap takes >15s, send error instead of hanging
+  const _bootstrapTimeout = setTimeout(() => {
+    if (!res.headersSent) {
+      log('WARN', 'Bootstrap timeout — sending fallback response');
+      res.status(503).json({ error: 'Server timeout, please retry' });
+    }
+  }, 15000);
+
   try {
     // ── 1. Verify initData ──────────────────────────────
     const raw = req.headers['x-telegram-init-data'] || req.body?.initData || '';
@@ -1369,13 +1406,13 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
               FROM investments WHERE user_id=$1 AND status='active'`, [uid]), 5000, []),
       withTimeout(db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [uid]), 5000, []),
       withTimeout(db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [uid]), 5000, []),
-      withTimeout(db.all(`SELECT r.id, r.first_name, r.username, r.created_at,
-                COALESCE((SELECT SUM(amount) FROM transactions WHERE user_id=r.id AND type='deposit' AND status='approved'),0) as total_deposit
+      withTimeout(db.all(`SELECT r.id, r.first_name, r.username, r.created_at, 0 as total_deposit
               FROM users r WHERE r.referred_by=$1 ORDER BY r.created_at DESC LIMIT 50`, [uid]), 5000, []),
-      withTimeout(db.all(`SELECT * FROM plans WHERE is_active=1 ORDER BY min_amt ASC`), 5000, []),
-      withTimeout(db.all(`SELECT key,value FROM settings`), 5000, []),
-      withTimeout(db.one(`SELECT COUNT(*) as c FROM users WHERE referred_by=$1
-              AND id IN (SELECT DISTINCT user_id FROM transactions WHERE type='deposit' AND status='approved')`, [uid]), 5000, {c:0}),
+      withTimeout(getCachedPlans(), 5000, []),
+      withTimeout(getCachedSettings(), 5000, []),
+      withTimeout(db.one(`SELECT COUNT(DISTINCT u.id) as c FROM users u
+              JOIN transactions t ON t.user_id=u.id AND t.type='deposit' AND t.status='approved'
+              WHERE u.referred_by=$1`, [uid]), 5000, {c:0}),
       withTimeout(db.one(`SELECT COUNT(*) as total FROM users WHERE referred_by=$1`, [uid]), 5000, {total:0}),
       withTimeout(db.one(`SELECT COUNT(DISTINCT u.id) as active FROM users u
               JOIN investments i ON i.user_id = u.id
@@ -1452,10 +1489,12 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
       settings,
       vip: vipData,
     });
+    clearTimeout(_bootstrapTimeout);
 
   } catch(e) {
+    clearTimeout(_bootstrapTimeout);
     log('ERROR', 'Bootstrap error: ' + e.message);
-    res.status(500).json({ error: 'Server error. Please try again.' });
+    if (!res.headersSent) res.status(500).json({ error: 'Server error. Please try again.' });
   }
 });
 
@@ -3237,6 +3276,7 @@ app.post('/admin/settings', adminAuth, async (req, res) => {
     for (const [k,v] of Object.entries(settings)) {
       await db.run(`INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2`, [k,String(v)]);
     }
+    invalidateCache(); // Clear cached settings
     res.json({success:true});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
