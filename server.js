@@ -3548,8 +3548,9 @@ app.get('/admin/deposit-history', adminAuth, async (req, res) => {
         [limit, offset]
       );
     } else if (type === 'MANUAL') {
+      // Show all admin_add records (manually added by admin)
       depRows = await db.all(
-        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type IN ('deposit','admin_add') AND t.note ILIKE '%manual%' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'admin_add' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
         [limit, offset]
       );
     } else if (type === 'BONUS') {
@@ -3570,7 +3571,14 @@ app.get('/admin/deposit-history', adminAuth, async (req, res) => {
     }
     const rows = depRows;
 
-    const countRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type IN ('deposit','admin_add','commission')`);
+    // Count based on current filter
+    let countQ;
+    if (type === 'AUTO')     countQ = "SELECT COUNT(*) as c FROM transactions WHERE type='deposit' AND (note ILIKE '%auto%' OR note ILIKE '%moralis%' OR note ILIKE '%bep20%' OR note ILIKE '%trc20%')";
+    else if (type === 'MANUAL')   countQ = "SELECT COUNT(*) as c FROM transactions WHERE type='admin_add'";
+    else if (type === 'BONUS')    countQ = "SELECT COUNT(*) as c FROM transactions WHERE type IN ('deposit','admin_add') AND note ILIKE '%bonus%'";
+    else if (type === 'REFERRAL') countQ = "SELECT COUNT(*) as c FROM transactions WHERE type='commission'";
+    else                          countQ = "SELECT COUNT(*) as c FROM transactions WHERE type IN ('deposit','admin_add','commission')";
+    const countRow = await db.one(countQ);
     res.json({ history: rows, total: parseInt(countRow.c), page, limit });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
