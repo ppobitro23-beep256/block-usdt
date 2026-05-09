@@ -3504,11 +3504,11 @@ app.get('/admin/mining/logs', adminAuth, async (req, res) => {
              u.username, u.first_name
       FROM transactions t
       JOIN users u ON u.id = t.user_id
-      WHERE t.type IN ('mining','swap','spin')
+      WHERE t.type IN ('swap','spin_reward','earn','invest','commission','admin_add','admin_deduct')
       ORDER BY t.created_at DESC
       LIMIT $1 OFFSET $2
     `, [limit, offset]);
-    const countRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type IN ('mining','swap','spin')`);
+    const countRow = await db.one(`SELECT COUNT(*) as c FROM transactions WHERE type IN ('swap','spin_reward','earn','invest','commission','admin_add','admin_deduct')`);
     res.json({ logs: rows, total: parseInt(countRow.c), page, limit });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
@@ -3539,15 +3539,32 @@ app.get('/admin/deposit-history', adminAuth, async (req, res) => {
     const where  = type ? "AND t.note ILIKE $3" : '';
     const params = type ? [limit, offset, '%' + type + '%'] : [limit, offset];
 
+    // Deposit type labels from note field
+    // AUTO = auto_deposit, MANUAL = manual keyword, BONUS = bonus keyword, REFERRAL = referral keyword
     let depRows;
-    if (type) {
+    if (type === 'AUTO') {
       depRows = await db.all(
-        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'deposit' AND t.note ILIKE $3 ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
-        [limit, offset, '%' + type + '%']
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'deposit' AND (t.note ILIKE '%auto%' OR t.note ILIKE '%moralis%' OR t.note ILIKE '%bep20%' OR t.note ILIKE '%trc20%') ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        [limit, offset]
+      );
+    } else if (type === 'MANUAL') {
+      depRows = await db.all(
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'deposit' AND t.note ILIKE '%manual%' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        [limit, offset]
+      );
+    } else if (type === 'BONUS') {
+      depRows = await db.all(
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type IN ('deposit','admin_add') AND t.note ILIKE '%bonus%' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        [limit, offset]
+      );
+    } else if (type === 'REFERRAL') {
+      depRows = await db.all(
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'commission' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        [limit, offset]
       );
     } else {
       depRows = await db.all(
-        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'deposit' ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
+        "SELECT t.id, t.user_id, t.amount, t.status, t.type, t.note, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type IN ('deposit','admin_add','commission') ORDER BY t.created_at DESC LIMIT $1 OFFSET $2",
         [limit, offset]
       );
     }
@@ -3588,13 +3605,14 @@ app.get('/admin/earnings-history', adminAuth, async (req, res) => {
     const limit  = 30;
     const offset = (page - 1) * limit;
     const typeMap = {
-      mining: ["'mining'"],
-      referral: ["'commission'"],
-      spin: ["'spin'"],
-      bonus: ["'bonus'"],
-      investment: ["'profit'", "'collect'"],
+      mining:     ["'swap'"],
+      referral:   ["'commission'"],
+      spin:       ["'spin_reward'"],
+      bonus:      ["'admin_add'","'bonus'"],
+      investment: ["'earn'","'invest'"],
     };
-    const typeList = typeMap[filter] ? typeMap[filter].join(',') : "'mining','commission','spin','bonus','profit','collect'";
+    const allTypes = "'swap','commission','spin_reward','admin_add','bonus','earn','invest','deposit','withdraw'";
+    const typeList = typeMap[filter] ? typeMap[filter].join(',') : allTypes;
     const earningsQ = 'SELECT t.id, t.user_id, t.amount, t.type, t.note, t.status, t.created_at, u.username, u.first_name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type IN (' + typeList + ') ORDER BY t.created_at DESC LIMIT $1 OFFSET $2';
     const countQ    = 'SELECT COUNT(*) as c FROM transactions WHERE type IN (' + typeList + ')';
     const rows      = await db.all(earningsQ, [limit, offset]);
