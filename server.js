@@ -717,6 +717,7 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS block_tokens_today_date TEXT DEFAULT ''`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mining_taps_today INT DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS energy_reset_flag INT DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_spin_date TEXT DEFAULT NULL`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mining_taps_date TEXT DEFAULT ''`),
     db.run(`INSERT INTO settings (key,value) VALUES ('token_rate','100')      ON CONFLICT (key) DO NOTHING`),
     db.run(`INSERT INTO settings (key,value) VALUES ('token_min_swap','10')   ON CONFLICT (key) DO NOTHING`),
