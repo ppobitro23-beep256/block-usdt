@@ -2996,7 +2996,7 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
     const [user, maxTapsRow, modeRow] = await Promise.all([
       db.one(`SELECT block_tokens, block_tokens_today, block_tokens_today_date,
                      block_tokens_total, mining_taps_today, mining_taps_date,
-                     energy_reset_flag, spin_reset_flag
+                     energy_reset_flag, spin_reset_flag, last_spin_date
               FROM users WHERE id=$1`, [u.id]),
       db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
       db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
@@ -3045,6 +3045,7 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       blk_price:       blkPrice,
       energy_reset:    (user?.energy_reset_flag || 0) === 1,
       spin_reset:      (user?.spin_reset_flag || 0) === 1,
+      next_spin_at:    user?.last_spin_date ? new Date(new Date(user.last_spin_date).getTime() + 86400000).toISOString() : null,
       has_investment:  hasMiningPlan,  // kept for compatibility
       has_mining_plan: hasMiningPlan,
       mining_plan:     miningPlanData,
