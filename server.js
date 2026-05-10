@@ -3182,7 +3182,7 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
       [u.id, amount, dailyBlk, tapReward, blkPrice, purchaseMode]
     );
 
-    const updated = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
+    const updated = await db.one(`SELECT balance, reinvest_credit FROM users WHERE id=$1`, [u.id]);
     log('BOOST', `User ${u.id} bought $${amount} mining boost`);
 
     // Distribute referral commissions — same logic as normal investment plans
@@ -3235,6 +3235,7 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
       success: true,
       message: `Mining boost activated! $${amount} USDT deducted.`,
       balance: parseFloat(updated.balance || 0),
+      credit:  parseFloat(updated.reinvest_credit || 0),
       amount
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
