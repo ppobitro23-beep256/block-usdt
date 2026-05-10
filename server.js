@@ -3033,7 +3033,15 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       miningPlanData = null;
     }
 
-    if ((user?.energy_reset_flag || 0) === 1) log('MINING', `mining/info: energy_reset=true for user ${u.id}`);
+    const energyReset = (user?.energy_reset_flag || 0) === 1;
+    const spinReset   = (user?.spin_reset_flag   || 0) === 1;
+
+    // Auto-clear flags immediately after reading — no need for separate clear-reset call
+    if (energyReset || spinReset) {
+      log('MINING', `mining/info: clearing flags for user ${u.id} — energy=${energyReset} spin=${spinReset}`);
+      await db.run(`UPDATE users SET energy_reset_flag=0, spin_reset_flag=0 WHERE id=$1`, [u.id]);
+    }
+
     res.json({
       block_tokens:    parseFloat(user?.block_tokens || 0),
       today:           isNewDay ? 0 : parseFloat(user?.block_tokens_today || 0),
@@ -3045,8 +3053,8 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       daily_blk:       dailyBlk,
       day_mode:        modeRow?.value || 'normal',
       blk_price:       blkPrice,
-      energy_reset:    (user?.energy_reset_flag || 0) === 1,
-      spin_reset:      (user?.spin_reset_flag || 0) === 1,
+      energy_reset:    energyReset,
+      spin_reset:      spinReset,
       next_spin_at:    user?.last_spin_date ? new Date(new Date(user.last_spin_date).getTime() + 86400000).toISOString() : null,
       has_investment:  hasMiningPlan,
       has_mining_plan: hasMiningPlan,
