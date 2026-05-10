@@ -2967,7 +2967,8 @@ app.post('/api/spin/claim', userAuth, async (req, res) => {
         block_tokens            = block_tokens + $1,
         block_tokens_total      = block_tokens_total + $1,
         block_tokens_today      = CASE WHEN $3::TEXT != COALESCE(block_tokens_today_date,'') THEN $1::REAL ELSE block_tokens_today + $1 END,
-        block_tokens_today_date = $3::TEXT
+        block_tokens_today_date = $3::TEXT,
+        last_spin_date          = NOW()
        WHERE id=$2`,
       [reward, u.id, today]
     );
