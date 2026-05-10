@@ -3033,7 +3033,7 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       miningPlanData = null;
     }
 
-    if ((user?.energy_reset_flag || 0) === 1) log('MINING', \`mining/info: energy_reset=true for user \${u.id}\`);
+    if ((user?.energy_reset_flag || 0) === 1) log('MINING', `mining/info: energy_reset=true for user ${u.id}`);
     res.json({
       block_tokens:    parseFloat(user?.block_tokens || 0),
       today:           isNewDay ? 0 : parseFloat(user?.block_tokens_today || 0),
