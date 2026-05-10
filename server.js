@@ -3205,7 +3205,7 @@ app.post('/api/mining/clear-reset', userAuth, async (req, res) => {
 app.post('/api/mining/earn', userAuth, async (req, res) => {
   try {
     const u     = req.tgUser;
-    const taps  = Math.min(parseInt(req.body?.taps) || 1, 50);
+    const taps  = Math.min(parseInt(req.body?.taps) || 1, 100);
     const today = new Date().toISOString().slice(0, 10);
 
     const maxTapsRow = await db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`);
@@ -3257,16 +3257,17 @@ app.post('/api/mining/earn', userAuth, async (req, res) => {
     );
 
     res.json({
-      success:         true,
+      success:           true,
       earn,
-      earn_per_tap:    earnPerTap,
-      has_mining_plan: !!miningPlan,
-      block_tokens:    parseFloat(updated.block_tokens || 0),
-      today:           parseFloat(updated.block_tokens_today || 0),
-      total:           parseFloat(updated.block_tokens_total || 0),
-      taps_used:       parseInt(updated.mining_taps_today || 0),
-      taps_left:       Math.max(0, maxTaps - parseInt(updated.mining_taps_today || 0)),
-      max_taps:        maxTaps,
+      earn_per_tap:      earnPerTap,
+      has_mining_plan:   !!miningPlan,
+      taps_used_this_req: actualTaps,
+      block_tokens:      parseFloat(updated.block_tokens || 0),
+      today:             parseFloat(updated.block_tokens_today || 0),
+      total:             parseFloat(updated.block_tokens_total || 0),
+      taps_used:         parseInt(updated.mining_taps_today || 0),
+      taps_left:         Math.max(0, maxTaps - parseInt(updated.mining_taps_today || 0)),
+      max_taps:          maxTaps,
     });
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
