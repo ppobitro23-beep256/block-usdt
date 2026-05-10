@@ -2558,20 +2558,24 @@ app.get('/admin/logs', adminAuth, async (req, res) => {
 
 app.post('/admin/user/balance', adminAuth, async (req, res) => {
   try {
-    const {user_id, type} = req.body;
+    const {user_id, type, wallet} = req.body;
     const amount = parseFloat(req.body.amount);
     if (!user_id || isNaN(amount) || amount <= 0) return res.status(400).json({error:'Invalid user_id or amount'});
     const change = type==='deduct' ? -Math.abs(amount) : Math.abs(amount);
-    // Guard: prevent deduct below zero
+    const isCredit = wallet === 'credit';
+    const field    = isCredit ? 'reinvest_credit' : 'balance';
+    const label    = isCredit ? 'Credit' : 'Withdrawable';
+
     if (type === 'deduct') {
-      const r = await pool.query(`UPDATE users SET balance=balance+$1 WHERE id=$2 AND balance>=$3 RETURNING id`, [change, user_id, Math.abs(amount)]);
-      if (r.rowCount === 0) return res.status(400).json({error:'Insufficient balance for deduction'});
+      const r = await pool.query(`UPDATE users SET ${field}=${field}+$1 WHERE id=$2 AND ${field}>=$3 RETURNING id`, [change, user_id, Math.abs(amount)]);
+      if (r.rowCount === 0) return res.status(400).json({error:`Insufficient ${label} balance for deduction`});
     } else {
-      await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [change, user_id]);
+      await db.run(`UPDATE users SET ${field}=${field}+$1 WHERE id=$2`, [change, user_id]);
     }
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
-      [user_id, type==='deduct'?'admin_deduct':'admin_add', Math.abs(amount), 'completed', type==='deduct' ? 'Admin deduction (MANUAL)' : 'Admin credit (MANUAL)']
+      [user_id, type==='deduct'?'admin_deduct':'admin_add', Math.abs(amount), 'completed',
+       type==='deduct' ? `Admin deduction (${label})` : `Admin credit (${label})`]
     );
     res.json({success:true});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
