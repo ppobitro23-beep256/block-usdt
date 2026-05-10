@@ -3005,9 +3005,10 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
     // ── Get current blk_price based on active day mode ──
     const blkPrice = await getCurrentBlkPrice();
 
-    const isNewDay  = (user?.block_tokens_today_date || '') !== today;
-    const tapsToday = isNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
-    const maxTaps   = parseInt(maxTapsRow?.value || '100');
+    const isNewDay    = (user?.block_tokens_today_date || '') !== today;
+    const isTapNewDay = (user?.mining_taps_date || '') !== today;
+    const tapsToday   = isTapNewDay ? 0 : (parseInt(user?.mining_taps_today) || 0);
+    const maxTaps     = parseInt(maxTapsRow?.value || '100');
 
     // Check if user has active mining plan (boost)
     const miningPlan = await getUserMiningPlan(u.id);
@@ -3069,38 +3070,29 @@ async function getCurrentBlkPrice() {
 // ── Mining helper: get sum of ALL active mining plans (use DB saved values) ──
 async function getUserMiningPlan(userId) {
   const plans = await db.all(
-    `SELECT id, amount, daily_blk, tap_reward FROM mining_plans 
+    `SELECT id, amount FROM mining_plans 
      WHERE user_id=$1 AND status='active'`,
     [userId]
   );
   if (!plans || !plans.length) return null;
 
-  let totalAmount    = 0;
-  let totalDailyBlk  = 0;
-  let totalTapReward = 0;
+  let totalAmount = 0;
+  for (const p of plans) totalAmount += parseFloat(p.amount || 0);
+  if (totalAmount <= 0) return null;
 
-  for (const p of plans) {
-    const amount     = parseFloat(p.amount     || 0);
-    const dailyBlk   = parseFloat(p.daily_blk  || 0);
-    const tapReward  = parseFloat(p.tap_reward || 0);
-
-    totalAmount    += amount;
-    totalDailyBlk  += dailyBlk;
-    totalTapReward += tapReward;
-  }
-
-  // Guard: tapReward must never be 0 for paid users
-  if (totalTapReward <= 0 && totalAmount > 0) {
-    const blkPrice = await getCurrentBlkPrice();
-    const safePrice = blkPrice > 0 ? blkPrice : 0.01;
-    totalDailyBlk  = +((totalAmount / 50) / safePrice).toFixed(4);
-    totalTapReward = +(totalDailyBlk / 100).toFixed(6);
-  }
+  // Dynamic: recalculate every time using CURRENT blk_price
+  // Lucky Day  → blkPrice high  → less BLK per tap
+  // Normal Day → blkPrice normal → normal BLK per tap  
+  // Red Day    → blkPrice low   → more BLK per tap
+  const blkPrice  = await getCurrentBlkPrice();
+  const safePrice = (blkPrice > 0) ? blkPrice : 0.01;
+  const dailyBlk  = +((totalAmount / 50) / safePrice).toFixed(4);
+  const tapReward = +(dailyBlk / 100).toFixed(6);
 
   return {
     amount:     +totalAmount.toFixed(2),
-    daily_blk:  +totalDailyBlk.toFixed(4),
-    tap_reward: +totalTapReward.toFixed(6),
+    daily_blk:  dailyBlk,
+    tap_reward: tapReward,
   };
 }
 
