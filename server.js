@@ -3033,6 +3033,7 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       miningPlanData = null;
     }
 
+    if ((user?.energy_reset_flag || 0) === 1) log('MINING', \`mining/info: energy_reset=true for user \${u.id}\`);
     res.json({
       block_tokens:    parseFloat(user?.block_tokens || 0),
       today:           isNewDay ? 0 : parseFloat(user?.block_tokens_today || 0),
@@ -3047,7 +3048,7 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       energy_reset:    (user?.energy_reset_flag || 0) === 1,
       spin_reset:      (user?.spin_reset_flag || 0) === 1,
       next_spin_at:    user?.last_spin_date ? new Date(new Date(user.last_spin_date).getTime() + 86400000).toISOString() : null,
-      has_investment:  hasMiningPlan,  // kept for compatibility
+      has_investment:  hasMiningPlan,
       has_mining_plan: hasMiningPlan,
       mining_plan:     miningPlanData,
     });
@@ -3198,6 +3199,7 @@ app.post('/api/mining/clear-reset', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     await db.run(`UPDATE users SET energy_reset_flag=0, spin_reset_flag=0 WHERE id=$1`, [u.id]);
+    log('MINING', `clear-reset called for user ${u.id}`);
     res.json({ success: true });
   } catch(e) { res.json({ success: false }); }
 });
