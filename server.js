@@ -2292,7 +2292,7 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
   try {
     const [
       totalUsersRow, activeInvestsRow, totalDepositRow, totalWithdrawRow,
-      pendingDepRow, pendingWithRow, bannedUsersRow, totalBalanceRow,
+      pendingDepRow, pendingWithRow, bannedUsersRow, totalBalanceRow, totalCreditRow,
       todayDepRow, autoDepRow, fraudRow
     ] = await Promise.all([
       db.one(`SELECT COUNT(*) as c FROM users`),
@@ -2303,6 +2303,7 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
       db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='withdraw' AND status='pending'`),
       db.one(`SELECT COUNT(*) as c FROM users WHERE is_banned=1`),
       db.one(`SELECT COALESCE(SUM(balance),0) as s FROM users`),
+      db.one(`SELECT COALESCE(SUM(reinvest_credit),0) as s FROM users`),
       // [NEW] Today's deposits
       db.one(`SELECT COALESCE(SUM(amount),0) as s, COUNT(*) as c FROM transactions WHERE type='deposit' AND status='approved' AND created_at >= NOW() - INTERVAL '24 hours'`),
       // [NEW] Auto vs semi counts
@@ -2318,6 +2319,7 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
       pendingWith: pendingWithRow.c,
       bannedUsers: bannedUsersRow.c,
       totalBalance: totalBalanceRow.s,
+      totalCredit:  totalCreditRow.s,
       // [NEW]
       todayDepAmount: todayDepRow.s,
       todayDepCount: todayDepRow.c,
