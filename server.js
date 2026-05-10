@@ -2994,13 +2994,14 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
     const u     = req.tgUser;
     const today = new Date().toISOString().slice(0, 10);
 
-    const [user, maxTapsRow, modeRow] = await Promise.all([
+    const [user, maxTapsRow, modeRow, lastSpinLog] = await Promise.all([
       db.one(`SELECT block_tokens, block_tokens_today, block_tokens_today_date,
                      block_tokens_total, mining_taps_today, mining_taps_date,
                      energy_reset_flag, spin_reset_flag, last_spin_date
               FROM users WHERE id=$1`, [u.id]),
       db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
       db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
+      db.one(`SELECT spun_at FROM spin_logs WHERE user_id=$1 ORDER BY spun_at DESC LIMIT 1`, [u.id]).catch(() => null),
     ]);
 
     // ── Get current blk_price based on active day mode ──
@@ -3056,7 +3057,7 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
       blk_price:       blkPrice,
       energy_reset:    energyReset,
       spin_reset:      spinReset,
-      next_spin_at:    user?.last_spin_date ? new Date(new Date(user.last_spin_date).getTime() + 86400000).toISOString() : null,
+      next_spin_at:    (spinReset || !lastSpinLog?.spun_at) ? null : new Date(new Date(lastSpinLog.spun_at).getTime() + 86400000).toISOString(),
       has_investment:  hasMiningPlan,
       has_mining_plan: hasMiningPlan,
       mining_plan:     miningPlanData,
