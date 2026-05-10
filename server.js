@@ -2012,12 +2012,12 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
       return res.status(400).json({ error: 'Already collected. Please wait 24 hours.', secondsLeft: secsLeft });
     }
     await db.run(
-      `UPDATE users SET balance=balance+$1, total_earned=total_earned+$1, today_earned=today_earned+$1, last_earn_date=TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') WHERE id=$2`,
+      `UPDATE users SET reinvest_credit=reinvest_credit+$1, total_earned=total_earned+$1, today_earned=today_earned+$1, last_earn_date=TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') WHERE id=$2`,
       [earn, u.id]
     );
     await db.run(
       `INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`,
-      [u.id,'earn',earn,'completed',`Daily: ${inv.plan_name}`]
+      [u.id,'earn',earn,'completed',`Credit: ${inv.plan_name}`]
     );
     // Use days_total from inv — days_done already incremented in atomic UPDATE above
     const newDaysDone = (inv.days_done || 0) + 1;
@@ -3117,19 +3117,30 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
     if (!amount || !VALID.includes(amount))
       return res.status(400).json({ error: 'Invalid package amount' });
 
-    // Check wallet balance
-    const user = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
-    const bal  = parseFloat(user?.balance || 0);
+    // Check wallet balance (credit first, then withdrawable)
+    const user = await db.one(`SELECT balance, reinvest_credit FROM users WHERE id=$1`, [u.id]);
+    const bal    = parseFloat(user?.balance || 0);
+    const credit = parseFloat(user?.reinvest_credit || 0);
+    const totalAvailable = bal + credit;
 
-    if (bal < amount)
+    if (totalAvailable < amount)
       return res.status(400).json({
-        error: 'Insufficient balance. Recharge your wallet.',
+        error: 'Insufficient balance.',
         balance: bal,
+        credit: credit,
         required: amount
       });
 
-    // Deduct from wallet
-    await db.run(`UPDATE users SET balance = balance - $1 WHERE id=$2`, [amount, u.id]);
+    // Deduct credit first, then balance
+    const creditToUse  = Math.min(credit, amount);
+    const balanceToUse = +(amount - creditToUse).toFixed(4);
+    if (creditToUse > 0 && balanceToUse > 0) {
+      await db.run(`UPDATE users SET balance=balance-$1, reinvest_credit=reinvest_credit-$2 WHERE id=$3`, [balanceToUse, creditToUse, u.id]);
+    } else if (creditToUse > 0) {
+      await db.run(`UPDATE users SET reinvest_credit=reinvest_credit-$1 WHERE id=$2`, [creditToUse, u.id]);
+    } else {
+      await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [balanceToUse, u.id]);
+    }
 
     // Calculate tap_reward and daily_blk based on BLK price
     const blkPrice  = await getCurrentBlkPrice();
