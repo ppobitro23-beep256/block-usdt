@@ -737,14 +737,18 @@ async function setupDB() {
     db.run(`CREATE INDEX IF NOT EXISTS idx_spin_logs_user ON spin_logs (user_id, spun_at DESC)`),
     // Mining plans — separate from investment plans
     db.run(`CREATE TABLE IF NOT EXISTS mining_plans (
-      id         SERIAL PRIMARY KEY,
-      user_id    BIGINT NOT NULL,
-      amount     REAL NOT NULL,
-      daily_blk  REAL NOT NULL,
-      tap_reward REAL NOT NULL,
-      status     TEXT DEFAULT 'active',
-      started_at TIMESTAMP DEFAULT NOW()
+      id            SERIAL PRIMARY KEY,
+      user_id       BIGINT NOT NULL,
+      amount        REAL NOT NULL,
+      daily_blk     REAL NOT NULL,
+      tap_reward    REAL NOT NULL,
+      status        TEXT DEFAULT 'active',
+      locked_price  REAL DEFAULT 0,
+      purchase_mode TEXT DEFAULT 'normal',
+      started_at    TIMESTAMP DEFAULT NOW()
     )`),
+    db.run(`ALTER TABLE mining_plans ADD COLUMN IF NOT EXISTS locked_price  REAL DEFAULT 0`),
+    db.run(`ALTER TABLE mining_plans ADD COLUMN IF NOT EXISTS purchase_mode TEXT DEFAULT 'normal'`),
     db.run(`CREATE INDEX IF NOT EXISTS idx_mining_plans_user ON mining_plans (user_id, status)`),
   ]);
 
@@ -3083,29 +3087,47 @@ async function getCurrentBlkPrice() {
 // ── Mining helper: get sum of ALL active mining plans (use DB saved values) ──
 async function getUserMiningPlan(userId) {
   const plans = await db.all(
-    `SELECT id, amount FROM mining_plans 
-     WHERE user_id=$1 AND status='active'`,
+    `SELECT id, amount, daily_blk, tap_reward, locked_price, purchase_mode, started_at
+     FROM mining_plans WHERE user_id=$1 AND status='active'`,
     [userId]
   );
   if (!plans || !plans.length) return null;
 
-  let totalAmount = 0;
-  for (const p of plans) totalAmount += parseFloat(p.amount || 0);
+  let totalAmount    = 0;
+  let totalDailyBlk  = 0;
+  let totalTapReward = 0;
+
+  for (const p of plans) {
+    totalAmount    += parseFloat(p.amount     || 0);
+    totalDailyBlk  += parseFloat(p.daily_blk  || 0);
+    totalTapReward += parseFloat(p.tap_reward || 0);
+  }
+
   if (totalAmount <= 0) return null;
 
-  // Dynamic: recalculate every time using CURRENT blk_price
-  // Lucky Day  → blkPrice high  → less BLK per tap
-  // Normal Day → blkPrice normal → normal BLK per tap  
-  // Red Day    → blkPrice low   → more BLK per tap
-  const blkPrice  = await getCurrentBlkPrice();
-  const safePrice = (blkPrice > 0) ? blkPrice : 0.01;
-  const dailyBlk  = +((totalAmount / 50) / safePrice).toFixed(4);
-  const tapReward = +(dailyBlk / 100).toFixed(6);
+  // Guard: if old plans have no stored tap_reward, recalculate ONCE using stored locked_price
+  // This handles plans purchased before the locked system was implemented
+  if (totalTapReward <= 0) {
+    totalDailyBlk  = 0; // reset to avoid double counting
+    totalTapReward = 0;
+    for (const p of plans) {
+      const lockedPrice = parseFloat(p.locked_price || 0);
+      const safePrice   = lockedPrice > 0 ? lockedPrice : 0.01;
+      const amt         = parseFloat(p.amount || 0);
+      const dBlk        = +((amt / 50) / safePrice).toFixed(4);
+      const tReward     = +(dBlk / 100).toFixed(6);
+      totalDailyBlk  += dBlk;
+      totalTapReward += tReward;
+      // Save for future — fill in missing values once
+      await db.run(`UPDATE mining_plans SET daily_blk=$1, tap_reward=$2, locked_price=CASE WHEN locked_price=0 THEN $3 ELSE locked_price END WHERE id=$4`, [dBlk, tReward, safePrice, p.id]);
+    }
+  }
 
   return {
     amount:     +totalAmount.toFixed(2),
-    daily_blk:  dailyBlk,
-    tap_reward: tapReward,
+    daily_blk:  +totalDailyBlk.toFixed(4),
+    tap_reward: +totalTapReward.toFixed(6),
+    plans:      plans,
   };
 }
 
@@ -3144,18 +3166,20 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
       await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [balanceToUse, u.id]);
     }
 
-    // Calculate tap_reward and daily_blk based on BLK price
-    const blkPrice  = await getCurrentBlkPrice();
-    const maxTaps   = 100;
-    const dailyUsd  = amount / 50;
-    const dailyBlk  = +(dailyUsd / blkPrice).toFixed(4);
-    const tapReward = +(dailyBlk / maxTaps).toFixed(6);
+    // Calculate tap_reward and daily_blk — LOCKED at purchase time
+    const blkPrice    = await getCurrentBlkPrice();
+    const modeRow2    = await db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`).catch(() => ({value:'normal'}));
+    const purchaseMode = modeRow2?.value || 'normal';
+    const maxTaps     = 100;
+    const dailyUsd    = amount / 50;
+    const dailyBlk    = +(dailyUsd / blkPrice).toFixed(4);
+    const tapReward   = +(dailyBlk / maxTaps).toFixed(6);
 
-    // Insert into mining_plans (NOT investments)
+    // Insert into mining_plans with LOCKED values — never recalculated
     await db.run(
-      `INSERT INTO mining_plans (user_id, amount, daily_blk, tap_reward, status)
-       VALUES ($1, $2, $3, $4, 'active')`,
-      [u.id, amount, dailyBlk, tapReward]
+      `INSERT INTO mining_plans (user_id, amount, daily_blk, tap_reward, status, locked_price, purchase_mode)
+       VALUES ($1, $2, $3, $4, 'active', $5, $6)`,
+      [u.id, amount, dailyBlk, tapReward, blkPrice, purchaseMode]
     );
 
     const updated = await db.one(`SELECT balance FROM users WHERE id=$1`, [u.id]);
@@ -3385,7 +3409,17 @@ app.get('/admin/mining/stats', adminAuth, async (req, res) => {
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
-// GET /admin/mining/users — per-user mining stats
+// GET /admin/mining/user-plans/:id — all mining plans for a user
+app.get('/admin/mining/user-plans/:id', adminAuth, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const user = await db.one(`SELECT id, first_name, username, uid, block_tokens, block_tokens_total, block_tokens_today, mining_taps_today FROM users WHERE id=$1`, [userId]);
+    const plans = await db.all(`SELECT id, amount, daily_blk, tap_reward, locked_price, purchase_mode, status, started_at FROM mining_plans WHERE user_id=$1 ORDER BY started_at DESC`, [userId]);
+    res.json({ user, plans });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+
 app.get('/admin/mining/users', adminAuth, async (req, res) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page) || 1);
