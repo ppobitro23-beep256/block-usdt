@@ -3714,10 +3714,11 @@ app.get('/admin/earnings-users', adminAuth, async (req, res) => {
       SELECT u.id, u.uid, u.username, u.first_name, u.total_earned, u.today_earned,
              MAX(t.created_at) as last_earn
       FROM users u
-      LEFT JOIN transactions t ON t.user_id = u.id AND t.type IN ('earn','swap','commission','spin_reward','admin_add','bonus')
+      LEFT JOIN transactions t ON t.user_id = u.id
+        AND t.type IN ('earn','swap','commission','spin_reward','admin_add','bonus')
       WHERE 1=1 ${searchClause}
-      GROUP BY u.id, u.uid, u.username, u.first_name, u.total_earned, u.today_earned
-      ORDER BY u.total_earned DESC
+      GROUP BY u.id
+      ORDER BY u.total_earned DESC NULLS LAST
       LIMIT $1 OFFSET $2
     `, params);
 
