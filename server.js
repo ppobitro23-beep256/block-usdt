@@ -3700,7 +3700,74 @@ app.get('/admin/plan-history', adminAuth, async (req, res) => {
   } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
 });
 
-// GET /admin/earnings-history — all earnings with filter
+// GET /admin/earnings-users — user list with total earnings for earnings history page
+app.get('/admin/earnings-users', adminAuth, async (req, res) => {
+  try {
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const limit  = 20;
+    const offset = (page - 1) * limit;
+    const search = req.query.search || '';
+    const searchClause = search ? `AND (u.username ILIKE $3 OR u.first_name ILIKE $3)` : '';
+    const params = search ? [limit, offset, `%${search}%`] : [limit, offset];
+
+    const rows = await db.all(`
+      SELECT u.id, u.uid, u.username, u.first_name, u.total_earned, u.today_earned,
+             MAX(t.created_at) as last_earn
+      FROM users u
+      LEFT JOIN transactions t ON t.user_id = u.id AND t.type IN ('earn','swap','commission','spin_reward','admin_add','bonus')
+      WHERE 1=1 ${searchClause}
+      GROUP BY u.id, u.uid, u.username, u.first_name, u.total_earned, u.today_earned
+      ORDER BY u.total_earned DESC
+      LIMIT $1 OFFSET $2
+    `, params);
+
+    const countRow = await db.one(
+      search ? `SELECT COUNT(*) as c FROM users WHERE username ILIKE $1 OR first_name ILIKE $1` : `SELECT COUNT(*) as c FROM users`,
+      search ? [`%${search}%`] : []
+    );
+    res.json({ users: rows, total: parseInt(countRow.c), page, limit });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/user-earnings/:id — per-user earnings with filter and pagination
+app.get('/admin/user-earnings/:id', adminAuth, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const limit  = 20;
+    const offset = (page - 1) * limit;
+    const filter = req.query.filter || '';
+
+    const typeMap = {
+      mining:     ["'swap'"],
+      referral:   ["'commission'"],
+      spin:       ["'spin_reward'"],
+      bonus:      ["'admin_add'","'bonus'"],
+      investment: ["'earn'"],
+    };
+    const typeClause = filter && typeMap[filter]
+      ? `AND t.type IN (${typeMap[filter].join(',')})` : '';
+
+    const rows = await db.all(`
+      SELECT t.id, t.type, t.amount, t.note, t.status, t.created_at
+      FROM transactions t
+      WHERE t.user_id=$1 AND t.type IN ('earn','swap','commission','spin_reward','admin_add','bonus')
+      ${typeClause}
+      ORDER BY t.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [userId, limit, offset]);
+
+    const countRow = await db.one(`
+      SELECT COUNT(*) as c FROM transactions
+      WHERE user_id=$1 AND type IN ('earn','swap','commission','spin_reward','admin_add','bonus')
+      ${typeClause}
+    `, [userId]);
+
+    res.json({ earnings: rows, total: parseInt(countRow.c), page, limit });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// GET /admin/earnings-history — kept for compatibility
 app.get('/admin/earnings-history', adminAuth, async (req, res) => {
   try {
     const page   = Math.max(1, parseInt(req.query.page) || 1);
