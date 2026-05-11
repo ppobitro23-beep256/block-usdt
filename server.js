@@ -3688,10 +3688,10 @@ app.get('/admin/plan-history', adminAuth, async (req, res) => {
     const rows = await db.all(`
       SELECT i.id, i.user_id, i.amount, i.status, i.created_at, i.cancelled_at,
              i.daily_profit, i.total_collected,
-             p.name as plan_name, p.daily_percent,
+             COALESCE(p.name, i.plan_name, 'Investment') as plan_name,
              u.username, u.first_name
       FROM investments i
-      JOIN plans p ON p.id = i.plan_id
+      LEFT JOIN plans p ON p.id = i.plan_id
       JOIN users u ON u.id = i.user_id
       ORDER BY i.created_at DESC
       LIMIT $1 OFFSET $2
