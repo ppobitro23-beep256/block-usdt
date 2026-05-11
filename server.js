@@ -3686,8 +3686,9 @@ app.get('/admin/plan-history', adminAuth, async (req, res) => {
     const limit  = 30;
     const offset = (page - 1) * limit;
     const rows = await db.all(`
-      SELECT i.id, i.user_id, i.amount, i.status, i.started_at as created_at, i.cancelled_at,
-             i.daily_pct, i.total_collected, i.plan_name,
+      SELECT i.id, i.user_id, i.amount, i.status, i.started_at,
+             i.cancelled_at, i.daily_pct, i.daily_earn,
+             i.days_done, i.days_total, i.plan_name,
              u.username, u.first_name
       FROM investments i
       JOIN users u ON u.id = i.user_id
