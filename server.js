@@ -3686,14 +3686,12 @@ app.get('/admin/plan-history', adminAuth, async (req, res) => {
     const limit  = 30;
     const offset = (page - 1) * limit;
     const rows = await db.all(`
-      SELECT i.id, i.user_id, i.amount, i.status, i.created_at, i.cancelled_at,
-             i.daily_profit, i.total_collected,
-             COALESCE(p.name, i.plan_name, 'Investment') as plan_name,
+      SELECT i.id, i.user_id, i.amount, i.status, i.started_at as created_at, i.cancelled_at,
+             i.daily_pct, i.total_collected, i.plan_name,
              u.username, u.first_name
       FROM investments i
-      LEFT JOIN plans p ON p.id = i.plan_id
       JOIN users u ON u.id = i.user_id
-      ORDER BY i.created_at DESC
+      ORDER BY i.started_at DESC
       LIMIT $1 OFFSET $2
     `, [limit, offset]);
     const countRow = await db.one(`SELECT COUNT(*) as c FROM investments`);
