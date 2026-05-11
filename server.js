@@ -3740,32 +3740,36 @@ app.get('/admin/user-earnings/:id', adminAuth, async (req, res) => {
     const filter = req.query.filter || '';
 
     const typeMap = {
-      mining:     ["'swap'"],
-      referral:   ["'commission'"],
-      spin:       ["'spin_reward'"],
-      bonus:      ["'admin_add'","'bonus'"],
-      investment: ["'earn'"],
+      mining:     ['swap'],
+      referral:   ['commission'],
+      spin:       ['spin_reward'],
+      bonus:      ['admin_add', 'bonus'],
+      investment: ['earn'],
     };
-    const typeClause = filter && typeMap[filter]
-      ? `AND t.type IN (${typeMap[filter].join(',')})` : '';
 
-    const rows = await db.all(`
-      SELECT t.id, t.type, t.amount, t.note, t.status, t.created_at
-      FROM transactions t
-      WHERE t.user_id=$1 AND t.type IN ('earn','swap','commission','spin_reward','admin_add','bonus')
-      ${typeClause}
-      ORDER BY t.created_at DESC
-      LIMIT $2 OFFSET $3
-    `, [userId, limit, offset]);
+    const allTypes = ['earn','swap','commission','spin_reward','admin_add','bonus'];
+    const types = (filter && typeMap[filter]) ? typeMap[filter] : allTypes;
 
-    const countRow = await db.one(`
-      SELECT COUNT(*) as c FROM transactions
-      WHERE user_id=$1 AND type IN ('earn','swap','commission','spin_reward','admin_add','bonus')
-      ${typeClause}
-    `, [userId]);
+    // Build parameterized placeholders: $2, $3, $4...
+    const placeholders = types.map((_, i) => `$${i + 2}`).join(',');
 
-    res.json({ earnings: rows, total: parseInt(countRow.c), page, limit });
-  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+    const rows = await db.all(
+      `SELECT t.id, t.type, t.amount, t.note, t.status, t.created_at
+       FROM transactions t
+       WHERE t.user_id=$1 AND t.type IN (${placeholders})
+       ORDER BY t.created_at DESC
+       LIMIT $${types.length + 2} OFFSET $${types.length + 3}`,
+      [userId, ...types, limit, offset]
+    );
+
+    const countRow = await db.one(
+      `SELECT COUNT(*) as c FROM transactions
+       WHERE user_id=$1 AND type IN (${placeholders})`,
+      [userId, ...types]
+    );
+
+    res.json({ earnings: rows, total: parseInt(countRow.c || 0), page, limit });
+  } catch(e) { log('ERROR', 'user-earnings: ' + e.message); res.status(500).json({ error: e.message }); }
 });
 
 // GET /admin/earnings-history — kept for compatibility
