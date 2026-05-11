@@ -2384,7 +2384,7 @@ app.get('/admin/stat/balances', adminAuth, async (req, res) => {
     const limit = Math.min(50, parseInt(req.query.limit) || 20);
     const offset = (page - 1) * limit;
     const [rows, totalRow] = await Promise.all([
-      db.all(`SELECT id, username, first_name, balance FROM users ORDER BY balance DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+      db.all(`SELECT id, username, first_name, balance, reinvest_credit FROM users ORDER BY balance DESC LIMIT $1 OFFSET $2`, [limit, offset]),
       db.one(`SELECT COUNT(*) as c FROM users`)
     ]);
     const total = parseInt(totalRow.c);
