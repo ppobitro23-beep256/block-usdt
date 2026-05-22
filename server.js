@@ -1889,12 +1889,13 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
     }
     const address = user.withdraw_address; // use DB address, never trust user input
 
-    // ✅ ACTIVE PLAN CHECK — must have at least 1 active investment
-    const activePlan = await db.one(
-      `SELECT id FROM investments WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]
-    );
-    if (!activePlan) {
-      return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment plan.' });
+    // ✅ ACTIVE PLAN CHECK — normal investment OR mining plan (either is enough)
+    const [activePlan, activeMiningPlan] = await Promise.all([
+      db.one(`SELECT id FROM investments  WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]),
+      db.one(`SELECT id FROM mining_plans WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]),
+    ]);
+    if (!activePlan && !activeMiningPlan) {
+      return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment or mining plan.' });
     }
 
     // ✅ CANCEL LOCK CHECK — 12h after plan cancellation
@@ -3980,10 +3981,9 @@ app.get('/api/referral-stats/:id', async (req, res) => {
 // AUTO DEPOSIT — Generate unique amount
 // ══════════════════════════════════════════
 async function generateUniqueAmt(base) {
-  // ✅ FIX: expanded from 5 → 99 possible suffix values (0.01–0.99)
-  // This dramatically reduces collision chance when many deposits are pending
+  // 99 possible suffix values (0.01–0.99) — reduces collision chance
   for (let i = 0; i < 99; i++) {
-    const dec  = (Math.floor(Math.random() * 5) + 1); // 1–5 cents (0.01–0.05)
+    const dec  = (Math.floor(Math.random() * 99) + 1); // 1–99 cents (0.01–0.99)
     const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
     const ex   = await db.one(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
@@ -4052,50 +4052,8 @@ app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
-// AUTO DEPOSIT — Credit helper
-// ══════════════════════════════════════════
-async function creditAutoDeposit(dep, txHash) {
-  try {
-    // [RACE GUARD] Only credit if this UPDATE actually changed a row
-    // If another process already completed this deposit, rowCount = 0 → skip
-    const result = await pool.query(
-      `UPDATE auto_deposits SET status='completed', tx_hash=$1 WHERE id=$2 AND status='pending'`,
-      [txHash, dep.id]
-    );
-    if (result.rowCount === 0) {
-      console.log(`[SKIP] Deposit ${dep.id} already processed (race guard)`);
-      return;
-    }
-    // Credit balance only after confirmed row lock
-    await db.run(`UPDATE users SET balance=balance+$1 WHERE id=$2`, [dep.amount, dep.user_id]); // credit base amount, not unique_amt (which has suffix)
-    // Transaction log
-    await db.run(
-      `INSERT INTO transactions (user_id,type,amount,network,txid,status,note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [dep.user_id,'deposit',dep.amount,'BEP20',txHash,'approved','Auto-detected']
-    );
-    // Mark first_deposit task as completed (NO balance reward — exact deposit amount only)
-    const taskDone = await db.one(
-      `SELECT id FROM tasks WHERE user_id=$1 AND task_key='first_deposit'`, [dep.user_id]
-    );
-    if (!taskDone) {
-      await db.run(
-        `INSERT INTO tasks (user_id, task_key, completed, completed_at)
-         VALUES ($1,'first_deposit',1,NOW()) ON CONFLICT DO NOTHING`,
-        [dep.user_id]
-      );
-    }
-    console.log(`✅ Auto deposit: user=${dep.user_id} base_amt=${dep.amount} unique_amt=${dep.unique_amt} ${dep.network} tx=${txHash}`);
-  } catch(e) {
-    // Gracefully handle unique constraint (tx_hash duplicate = already credited)
-    if (e.message.includes('unique') || e.message.includes('duplicate') || e.message.includes('idx_auto_dep_txhash')) {
-      console.log(`[SAFE] TX ${txHash.slice(0,16)} already processed — skipping`);
-    } else {
-      console.error('[creditAutoDeposit] error:', e.message);
-    }
-  }
-}
-
+// NOTE: creditAutoDeposit() removed — replaced by safeCredit() which has
+// full idempotency, webhook audit logging, and admin failure alerts.
 // ══════════════════════════════════════════
 // BEP20 AUTO DEPOSIT — Moralis Streams
 // Webhook-based, real-time, no polling needed
@@ -5514,12 +5472,13 @@ app.post('/api/promo/claim', userAuth, async (req, res) => {
       return res.status(400).json({ error: 'Bind your withdrawal address first' });
     }
 
-    // 2b. Active plan check
-    const activePlanCheck = await db.one(
-      `SELECT id FROM investments WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]
-    );
-    if (!activePlanCheck) {
-      return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment plan.' });
+    // 2b. Active plan check — normal investment OR mining plan (either is enough)
+    const [activePlanCheck, activeMiningCheck] = await Promise.all([
+      db.one(`SELECT id FROM investments  WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]),
+      db.one(`SELECT id FROM mining_plans WHERE user_id=$1 AND status='active' LIMIT 1`, [u.id]),
+    ]);
+    if (!activePlanCheck && !activeMiningCheck) {
+      return res.status(400).json({ error: '⚠️ Withdrawal requires at least 1 active investment or mining plan.' });
     }
 
     // 2c. Cancel lock check
@@ -5758,8 +5717,13 @@ app.post('/api/invest/paid-unlock', userAuth, async (req, res) => {
     if (Math.abs(amt - requiredFee) > 0.01) return res.status(400).json({ error: `Unlock fee is $${requiredFee}` });
     if (user.balance < requiredFee) return res.status(400).json({ error: 'Insufficient balance' });
 
-    // Deduct fee and log
-    await db.run(`UPDATE users SET balance=balance-$1 WHERE id=$2`, [requiredFee, u.id]);
+    // Deduct fee — atomic guard prevents negative balance under race condition
+    const unlockDeduct = await pool.query(
+      `UPDATE users SET balance=balance-$1 WHERE id=$2 AND balance>=$1 RETURNING id`,
+      [requiredFee, u.id]
+    );
+    if (unlockDeduct.rowCount === 0) return res.status(400).json({ error: 'Insufficient balance' });
+
     await db.run(
       `INSERT INTO plan_unlock_logs (user_id, plan_id, plan_name, unlock_type, fee_paid) VALUES ($1,$2,$3,'paid',$4)`,
       [u.id, plan.id, plan.name, requiredFee]
