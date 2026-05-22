@@ -2582,6 +2582,355 @@ app.post('/admin/user/balance', adminAuth, async (req, res) => {
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// INVESTMENT ANALYTICS v2
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
+  try {
+    // ── Dynamic date range from query params ─────────────────────────────────
+    const reqDays = Math.min(365, Math.max(1, parseInt(req.query.days) || 30));
+    // Sanitize dates — only allow YYYY-MM-DD format to prevent SQL injection
+    const DATE_RE  = /^\d{4}-\d{2}-\d{2}$/;
+    const dateFrom = (req.query.date_from && DATE_RE.test(req.query.date_from)) ? req.query.date_from : null;
+    const dateTo   = (req.query.date_to   && DATE_RE.test(req.query.date_to))   ? req.query.date_to   : null;
+    const intervalSql = (dateFrom && dateTo)
+      ? `created_at >= '${dateFrom}'::date AND created_at < ('${dateTo}'::date + INTERVAL '1 day')`
+      : `created_at >= NOW() - INTERVAL '${reqDays} days'`;
+
+    // ── Run all queries in parallel ───────────────────────────────────────────
+    const [
+      summaryRows,
+      investorsRaw,
+      completedRaw,
+      dailyPayouts,
+      dailyDeposits,
+      planStats,
+      sharedWallets,
+      sharedIPs,
+      rapidDepositors,
+      highWithdraw,
+      unusualReferrers,
+      roiRows,
+    ] = await Promise.all([
+
+      // 1. Summary counters
+      Promise.all([
+        db.one(`SELECT COUNT(*) as c FROM users`),
+        db.one(`SELECT COUNT(DISTINCT user_id) as c FROM investments WHERE status='active'`),
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='deposit' AND status='approved'`),
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='approved'`),
+        db.one(`SELECT COUNT(*) as c FROM investments WHERE status='active'`),
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='earn'`),
+        db.one(`SELECT COALESCE(SUM(pending_earn),0) as s FROM investments WHERE status='active'`),
+        db.one(`SELECT COUNT(*) as c FROM investments WHERE status='completed'`),
+      ]),
+
+      // 2. All active investors — single optimised query
+      db.all(`
+        SELECT
+          u.id           AS user_id,
+          u.username,
+          u.first_name,
+          u.ip_address,
+          u.withdraw_address,
+          u.is_banned,
+          u.created_at   AS user_created,
+
+          i.id           AS inv_id,
+          i.plan_name,
+          i.amount,
+          i.daily_pct,
+          i.daily_earn,
+          i.days_total,
+          i.days_done,
+          i.pending_earn,
+          i.last_collect,
+          i.started_at,
+
+          CASE WHEN i.days_total > 0
+               THEN ROUND((i.days_done::NUMERIC / i.days_total) * 100, 2)
+               ELSE 0 END                              AS roi_pct,
+          (i.days_done * i.daily_earn)                 AS total_earned,
+          ((i.days_total - i.days_done) * i.daily_earn)AS remaining_earn,
+
+          COALESCE(w.total_withdrawn, 0)               AS total_withdrawn,
+          COALESCE(d.total_deposited, 0)               AS total_deposited,
+          COALESCE(r.ref_count,      0)                AS referral_count,
+          COALESCE(r.ref_invested,   0)                AS referral_invested
+
+        FROM investments i
+        JOIN users u ON u.id = i.user_id
+
+        LEFT JOIN (
+          SELECT user_id, SUM(amount) AS total_withdrawn
+          FROM transactions WHERE type='withdraw' AND status='approved'
+          GROUP BY user_id
+        ) w ON w.user_id = u.id
+
+        LEFT JOIN (
+          SELECT user_id, SUM(amount) AS total_deposited
+          FROM transactions WHERE type='deposit'  AND status='approved'
+          GROUP BY user_id
+        ) d ON d.user_id = u.id
+
+        LEFT JOIN (
+          SELECT u2.referred_by AS referrer_id,
+                 COUNT(DISTINCT u2.id) AS ref_count,
+                 COALESCE(SUM(i2.amount), 0) AS ref_invested
+          FROM users u2
+          LEFT JOIN investments i2 ON i2.user_id = u2.id AND i2.status='active'
+          WHERE u2.referred_by IS NOT NULL
+          GROUP BY u2.referred_by
+        ) r ON r.referrer_id = u.id
+
+        WHERE i.status = 'active'
+        ORDER BY roi_pct DESC
+      `),
+
+      // 3. Recent completed investments
+      db.all(`
+        SELECT u.id AS user_id, u.username, u.first_name,
+               i.plan_name, i.amount, i.daily_earn, i.days_total,
+               (i.days_total * i.daily_earn) AS total_earned,
+               i.started_at, i.last_collect
+        FROM investments i JOIN users u ON u.id = i.user_id
+        WHERE i.status = 'completed'
+        ORDER BY i.last_collect DESC NULLS LAST, i.id DESC LIMIT 100
+      `),
+
+      // 4. Daily payouts — dynamic range
+      db.all(`
+        SELECT TO_CHAR(DATE(created_at), 'YYYY-MM-DD') AS day,
+               COALESCE(SUM(amount),0) AS total,
+               COUNT(*) AS count
+        FROM transactions
+        WHERE type='earn' AND ${intervalSql}
+        GROUP BY DATE(created_at)
+        ORDER BY DATE(created_at) ASC
+      `),
+
+      // 5. Daily deposits & withdrawals — dynamic range
+      db.all(`
+        SELECT TO_CHAR(DATE(created_at), 'YYYY-MM-DD') AS day,
+               type,
+               COALESCE(SUM(amount),0) AS total
+        FROM transactions
+        WHERE type IN ('deposit','withdraw')
+          AND status = 'approved'
+          AND ${intervalSql}
+        GROUP BY DATE(created_at), type
+        ORDER BY DATE(created_at) ASC
+      `),
+
+      // 6. Plan statistics
+      db.all(`
+        SELECT plan_name,
+               COUNT(*)::int                AS count,
+               COALESCE(SUM(amount),0)      AS total_invested,
+               COALESCE(SUM(days_done * daily_earn),0) AS total_earned,
+               COALESCE(AVG(daily_pct),0)   AS avg_daily_pct,
+               COALESCE(AVG(days_total),0)  AS avg_days
+        FROM investments WHERE status='active'
+        GROUP BY plan_name ORDER BY total_invested DESC
+      `),
+
+      // 7. Shared wallets (case-insensitive, trimmed)
+      db.all(`
+        SELECT LOWER(TRIM(withdraw_address)) AS withdraw_address,
+               COUNT(*) AS user_count,
+               array_agg(id) AS user_ids
+        FROM users
+        WHERE withdraw_address IS NOT NULL AND TRIM(withdraw_address) != ''
+        GROUP BY LOWER(TRIM(withdraw_address)) HAVING COUNT(*) > 1
+      `),
+
+      // 8. Shared IPs among investors
+      db.all(`
+        SELECT u.ip_address, COUNT(DISTINCT u.id) AS user_count, array_agg(u.id) AS user_ids
+        FROM users u JOIN investments i ON i.user_id=u.id AND i.status='active'
+        WHERE u.ip_address IS NOT NULL AND u.ip_address != ''
+        GROUP BY u.ip_address HAVING COUNT(DISTINCT u.id) > 1
+      `),
+
+      // 9. Rapid depositors (>2 deposits in 24h)
+      db.all(`
+        SELECT user_id, COUNT(*) AS dep_count
+        FROM transactions
+        WHERE type='deposit' AND status='approved' AND created_at >= NOW() - INTERVAL '24 hours'
+        GROUP BY user_id HAVING COUNT(*) > 2
+      `),
+
+      // 10. High withdrawal ratio (withdrawn > 80% of deposited)
+      db.all(`
+        SELECT d.user_id, d.total_dep, COALESCE(w.total_with,0) AS total_with
+        FROM (
+          SELECT user_id, SUM(amount) AS total_dep
+          FROM transactions WHERE type='deposit' AND status='approved' GROUP BY user_id
+        ) d
+        LEFT JOIN (
+          SELECT user_id, SUM(amount) AS total_with
+          FROM transactions WHERE type='withdraw' AND status='approved' GROUP BY user_id
+        ) w ON w.user_id = d.user_id
+        WHERE COALESCE(w.total_with,0) > d.total_dep * 0.8
+      `),
+
+      // 11. Unusual referral activity
+      db.all(`
+        SELECT referred_by, COUNT(*) AS ref_count
+        FROM users WHERE referred_by IS NOT NULL
+        GROUP BY referred_by HAVING COUNT(*) > 5
+      `),
+
+      // 12. ROI bucket counts (fast pre-aggregated)
+      db.all(`
+        SELECT
+          CASE
+            WHEN days_total = 0 THEN '0-10'
+            WHEN (days_done::float/days_total)*100 <  10 THEN '0-10'
+            WHEN (days_done::float/days_total)*100 <  20 THEN '10-20'
+            WHEN (days_done::float/days_total)*100 <  30 THEN '20-30'
+            WHEN (days_done::float/days_total)*100 <  40 THEN '30-40'
+            WHEN (days_done::float/days_total)*100 <  50 THEN '40-50'
+            WHEN (days_done::float/days_total)*100 <  60 THEN '50-60'
+            WHEN (days_done::float/days_total)*100 <  70 THEN '60-70'
+            WHEN (days_done::float/days_total)*100 <  80 THEN '70-80'
+            WHEN (days_done::float/days_total)*100 <  90 THEN '80-90'
+            WHEN (days_done::float/days_total)*100 < 100 THEN '90-99'
+            ELSE '100+'
+          END AS bucket,
+          COUNT(*) AS count,
+          COALESCE(SUM(amount),0) AS total_invested,
+          COALESCE(SUM(days_done * daily_earn),0) AS total_earned
+        FROM investments WHERE status='active'
+        GROUP BY bucket
+      `),
+    ]);
+
+    // ── Build summary ──────────────────────────────────────────────────────
+    const [tu, tiv, td, tw, tai, tp, tpr, tc] = summaryRows;
+    // Today's deposit/withdrawal totals (accurate, not from chart array)
+    const todayDate = new Date().toISOString().slice(0,10);
+    const todayDepAmt  = parseFloat((dailyDeposits.find(r => r.day === todayDate && r.type === 'deposit')  || {}).total || 0);
+    const todayWithAmt = parseFloat((dailyDeposits.find(r => r.day === todayDate && r.type === 'withdraw') || {}).total || 0);
+
+    const summary = {
+      totalUsers:        parseInt(tu.c),
+      totalInvestors:    parseInt(tiv.c),
+      totalDeposits:     parseFloat(td.s),
+      totalWithdrawals:  parseFloat(tw.s),
+      activeInvestments: parseInt(tai.c),
+      profitPaid:        parseFloat(tp.s),
+      pendingROI:        parseFloat(tpr.s),
+      completedCount:    parseInt(tc.c),
+      netFlow:           parseFloat(td.s) - parseFloat(tw.s),
+      todayDeposits:     todayDepAmt,
+      todayWithdrawals:  todayWithAmt,
+    };
+
+    // ── Build flag lookup maps ─────────────────────────────────────────────
+    const walletMap = {}, ipMap = {};
+    const rapidSet  = new Set(rapidDepositors.map(r => String(r.user_id)));
+    const highWSet  = new Set(highWithdraw.map(r => String(r.user_id)));
+    const unusRefSet= new Set(unusualReferrers.map(r => String(r.referred_by)));
+
+    sharedWallets.forEach(r => (r.user_ids||[]).forEach(id => { walletMap[String(id)] = r.user_count; }));
+    sharedIPs.forEach(r     => (r.user_ids||[]).forEach(id => { ipMap[String(id)] = { ip: r.ip_address, count: r.user_count }; }));
+
+    // ── Enrich investors ───────────────────────────────────────────────────
+    const investors = investorsRaw.map(inv => {
+      const uid = String(inv.user_id);
+      const flags = [];
+      if (walletMap[uid])      flags.push({ type: 'shared_wallet',    detail: `${walletMap[uid]} accounts share this wallet` });
+      if (ipMap[uid])          flags.push({ type: 'shared_ip',        detail: `${ipMap[uid].count} investors from ${ipMap[uid].ip}` });
+      if (rapidSet.has(uid))   flags.push({ type: 'rapid_deposit',    detail: 'Multiple deposits within 24h' });
+      if (highWSet.has(uid))   flags.push({ type: 'high_withdrawal',  detail: 'Withdrawn >80% of deposits' });
+      if (unusRefSet.has(uid)) flags.push({ type: 'unusual_referral', detail: `${inv.referral_count} referrals` });
+
+      const principal = parseFloat(inv.amount)          || 0; // this investment's cost
+      const earned    = parseFloat(inv.total_earned)    || 0; // ROI earned so far (days_done * daily_earn)
+      const withdrawn = parseFloat(inv.total_withdrawn) || 0;
+      const netPnl    = earned - principal; // net gain = ROI earned minus what was invested
+
+      return { ...inv, flags, netPnl, roi_pct: parseFloat(inv.roi_pct) || 0 };
+    });
+
+    // ── Deduplicate by user_id (keep highest ROI investment per user) ─────────
+    const invByUser = {};
+    for (const inv of investors) {
+      const uid = String(inv.user_id);
+      if (!invByUser[uid] || inv.roi_pct > invByUser[uid].roi_pct) {
+        invByUser[uid] = inv;
+      }
+    }
+    const investorsDedupe = Object.values(invByUser);
+
+    // ── ROI distribution (ordered buckets) ────────────────────────────────
+    const BUCKET_ORDER = ['0-10','10-20','20-30','30-40','40-50','50-60','60-70','70-80','80-90','90-99','100+'];
+    const bucketMap = {};
+    roiRows.forEach(r => { bucketMap[r.bucket] = r; });
+    const roiDistribution = BUCKET_ORDER.map(key => ({
+      label:         key === '100+' ? '100%+ ✅' : key + '%',
+      bucket:        key,
+      count:         parseInt((bucketMap[key]||{}).count || 0),
+      totalInvested: parseFloat((bucketMap[key]||{}).total_invested || 0),
+      totalEarned:   parseFloat((bucketMap[key]||{}).total_earned   || 0),
+    }));
+
+    // ── Profit status ──────────────────────────────────────────────────────
+    const profitStatus = {
+      in_profit:  investorsDedupe.filter(u => u.netPnl >  1).length,
+      breakeven:  investorsDedupe.filter(u => Math.abs(u.netPnl) <= 1).length,
+      in_loss:    investorsDedupe.filter(u => u.netPnl < -1).length,
+      completed:  parseInt(tc.c),
+    };
+
+    // ── Chart data — fill missing days with 0 ─────────────────────────────
+    const chartDays = [];
+    for (let i = reqDays - 1; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      chartDays.push(d.toISOString().slice(0, 10));
+    }
+    const payoutMap = {}, depMap = {}, withMap = {};
+    dailyPayouts.forEach(r  => { payoutMap[r.day] = parseFloat(r.total); });
+    dailyDeposits.forEach(r => {
+      const day = r.day;
+      if (r.type === 'deposit')  depMap[day]  = parseFloat(r.total);
+      if (r.type === 'withdraw') withMap[day] = parseFloat(r.total);
+    });
+    const chartData = {
+      labels:      chartDays,
+      payouts:     chartDays.map(d => payoutMap[d]  || 0),
+      deposits:    chartDays.map(d => depMap[d]      || 0),
+      withdrawals: chartDays.map(d => withMap[d]     || 0),
+    };
+
+    res.json({
+      summary,
+      investors: investorsDedupe,
+      completed:    completedRaw,
+      roiDistribution,
+      profitStatus,
+      planStats,
+      chartData,
+      flagSummary: {
+        sharedWallets:    sharedWallets.length,
+        sharedIPs:        sharedIPs.length,
+        rapidDepositors:  rapidDepositors.length,
+        highWithdrawal:   highWithdraw.length,
+        unusualReferrers: unusualReferrers.length,
+      },
+      generatedAt: new Date().toISOString(),
+    });
+
+  } catch(e) {
+    log('ERROR', 'invest-analytics v2: ' + e.message);
+    res.status(500).json({ error: 'Analytics error: ' + e.message });
+  }
+});
+
+// ── END INVESTMENT ANALYTICS v2 ────────────────────────────────────────────
+
 app.get('/admin/transactions', adminAuth, async (req, res) => {
   try {
     const { type, status, limit=20, page=1, search='' } = req.query;
@@ -4788,9 +5137,8 @@ app.post('/api/collect-commission', authLimit, userAuth, async (req, res) => {
     const pending = parseFloat(user.pending_commission || 0);
     if (pending <= 0) return res.status(400).json({error:'No pending commission'});
     // ✅ FIX: Atomic — only collect if pending_commission still > 0 (race condition guard)
-    // Commission goes to reinvest_credit (not withdrawable balance)
     const commResult = await pool.query(
-      `UPDATE users SET reinvest_credit=reinvest_credit+pending_commission, pending_commission=0
+      `UPDATE users SET balance=balance+pending_commission, pending_commission=0
        WHERE id=$1 AND pending_commission > 0 RETURNING pending_commission as collected`,
       [u.id]
     );
