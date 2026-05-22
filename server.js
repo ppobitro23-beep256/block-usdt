@@ -2622,7 +2622,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='deposit' AND status='approved'`),
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='approved'`),
         db.one(`SELECT COUNT(*) as c FROM investments WHERE status='active'`),
-        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='earn'`),
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='earn' AND note LIKE '%Daily%'`),
         db.one(`SELECT COALESCE(SUM(pending_earn),0) as s FROM investments WHERE status='active'`),
         db.one(`SELECT COUNT(*) as c FROM investments WHERE status='completed'`),
       ]),
@@ -2804,10 +2804,15 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
 
     // ── Build summary ──────────────────────────────────────────────────────
     const [tu, tiv, td, tw, tai, tp, tpr, tc] = summaryRows;
-    // Today's deposit/withdrawal totals (accurate, not from chart array)
-    const todayDate = new Date().toISOString().slice(0,10);
-    const todayDepAmt  = parseFloat((dailyDeposits.find(r => r.day === todayDate && r.type === 'deposit')  || {}).total || 0);
-    const todayWithAmt = parseFloat((dailyDeposits.find(r => r.day === todayDate && r.type === 'withdraw') || {}).total || 0);
+    // Today's deposit/withdrawal totals — query directly for accuracy (avoids timezone mismatch)
+    const [todayDepRow, todayWithRow] = await Promise.all([
+      db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions
+              WHERE type='deposit' AND status='approved' AND DATE(created_at)=NOW()::date`),
+      db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions
+              WHERE type='withdraw' AND status='approved' AND DATE(created_at)=NOW()::date`),
+    ]);
+    const todayDepAmt  = parseFloat(todayDepRow.s  || 0);
+    const todayWithAmt = parseFloat(todayWithRow.s || 0);
 
     const summary = {
       totalUsers:        parseInt(tu.c),
@@ -2881,9 +2886,12 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     };
 
     // ── Chart data — fill missing days with 0 ─────────────────────────────
+    // Get today's date from DB to ensure timezone consistency
+    const dbDateRow = await db.one(`SELECT NOW()::date::text AS today`);
+    const dbToday   = dbDateRow.today; // 'YYYY-MM-DD' in DB timezone
     const chartDays = [];
     for (let i = reqDays - 1; i >= 0; i--) {
-      const d = new Date(); d.setDate(d.getDate() - i);
+      const d = new Date(dbToday + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - i);
       chartDays.push(d.toISOString().slice(0, 10));
     }
     const payoutMap = {}, depMap = {}, withMap = {};
