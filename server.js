@@ -5136,19 +5136,19 @@ app.post('/api/collect-commission', authLimit, userAuth, async (req, res) => {
     if (!user) return res.status(404).json({error:'Not found'});
     const pending = parseFloat(user.pending_commission || 0);
     if (pending <= 0) return res.status(400).json({error:'No pending commission'});
-    // ✅ FIX: Atomic — only collect if pending_commission still > 0 (race condition guard)
+    // ✅ Commission goes to reinvest_credit (invest-only balance — NOT withdrawable)
+    // Atomic: only collect if pending_commission still > 0 (race condition guard)
     const commResult = await pool.query(
-      `UPDATE users SET balance=balance+pending_commission, pending_commission=0
+      `UPDATE users SET reinvest_credit=reinvest_credit+pending_commission, pending_commission=0
        WHERE id=$1 AND pending_commission > 0 RETURNING pending_commission as collected`,
       [u.id]
     );
     if (commResult.rowCount === 0) return res.status(400).json({error:'No pending commission'});
     const actualCollected = parseFloat(commResult.rows[0].collected || pending);
-    // override pending with actual DB value
     const collectedAmt = actualCollected > 0 ? actualCollected : pending;
     await db.run(`UPDATE commissions SET status='collected' WHERE user_id=$1 AND status='pending'`, [u.id]);
-    await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',collectedAmt,'completed','Referral commission collected']);
-    res.json({success:true, collected:collectedAmt});
+    await db.run(`INSERT INTO transactions (user_id,type,amount,status,note) VALUES ($1,$2,$3,$4,$5)`, [u.id,'commission',collectedAmt,'completed','Referral commission collected — added to invest balance']);
+    res.json({success:true, collected:collectedAmt, note:'Added to your invest balance. Use it to invest in any plan.'});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
 });
 
