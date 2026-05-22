@@ -619,6 +619,7 @@ async function setupDB() {
     db.run(`ALTER TABLE investments ADD COLUMN IF NOT EXISTS cancel_refund REAL DEFAULT 0`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_cancel_at TIMESTAMP DEFAULT NULL`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reinvest_credit REAL DEFAULT 0`),
+    db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ip_address TEXT DEFAULT NULL`),
     db.run(`CREATE TABLE IF NOT EXISTS plan_unlock_logs (
       id          SERIAL PRIMARY KEY,
       user_id     BIGINT NOT NULL,
@@ -2632,7 +2633,6 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
           u.id           AS user_id,
           u.username,
           u.first_name,
-          u.ip_address,
           u.withdraw_address,
           u.is_banned,
           u.created_at   AS user_created,
@@ -2745,13 +2745,8 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         GROUP BY LOWER(TRIM(withdraw_address)) HAVING COUNT(*) > 1
       `),
 
-      // 8. Shared IPs among investors
-      db.all(`
-        SELECT u.ip_address, COUNT(DISTINCT u.id) AS user_count, array_agg(u.id) AS user_ids
-        FROM users u JOIN investments i ON i.user_id=u.id AND i.status='active'
-        WHERE u.ip_address IS NOT NULL AND u.ip_address != ''
-        GROUP BY u.ip_address HAVING COUNT(DISTINCT u.id) > 1
-      `),
+      // 8. Shared IPs — column not available, return empty
+      Promise.resolve([]),
 
       // 9. Rapid depositors (>2 deposits in 24h)
       db.all(`
@@ -2915,7 +2910,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
       chartData,
       flagSummary: {
         sharedWallets:    sharedWallets.length,
-        sharedIPs:        sharedIPs.length,
+        sharedIPs:        0,
         rapidDepositors:  rapidDepositors.length,
         highWithdrawal:   highWithdraw.length,
         unusualReferrers: unusualReferrers.length,
