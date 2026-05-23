@@ -2862,15 +2862,30 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
       return { ...inv, flags, netPnl, roi_pct: parseFloat(inv.roi_pct) || 0 };
     });
 
-    // ── Deduplicate by user_id (keep highest ROI investment per user) ─────────
-    const invByUser = {};
+    // ── Aggregate per user for leaderboard (sum all plans) ──────────────────
+    const userAggMap = {};
     for (const inv of investors) {
       const uid = String(inv.user_id);
-      if (!invByUser[uid] || inv.roi_pct > invByUser[uid].roi_pct) {
-        invByUser[uid] = inv;
+      if (!userAggMap[uid]) {
+        userAggMap[uid] = {
+          ...inv,
+          total_earned:    parseFloat(inv.total_earned)    || 0,
+          netPnl:          parseFloat(inv.netPnl)          || 0,
+          amount:          parseFloat(inv.amount)           || 0,
+          total_withdrawn: parseFloat(inv.total_withdrawn)  || 0,
+          _planCount:      1,
+        };
+      } else {
+        userAggMap[uid].total_earned    += parseFloat(inv.total_earned)    || 0;
+        userAggMap[uid].netPnl          += parseFloat(inv.netPnl)          || 0;
+        userAggMap[uid].amount          += parseFloat(inv.amount)          || 0;
+        userAggMap[uid].total_withdrawn += parseFloat(inv.total_withdrawn)  || 0;
+        userAggMap[uid]._planCount      += 1;
+        // plan_name: show count if multiple
+        userAggMap[uid].plan_name = userAggMap[uid]._planCount + ' plans';
       }
     }
-    const investorsDedupe = Object.values(invByUser);
+    const investorsDedupe = Object.values(userAggMap); // for leaderboard (per user)
 
     // ── ROI distribution (ordered buckets) ────────────────────────────────
     const BUCKET_ORDER = ['0-10','10-20','20-30','30-40','40-50','50-60','60-70','70-80','80-90','90-99','100+'];
@@ -2879,16 +2894,16 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     const roiDistribution = BUCKET_ORDER.map(key => ({
       label:         key === '100+' ? '100%+ ✅' : key + '%',
       bucket:        key,
-      count:         parseInt((bucketMap[key]||{}).count || 0),
+      count:         parseInt((bucketMap[key]||{}).count || 0),   // plan count (not user count)
       totalInvested: parseFloat((bucketMap[key]||{}).total_invested || 0),
       totalEarned:   parseFloat((bucketMap[key]||{}).total_earned   || 0),
     }));
 
-    // ── Profit status ──────────────────────────────────────────────────────
+    // ── Profit status — count plans (not users) ───────────────────────────
     const profitStatus = {
-      in_profit:  investorsDedupe.filter(u => u.roi_pct >= 100).length,          // capital fully recovered
-      breakeven:  investorsDedupe.filter(u => u.roi_pct >= 80 && u.roi_pct < 100).length, // 80–99% recovered
-      in_loss:    investorsDedupe.filter(u => u.roi_pct <  80).length,           // still recovering
+      in_profit:  investors.filter(u => u.roi_pct >= 100).length,           // plans with capital recovered
+      breakeven:  investors.filter(u => u.roi_pct >= 80 && u.roi_pct < 100).length,
+      in_loss:    investors.filter(u => u.roi_pct <  80).length,            // plans still recovering
       completed:  parseInt(tc.c),
     };
 
@@ -2917,7 +2932,8 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
 
     res.json({
       summary,
-      investors: investorsDedupe,
+      investors:    investorsDedupe,   // per-user aggregated (for leaderboard)
+      allPlans:     investors,          // all individual plans (for ROI groups)
       completed:    completedRaw,
       roiDistribution,
       profitStatus,
