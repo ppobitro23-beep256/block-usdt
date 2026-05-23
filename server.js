@@ -2725,16 +2725,18 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         ORDER BY DATE(created_at) ASC
       `),
 
-      // 6. Plan statistics
+      // 6. Plan statistics — normalize plan_name (strip emoji/symbols, trim)
       db.all(`
-        SELECT plan_name,
+        SELECT
+               TRIM(REGEXP_REPLACE(plan_name, '^[^a-zA-Z0-9]+', '')) AS plan_name,
                COUNT(*)::int                AS count,
                COALESCE(SUM(amount),0)      AS total_invested,
                COALESCE(SUM(days_done * daily_earn),0) AS total_earned,
                COALESCE(AVG(daily_pct),0)   AS avg_daily_pct,
                COALESCE(AVG(days_total),0)  AS avg_days
         FROM investments WHERE status='active'
-        GROUP BY plan_name ORDER BY total_invested DESC
+        GROUP BY TRIM(REGEXP_REPLACE(plan_name, '^[^a-zA-Z0-9]+', ''))
+        ORDER BY total_invested DESC
       `),
 
       // 7. Shared wallets (case-insensitive, trimmed)
