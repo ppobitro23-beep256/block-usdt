@@ -2652,7 +2652,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
           i.started_at,
 
           CASE WHEN i.amount > 0
-               THEN ROUND(((i.days_done * i.daily_earn)::NUMERIC / i.amount) * 100, 2)
+               THEN ROUND(((i.days_done::NUMERIC * i.daily_earn::NUMERIC) / i.amount::NUMERIC) * 100, 2)
                ELSE 0 END                              AS roi_pct,
           (i.days_done * i.daily_earn)                 AS total_earned,
           ((i.days_total - i.days_done) * i.daily_earn)AS remaining_earn,
