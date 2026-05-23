@@ -2347,12 +2347,15 @@ app.get('/admin/stat/deposits', adminAuth, async (req, res) => {
     const offset = (page - 1) * limit;
     const [rows, totalRow] = await Promise.all([
       db.all(`
-        SELECT ad.user_id, u.username, u.first_name, ad.amount, ad.network, ad.status, ad.created_at
-        FROM auto_deposits ad LEFT JOIN users u ON u.id=ad.user_id
-        WHERE ad.status='completed'
-        ORDER BY ad.created_at DESC LIMIT $1 OFFSET $2
+        SELECT t.user_id, u.username, u.first_name, t.amount,
+               COALESCE(t.network, 'Manual') AS network,
+               t.status, t.created_at,
+               CASE WHEN t.type='admin_add' THEN 'Admin Add' ELSE 'Auto' END AS dep_type
+        FROM transactions t LEFT JOIN users u ON u.id=t.user_id
+        WHERE t.type IN ('deposit','admin_add') AND t.status IN ('approved','completed')
+        ORDER BY t.created_at DESC LIMIT $1 OFFSET $2
       `, [limit, offset]),
-      db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE status='completed'`)
+      db.one(`SELECT COUNT(*) as c FROM transactions WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed')`)
     ]);
     const total = parseInt(totalRow.c);
     res.json({ rows, total, currentPage: page, totalPages: Math.ceil(total/limit), limit });
@@ -2648,8 +2651,8 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
           i.last_collect,
           i.started_at,
 
-          CASE WHEN i.days_total > 0
-               THEN ROUND((i.days_done::NUMERIC / i.days_total) * 100, 2)
+          CASE WHEN i.amount > 0
+               THEN ROUND(((i.days_done * i.daily_earn)::NUMERIC / i.amount) * 100, 2)
                ELSE 0 END                              AS roi_pct,
           (i.days_done * i.daily_earn)                 AS total_earned,
           ((i.days_total - i.days_done) * i.daily_earn)AS remaining_earn,
@@ -2785,17 +2788,17 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
       db.all(`
         SELECT
           CASE
-            WHEN days_total = 0 THEN '0-10'
-            WHEN (days_done::float/days_total)*100 <  10 THEN '0-10'
-            WHEN (days_done::float/days_total)*100 <  20 THEN '10-20'
-            WHEN (days_done::float/days_total)*100 <  30 THEN '20-30'
-            WHEN (days_done::float/days_total)*100 <  40 THEN '30-40'
-            WHEN (days_done::float/days_total)*100 <  50 THEN '40-50'
-            WHEN (days_done::float/days_total)*100 <  60 THEN '50-60'
-            WHEN (days_done::float/days_total)*100 <  70 THEN '60-70'
-            WHEN (days_done::float/days_total)*100 <  80 THEN '70-80'
-            WHEN (days_done::float/days_total)*100 <  90 THEN '80-90'
-            WHEN (days_done::float/days_total)*100 < 100 THEN '90-99'
+            WHEN amount = 0 THEN '0-10'
+            WHEN (days_done * daily_earn)::float/amount*100 <  10 THEN '0-10'
+            WHEN (days_done * daily_earn)::float/amount*100 <  20 THEN '10-20'
+            WHEN (days_done * daily_earn)::float/amount*100 <  30 THEN '20-30'
+            WHEN (days_done * daily_earn)::float/amount*100 <  40 THEN '30-40'
+            WHEN (days_done * daily_earn)::float/amount*100 <  50 THEN '40-50'
+            WHEN (days_done * daily_earn)::float/amount*100 <  60 THEN '50-60'
+            WHEN (days_done * daily_earn)::float/amount*100 <  70 THEN '60-70'
+            WHEN (days_done * daily_earn)::float/amount*100 <  80 THEN '70-80'
+            WHEN (days_done * daily_earn)::float/amount*100 <  90 THEN '80-90'
+            WHEN (days_done * daily_earn)::float/amount*100 < 100 THEN '90-99'
             ELSE '100+'
           END AS bucket,
           COUNT(*) AS count,
@@ -2883,9 +2886,9 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
 
     // ── Profit status ──────────────────────────────────────────────────────
     const profitStatus = {
-      in_profit:  investorsDedupe.filter(u => u.netPnl >  1).length,
-      breakeven:  investorsDedupe.filter(u => Math.abs(u.netPnl) <= 1).length,
-      in_loss:    investorsDedupe.filter(u => u.netPnl < -1).length,
+      in_profit:  investorsDedupe.filter(u => u.roi_pct >= 100).length,          // capital fully recovered
+      breakeven:  investorsDedupe.filter(u => u.roi_pct >= 80 && u.roi_pct < 100).length, // 80–99% recovered
+      in_loss:    investorsDedupe.filter(u => u.roi_pct <  80).length,           // still recovering
       completed:  parseInt(tc.c),
     };
 
