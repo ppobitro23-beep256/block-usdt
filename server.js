@@ -1419,7 +1419,7 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
       withTimeout(getCachedPlans(), 5000, []),
       withTimeout(getCachedSettings(), 5000, []),
       withTimeout(db.one(`SELECT COUNT(DISTINCT u.id) as c FROM users u
-              JOIN transactions t ON t.user_id=u.id AND t.type='deposit' AND t.status='approved'
+              JOIN transactions t ON t.user_id=u.id AND t.type IN ('deposit','admin_add') AND t.status IN ('approved','completed')
               WHERE u.referred_by=$1`, [uid]), 5000, {c:0}),
       withTimeout(db.one(`SELECT COUNT(*) as total FROM users WHERE referred_by=$1`, [uid]), 5000, {total:0}),
       withTimeout(db.one(`SELECT COUNT(DISTINCT u.id) as active FROM users u
@@ -2303,15 +2303,15 @@ app.get('/admin/stats', adminAuth, async (req, res) => {
     ] = await Promise.all([
       db.one(`SELECT COUNT(*) as c FROM users`),
       db.one(`SELECT COUNT(*) as c FROM investments WHERE status='active'`),
-      db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='deposit' AND status='approved'`),
+      db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed')`),
       db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='approved'`),
       db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='deposit' AND status='pending'`),
       db.one(`SELECT COUNT(*) as c FROM transactions WHERE type='withdraw' AND status='pending'`),
       db.one(`SELECT COUNT(*) as c FROM users WHERE is_banned=1`),
       db.one(`SELECT COALESCE(SUM(balance),0) as s FROM users`),
       db.one(`SELECT COALESCE(SUM(reinvest_credit),0) as s FROM users`),
-      // [NEW] Today's deposits
-      db.one(`SELECT COALESCE(SUM(amount),0) as s, COUNT(*) as c FROM transactions WHERE type='deposit' AND status='approved' AND created_at >= NOW() - INTERVAL '24 hours'`),
+      // [NEW] Today's deposits (includes admin_add)
+      db.one(`SELECT COALESCE(SUM(amount),0) as s, COUNT(*) as c FROM transactions WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed') AND created_at >= NOW() - INTERVAL '24 hours'`),
       // [NEW] Auto vs semi counts
       db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE dep_type='auto' AND status='completed'`),
       db.one(`SELECT COUNT(*) as c FROM auto_deposits WHERE fraud_flag=1`),
@@ -2454,11 +2454,11 @@ app.get('/admin/users', adminAuth, async (req, res) => {
     const enrichRows = userIds.length > 0 ? await db.all(`
       SELECT
         user_id,
-        SUM(CASE WHEN type='deposit'  AND status='approved' THEN amount ELSE 0 END) as dep_total,
+        SUM(CASE WHEN type IN ('deposit','admin_add') AND status IN ('approved','completed') THEN amount ELSE 0 END) as dep_total,
         SUM(CASE WHEN type='withdraw' AND status='approved' THEN amount ELSE 0 END) as with_total,
-        COUNT(CASE WHEN type='deposit'  AND status='approved' THEN 1 END) as dep_cnt,
+        COUNT(CASE WHEN type IN ('deposit','admin_add') AND status IN ('approved','completed') THEN 1 END) as dep_cnt,
         COUNT(CASE WHEN type='withdraw' AND status='approved' THEN 1 END) as with_cnt,
-        MAX(CASE WHEN type='deposit'  AND status='approved' THEN created_at END) as last_dep,
+        MAX(CASE WHEN type IN ('deposit','admin_add') AND status IN ('approved','completed') THEN created_at END) as last_dep,
         MAX(CASE WHEN type='withdraw' AND status='approved' THEN created_at END) as last_with
       FROM transactions
       WHERE user_id = ANY($1::bigint[])
@@ -2495,8 +2495,8 @@ app.get('/admin/user/:id/details', adminAuth, async (req, res) => {
     const uid    = req.params.id;
     const status = req.query.status || '';
     const depQ   = status
-      ? `SELECT 'deposit' as type, amount, status, created_at, network FROM transactions WHERE user_id=$1 AND type='deposit' AND status=$2 ORDER BY created_at DESC LIMIT 50`
-      : `SELECT 'deposit' as type, amount, status, created_at, network FROM transactions WHERE user_id=$1 AND type='deposit' ORDER BY created_at DESC LIMIT 50`;
+      ? `SELECT 'deposit' as type, amount, status, created_at, network, note FROM transactions WHERE user_id=$1 AND type IN ('deposit','admin_add') AND status=$2 ORDER BY created_at DESC LIMIT 50`
+      : `SELECT 'deposit' as type, amount, status, created_at, network, note FROM transactions WHERE user_id=$1 AND type IN ('deposit','admin_add') ORDER BY created_at DESC LIMIT 50`;
     const withQ  = status
       ? `SELECT 'withdraw' as type, amount, status, created_at, address as network FROM transactions WHERE user_id=$1 AND type='withdraw' AND status=$2 ORDER BY created_at DESC LIMIT 50`
       : `SELECT 'withdraw' as type, amount, status, created_at, address as network FROM transactions WHERE user_id=$1 AND type='withdraw' ORDER BY created_at DESC LIMIT 50`;
@@ -2619,7 +2619,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
       Promise.all([
         db.one(`SELECT COUNT(*) as c FROM users`),
         db.one(`SELECT COUNT(DISTINCT user_id) as c FROM investments WHERE status='active'`),
-        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='deposit' AND status='approved'`),
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed')`),
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='approved'`),
         db.one(`SELECT COUNT(*) as c FROM investments WHERE status='active'`),
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='earn' AND note LIKE '%Daily%'`),
@@ -2670,7 +2670,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
 
         LEFT JOIN (
           SELECT user_id, SUM(amount) AS total_deposited
-          FROM transactions WHERE type='deposit'  AND status='approved'
+          FROM transactions WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed')
           GROUP BY user_id
         ) d ON d.user_id = u.id
 
@@ -2710,16 +2710,18 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         ORDER BY DATE(created_at) ASC
       `),
 
-      // 5. Daily deposits & withdrawals — dynamic range
+      // 5. Daily deposits & withdrawals — dynamic range (includes admin_add as deposit)
       db.all(`
         SELECT TO_CHAR(DATE(created_at), 'YYYY-MM-DD') AS day,
-               type,
+               CASE WHEN type = 'admin_add' THEN 'deposit' ELSE type END AS type,
                COALESCE(SUM(amount),0) AS total
         FROM transactions
-        WHERE type IN ('deposit','withdraw')
-          AND status = 'approved'
+        WHERE (
+          (type IN ('deposit','admin_add') AND status IN ('approved','completed'))
+          OR (type = 'withdraw' AND status = 'approved')
+        )
           AND ${intervalSql}
-        GROUP BY DATE(created_at), type
+        GROUP BY DATE(created_at), CASE WHEN type = 'admin_add' THEN 'deposit' ELSE type END
         ORDER BY DATE(created_at) ASC
       `),
 
@@ -2761,7 +2763,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         SELECT d.user_id, d.total_dep, COALESCE(w.total_with,0) AS total_with
         FROM (
           SELECT user_id, SUM(amount) AS total_dep
-          FROM transactions WHERE type='deposit' AND status='approved' GROUP BY user_id
+          FROM transactions WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed') GROUP BY user_id
         ) d
         LEFT JOIN (
           SELECT user_id, SUM(amount) AS total_with
@@ -2807,7 +2809,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     // Today's deposit/withdrawal totals — query directly for accuracy (avoids timezone mismatch)
     const [todayDepRow, todayWithRow] = await Promise.all([
       db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions
-              WHERE type='deposit' AND status='approved' AND DATE(created_at)=NOW()::date`),
+              WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed') AND DATE(created_at)=NOW()::date`),
       db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions
               WHERE type='withdraw' AND status='approved' AND DATE(created_at)=NOW()::date`),
     ]);
@@ -2994,7 +2996,7 @@ app.get('/admin/user-detail/:id', adminAuth, async (req, res) => {
     );
 
     const depRow = await db.one(
-      `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type='deposit' AND status='approved'`, [uid]
+      `SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE user_id=$1 AND type IN ('deposit','admin_add') AND status IN ('approved','completed')`, [uid]
     ).catch(() => ({ total: 0 }));
 
     const withRow = await db.one(
@@ -4979,7 +4981,7 @@ app.get('/admin/deposit-stats', adminAuth, async (req, res) => {
         TO_CHAR(created_at, 'HH24') as time,
         SUM(amount) as total
       FROM transactions
-      WHERE type='deposit' AND status='approved'
+      WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed')
         AND created_at > NOW() - INTERVAL '24 hours'
       GROUP BY TO_CHAR(created_at, 'HH24')
       ORDER BY MIN(created_at) ASC
