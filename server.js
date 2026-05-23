@@ -2880,19 +2880,21 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
           total_earned:    parseFloat(inv.total_earned)    || 0,
           netPnl:          parseFloat(inv.netPnl)          || 0,
           amount:          parseFloat(inv.amount)          || 0,
-          total_withdrawn: parseFloat(inv.total_withdrawn) || 0,
+          total_withdrawn: parseFloat(inv.total_withdrawn) || 0, // user-level, set once
           _planCount:      1,
           _plans:          [planEntry],
         };
       } else {
-        userAggMap[uid].total_earned    += parseFloat(inv.total_earned)    || 0;
-        userAggMap[uid].netPnl          += parseFloat(inv.netPnl)          || 0;
-        userAggMap[uid].amount          += parseFloat(inv.amount)          || 0;
-        userAggMap[uid].total_withdrawn += parseFloat(inv.total_withdrawn) || 0;
-        userAggMap[uid]._planCount      += 1;
-        userAggMap[uid].plan_name        = userAggMap[uid]._planCount + ' plans';
+        userAggMap[uid].total_earned += parseFloat(inv.total_earned) || 0;
+        userAggMap[uid].amount       += parseFloat(inv.amount)       || 0;
+        // total_withdrawn is already user-level from DB join — do NOT add again
+        // just keep the value from first record (same for all plans of same user)
+        userAggMap[uid]._planCount   += 1;
+        userAggMap[uid].plan_name     = userAggMap[uid]._planCount + ' plans';
         userAggMap[uid]._plans.push(planEntry);
       }
+      // Recalculate netPnl = total_earned - total_invested (not per-plan)
+      userAggMap[uid].netPnl = userAggMap[uid].total_earned - userAggMap[uid].amount;
     }
     const investorsDedupe = Object.values(userAggMap); // for leaderboard (per user)
 
