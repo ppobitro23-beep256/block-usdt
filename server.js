@@ -2900,33 +2900,14 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     }
     const investorsDedupe = Object.values(userAggMap); // for leaderboard (per user)
 
-    // ── ROI distribution (ordered buckets) ────────────────────────────────
+    // ── ROI distribution by unique users ────────────────────────────────────
     const BUCKET_ORDER = ['0-10','10-20','20-30','30-40','40-50','50-60','60-70','70-80','80-90','90-99','100+'];
     const bucketMap = {};
     roiRows.forEach(r => { bucketMap[r.bucket] = r; });
-    const roiDistribution = BUCKET_ORDER.map(key => ({
-      label:         key === '100+' ? '100%+ ✅' : key + '%',
-      bucket:        key,
-      count:         userBucketMap[key] || 0,                     // unique user count
-      totalInvested: parseFloat((bucketMap[key]||{}).total_invested || 0),
-      totalEarned:   parseFloat((bucketMap[key]||{}).total_earned   || 0),
-    }));
 
-    // ── Profit status — count unique users (using avg ROI across all plans) ─
-    // investorsDedupe already has aggregated total_earned and amount per user
-    const profitStatus = {
-      in_profit:  investorsDedupe.filter(u => u.roi_pct >= 100).length,
-      breakeven:  investorsDedupe.filter(u => u.roi_pct >= 80 && u.roi_pct < 100).length,
-      in_loss:    investorsDedupe.filter(u => u.roi_pct <  80).length,
-      completed:  parseInt(tc.c),
-    };
-
-    // ── ROI distribution by unique users (override SQL bucket counts) ─────
-    // Recalculate using investorsDedupe so each user counted once
-    // Use effective ROI = total_earned / total_invested * 100
-    const BUCKET_ORDER_2 = ['0-10','10-20','20-30','30-40','40-50','50-60','60-70','70-80','80-90','90-99','100+'];
+    // Build userBucketMap FIRST — then use in roiDistribution
     const userBucketMap = {};
-    BUCKET_ORDER_2.forEach(k => { userBucketMap[k] = 0; });
+    BUCKET_ORDER.forEach(k => { userBucketMap[k] = 0; });
     investorsDedupe.forEach(u => {
       const r = u.amount > 0 ? (u.total_earned / u.amount) * 100 : 0;
       const bucket = r >= 100 ? '100+' : r >= 90 ? '90-99' : r >= 80 ? '80-90' : r >= 70 ? '70-80'
@@ -2934,6 +2915,22 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         : r >= 20 ? '20-30' : r >= 10 ? '10-20' : '0-10';
       userBucketMap[bucket] = (userBucketMap[bucket] || 0) + 1;
     });
+
+    const roiDistribution = BUCKET_ORDER.map(key => ({
+      label:         key === '100+' ? '100%+ ✅' : key + '%',
+      bucket:        key,
+      count:         userBucketMap[key] || 0,
+      totalInvested: parseFloat((bucketMap[key]||{}).total_invested || 0),
+      totalEarned:   parseFloat((bucketMap[key]||{}).total_earned   || 0),
+    }));
+
+    // ── Profit status — count unique users ───────────────────────────────
+    const profitStatus = {
+      in_profit:  investorsDedupe.filter(u => u.roi_pct >= 100).length,
+      breakeven:  investorsDedupe.filter(u => u.roi_pct >= 80 && u.roi_pct < 100).length,
+      in_loss:    investorsDedupe.filter(u => u.roi_pct <  80).length,
+      completed:  parseInt(tc.c),
+    };
 
     // ── Chart data — fill missing days with 0 ─────────────────────────────
     // Get today's date from DB to ensure timezone consistency
