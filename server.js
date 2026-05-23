@@ -2982,6 +2982,119 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
 
 // ── END INVESTMENT ANALYTICS v2 ────────────────────────────────────────────
 
+// ── MINING ANALYTICS ENDPOINT ──────────────────────────────────────────────
+app.get('/admin/mining-analytics', adminAuth, async (req, res) => {
+  try {
+    const blkPrice = await getCurrentBlkPrice();
+
+    const [
+      summaryRow,
+      planStats,
+      dailyMining,
+      topMiners,
+      miningUserInvest,
+    ] = await Promise.all([
+
+      // 1. Summary — separate queries to avoid join-inflation of block_tokens
+      db.one(`
+        SELECT
+          COUNT(DISTINCT mp.user_id)                                        AS total_miners,
+          COUNT(mp.id)                                                      AS total_plans,
+          COALESCE(SUM(mp.amount),0)                                        AS total_invested,
+          COALESCE(SUM(CASE WHEN mp.status='active' THEN 1 ELSE 0 END),0)  AS active_plans,
+          COALESCE(SUM(mp.daily_blk),0)                                     AS total_daily_blk,
+          (SELECT COALESCE(SUM(block_tokens_total),0) FROM users WHERE id IN (SELECT DISTINCT user_id FROM mining_plans)) AS total_blk_earned,
+          (SELECT COALESCE(SUM(block_tokens),0)       FROM users WHERE id IN (SELECT DISTINCT user_id FROM mining_plans)) AS total_blk_held
+        FROM mining_plans mp
+      `),
+
+      // 2. Plan breakdown by amount tier
+      db.all(`
+        SELECT
+          amount,
+          COUNT(*)          AS plan_count,
+          COALESCE(SUM(CASE WHEN status='active' THEN 1 ELSE 0 END),0) AS active_count,
+          COALESCE(SUM(daily_blk),0) AS total_daily_blk,
+          purchase_mode
+        FROM mining_plans
+        GROUP BY amount, purchase_mode
+        ORDER BY amount DESC
+      `),
+
+      // 3. Daily mining activity (transactions type='earn' from mining tap)
+      db.all(`
+        SELECT TO_CHAR(DATE(created_at),'YYYY-MM-DD') AS day,
+               COUNT(DISTINCT user_id) AS active_miners,
+               COUNT(*) AS tap_count
+        FROM transactions
+        WHERE type='spin_reward' OR (type='earn' AND (note ILIKE '%tap%' OR note ILIKE '%mining%' OR note ILIKE '%BLK%'))
+        GROUP BY DATE(created_at)
+        ORDER BY DATE(created_at) DESC
+        LIMIT 30
+      `),
+
+      // 4. Top miners by BLK earned total
+      db.all(`
+        SELECT u.id, u.first_name, u.username,
+               COALESCE(u.block_tokens_total,0) AS total_blk_earned,
+               COALESCE(u.block_tokens,0)        AS blk_held,
+               COALESCE(u.block_tokens_today,0)  AS blk_today,
+               COALESCE(u.mining_taps_today,0)   AS taps_today,
+               COALESCE(SUM(mp.amount),0)         AS total_invested,
+               COALESCE(SUM(mp.daily_blk),0)      AS daily_blk,
+               COUNT(mp.id)                        AS plan_count
+        FROM users u
+        LEFT JOIN mining_plans mp ON mp.user_id = u.id AND mp.status='active'
+        WHERE u.block_tokens_total > 0
+        GROUP BY u.id, u.first_name, u.username, u.block_tokens_total, u.block_tokens, u.block_tokens_today, u.mining_taps_today
+        ORDER BY total_blk_earned DESC
+        LIMIT 20
+      `),
+
+      // 5. Users with BOTH mining plan AND investment plan
+      db.all(`
+        SELECT u.id, u.first_name, u.username,
+               COALESCE(u.block_tokens_total,0) AS blk_earned,
+               COALESCE(u.block_tokens,0)        AS blk_held,
+               (SELECT COALESCE(SUM(amount),0) FROM investments  WHERE user_id=u.id AND status='active') AS invest_amount,
+               (SELECT COALESCE(SUM(amount),0) FROM mining_plans WHERE user_id=u.id AND status='active') AS mining_amount
+        FROM users u
+        WHERE EXISTS (SELECT 1 FROM investments  WHERE user_id=u.id AND status='active')
+          AND EXISTS (SELECT 1 FROM mining_plans WHERE user_id=u.id AND status='active')
+        ORDER BY (SELECT COALESCE(SUM(amount),0) FROM investments WHERE user_id=u.id AND status='active') DESC
+        LIMIT 50
+      `),
+    ]);
+
+    const s = summaryRow;
+    const blkPriceF = parseFloat(blkPrice) || 0.01;
+
+    res.json({
+      blkPrice: blkPriceF,
+      summary: {
+        totalMiners:    parseInt(s.total_miners),
+        totalPlans:     parseInt(s.total_plans),
+        activePlans:    parseInt(s.active_plans),
+        totalInvested:  parseFloat(s.total_invested),
+        totalBlkEarned: parseFloat(s.total_blk_earned),
+        totalBlkHeld:   parseFloat(s.total_blk_held),
+        totalBlkValue:  parseFloat(s.total_blk_held) * blkPriceF,
+        dailyBlkOutput: parseFloat(s.total_daily_blk),
+        dailyUsdValue:  parseFloat(s.total_daily_blk) * blkPriceF,
+      },
+      planStats,
+      dailyMining: dailyMining.reverse(),
+      topMiners,
+      bothPlanUsers: miningUserInvest,
+    });
+  } catch(e) {
+    log('ERROR', 'mining-analytics: ' + e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+// ── END MINING ANALYTICS ────────────────────────────────────────────────────
+
+
 app.get('/admin/transactions', adminAuth, async (req, res) => {
   try {
     const { type, status, limit=20, page=1, search='' } = req.query;
