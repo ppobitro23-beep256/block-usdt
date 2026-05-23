@@ -2622,7 +2622,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type IN ('deposit','admin_add') AND status IN ('approved','completed')`),
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='approved'`),
         db.one(`SELECT COUNT(*) as c FROM investments WHERE status='active'`),
-        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='earn' AND note LIKE '%Daily%'`),
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='earn' AND status='completed'`),
         db.one(`SELECT COALESCE(SUM(pending_earn),0) as s FROM investments WHERE status='active'`),
         db.one(`SELECT COUNT(*) as c FROM investments WHERE status='completed'`),
       ]),
@@ -4789,6 +4789,20 @@ async function startScanners() {
       await db.run(`UPDATE auto_deposits SET status='expired' WHERE status='pending' AND expires_at < NOW()`);
     } catch(e) {}
   }, 60 * 1000);
+
+  // ── Auto-complete finished investments ───────────────────────────────────
+  async function autoCompleteInvestments() {
+    try {
+      const result = await pool.query(
+        `UPDATE investments SET status='completed'
+         WHERE status='active' AND days_done >= days_total
+         RETURNING id`
+      );
+      if (result.rowCount > 0) log('CRON', `Auto-completed ${result.rowCount} investment(s)`);
+    } catch(e) { log('ERROR', 'Auto-complete cron: ' + e.message); }
+  }
+  autoCompleteInvestments(); // run immediately on start
+  setInterval(autoCompleteInvestments, 60 * 1000); // then every 1 minute
 }
 
 // ══════════════════════════════════════════
