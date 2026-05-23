@@ -2866,23 +2866,32 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     const userAggMap = {};
     for (const inv of investors) {
       const uid = String(inv.user_id);
+      const planEntry = {
+        plan_name:    inv.plan_name,
+        amount:       parseFloat(inv.amount)       || 0,
+        total_earned: parseFloat(inv.total_earned) || 0,
+        roi_pct:      parseFloat(inv.roi_pct)      || 0,
+        days_done:    inv.days_done  || 0,
+        days_total:   inv.days_total || 0,
+      };
       if (!userAggMap[uid]) {
         userAggMap[uid] = {
           ...inv,
           total_earned:    parseFloat(inv.total_earned)    || 0,
           netPnl:          parseFloat(inv.netPnl)          || 0,
-          amount:          parseFloat(inv.amount)           || 0,
-          total_withdrawn: parseFloat(inv.total_withdrawn)  || 0,
+          amount:          parseFloat(inv.amount)          || 0,
+          total_withdrawn: parseFloat(inv.total_withdrawn) || 0,
           _planCount:      1,
+          _plans:          [planEntry],
         };
       } else {
         userAggMap[uid].total_earned    += parseFloat(inv.total_earned)    || 0;
         userAggMap[uid].netPnl          += parseFloat(inv.netPnl)          || 0;
         userAggMap[uid].amount          += parseFloat(inv.amount)          || 0;
-        userAggMap[uid].total_withdrawn += parseFloat(inv.total_withdrawn)  || 0;
+        userAggMap[uid].total_withdrawn += parseFloat(inv.total_withdrawn) || 0;
         userAggMap[uid]._planCount      += 1;
-        // plan_name: show count if multiple
-        userAggMap[uid].plan_name = userAggMap[uid]._planCount + ' plans';
+        userAggMap[uid].plan_name        = userAggMap[uid]._planCount + ' plans';
+        userAggMap[uid]._plans.push(planEntry);
       }
     }
     const investorsDedupe = Object.values(userAggMap); // for leaderboard (per user)
