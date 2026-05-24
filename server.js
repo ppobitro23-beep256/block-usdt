@@ -1287,6 +1287,11 @@ app.get('/manager/invest-analytics', managerAuth, async (req, res) => {
   return investAnalyticsHandler(req, res);
 });
 
+// Manager mining analytics
+app.get('/manager/mining-analytics', managerAuth, async (req, res) => {
+  return miningAnalyticsHandler(req, res);
+});
+
 
 // ══════════════════════════════════════════
 // USER ROUTES
@@ -3113,6 +3118,10 @@ async function investAnalyticsHandler(req, res) {
 
 // ── MINING ANALYTICS ENDPOINT ──────────────────────────────────────────────
 app.get('/admin/mining-analytics', adminAuth, async (req, res) => {
+  return miningAnalyticsHandler(req, res);
+});
+
+async function miningAnalyticsHandler(req, res) {
   try {
     const blkPrice = await getCurrentBlkPrice();
 
@@ -3219,7 +3228,7 @@ app.get('/admin/mining-analytics', adminAuth, async (req, res) => {
     log('ERROR', 'mining-analytics: ' + e.message);
     res.status(500).json({ error: e.message });
   }
-});
+}
 // ── END MINING ANALYTICS ────────────────────────────────────────────────────
 
 
