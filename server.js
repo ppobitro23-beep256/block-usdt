@@ -152,8 +152,9 @@ async function clearFraud(userId) {
 }
 
 const BOT_TOKEN    = process.env.BOT_TOKEN    || '';
-const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
-const DATABASE_URL = process.env.DATABASE_URL || '';
+const ADMIN_SECRET   = process.env.ADMIN_SECRET   || '';
+const MANAGER_PASS   = process.env.MANAGER_PASS   || '';
+const DATABASE_URL   = process.env.DATABASE_URL   || '';
 
 // Safety check — crash early if critical env vars missing
 if (!DATABASE_URL) { console.error('❌ DATABASE_URL env var missing'); process.exit(1); }
@@ -308,8 +309,8 @@ const corsConfig = {
     if (origin.endsWith('.telegram.org')) return cb(null, true);
     cb(new Error('CORS not allowed'));
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-telegram-init-data', 'x-admin-secret', 'Accept'],
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'x-telegram-init-data', 'x-admin-secret', 'x-manager-pass', 'Accept'],
   credentials: false,
 };
 app.use(cors(corsConfig));
@@ -1251,6 +1252,41 @@ function adminAuth(req, res, next) {
   } catch { return res.status(403).json({error:'Unauthorized'}); }
   next();
 }
+
+function managerAuth(req, res, next) {
+  if (!MANAGER_PASS) return res.status(403).json({ error: 'Manager access not configured' });
+  const pass = req.headers['x-manager-pass'] || req.body?.managerPass || '';
+  try {
+    const a = Buffer.from(pass.padEnd(64));
+    const b = Buffer.from(MANAGER_PASS.padEnd(64));
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(403).json({ error: 'Invalid password' });
+    }
+  } catch { return res.status(403).json({ error: 'Unauthorized' }); }
+  next();
+}
+
+// Manager auth verify endpoint
+app.post('/manager/auth', authLimit, (req, res) => {
+  if (!MANAGER_PASS) return res.status(403).json({ error: 'Manager access not configured' });
+  const pass = req.body?.password || '';
+  try {
+    const a = Buffer.from(pass.padEnd(64));
+    const b = Buffer.from(MANAGER_PASS.padEnd(64));
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(403).json({ error: 'Invalid password' });
+    }
+  } catch { return res.status(403).json({ error: 'Unauthorized' }); }
+  res.json({ success: true });
+});
+
+// Manager read-only analytics — bypasses adminAuth, calls same handler internally via next()
+// Avoids localhost proxy: just overrides auth header and calls admin route directly
+// Manager read-only analytics — calls shared handler directly (no localhost proxy, no next('route'))
+app.get('/manager/invest-analytics', managerAuth, async (req, res) => {
+  return investAnalyticsHandler(req, res);
+});
+
 
 // ══════════════════════════════════════════
 // USER ROUTES
@@ -2641,6 +2677,10 @@ app.post('/admin/user/balance', adminAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
+  return investAnalyticsHandler(req, res);
+});
+
+async function investAnalyticsHandler(req, res) {
   try {
     // ── Dynamic date range from query params ─────────────────────────────────
     const reqDays = Math.min(365, Math.max(1, parseInt(req.query.days) || 30));
@@ -3067,7 +3107,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     log('ERROR', 'invest-analytics v2: ' + e.message);
     res.status(500).json({ error: 'Analytics error: ' + e.message });
   }
-});
+}
 
 // ── END INVESTMENT ANALYTICS v2 ────────────────────────────────────────────
 
