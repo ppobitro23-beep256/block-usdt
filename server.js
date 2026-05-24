@@ -481,6 +481,16 @@ async function setupDB() {
   `);
 
   await db.run(`
+    CREATE TABLE IF NOT EXISTS platform_expenses (
+      id         SERIAL PRIMARY KEY,
+      amount     REAL NOT NULL,
+      note       TEXT DEFAULT '',
+      category   TEXT DEFAULT 'other',
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  await db.run(`
     CREATE TABLE IF NOT EXISTS auto_deposits (
       id         SERIAL PRIMARY KEY,
       user_id    BIGINT NOT NULL,
@@ -2294,6 +2304,46 @@ app.get('/api/plans', async (req, res) => {
 // ══════════════════════════════════════════
 // ADMIN ROUTES
 // ══════════════════════════════════════════
+// ══════════════════════════════════════════
+// PLATFORM EXPENSES
+// ══════════════════════════════════════════
+app.get('/admin/expenses', adminAuth, async (req, res) => {
+  try {
+    const rows = await db.all(`SELECT * FROM platform_expenses ORDER BY created_at DESC`);
+    const totalRow = await db.one(`SELECT COALESCE(SUM(amount),0) as total FROM platform_expenses`);
+    res.json({ expenses: rows, total: parseFloat(totalRow.total) });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/admin/expenses/add', adminAuth, async (req, res) => {
+  try {
+    const { amount, note, category } = req.body;
+    const amt = parseFloat(amount);
+    if (!amt || amt <= 0 || !isFinite(amt)) return res.status(400).json({ error: 'Invalid amount' });
+    if (amt > 1000000) return res.status(400).json({ error: 'Amount too large' });
+    const validCats = ['platform', 'developer', 'marketing', 'server', 'other'];
+    const cat = validCats.includes(category) ? category : 'other';
+    const safeNote = (note || '').toString().slice(0, 200);
+    await db.run(
+      `INSERT INTO platform_expenses (amount, note, category) VALUES ($1, $2, $3)`,
+      [amt, safeNote, cat]
+    );
+    log('ADMIN', `Expense added: $${amt} [${cat}] — ${safeNote || '(no note)'}`);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.delete('/admin/expenses/:id', adminAuth, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Invalid id' });
+    const result = await pool.query(`DELETE FROM platform_expenses WHERE id=$1 RETURNING id`, [id]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Not found' });
+    log('ADMIN', `Expense deleted id=${id}`);
+    res.json({ success: true });
+  } catch(e) { log('ERROR', e.message); res.status(500).json({ error: 'Server error' }); }
+});
+
 app.get('/admin/stats', adminAuth, async (req, res) => {
   try {
     const [
@@ -2638,6 +2688,8 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='pending'`),
         // [LIABILITY] Total future ROI still owed on active investments
         db.one(`SELECT COALESCE(SUM((days_total - days_done) * daily_earn),0) as s FROM investments WHERE status='active'`),
+        // [EXPENSES] Total platform expenses logged by admin
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM platform_expenses`),
         // [CAPITAL] Total ever invested — active + completed both
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM investments`),
       ]),
@@ -2822,7 +2874,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     ]);
 
     // ── Build summary ──────────────────────────────────────────────────────
-    const [tu, tiv, td, tw, tai, tp, tpr, tc, tbal, tcomm, tcredit, tpendwith, tfutureROI, tallInvest] = summaryRows;
+    const [tu, tiv, td, tw, tai, tp, tpr, tc, tbal, tcomm, tcredit, tpendwith, tfutureROI, texpenses, tallInvest] = summaryRows;
     // Today's deposit/withdrawal totals — query directly for accuracy (avoids timezone mismatch)
     const [todayDepRow, todayWithRow] = await Promise.all([
       db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions
@@ -2840,13 +2892,13 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     const reinvestCred  = parseFloat(tcredit.s);
     const pendingWithAmt= parseFloat(tpendwith.s);
     const futureROI     = parseFloat(tfutureROI.s);
+    const totalExpenses = parseFloat(texpenses.s);
     // Total liability = what we owe users right now
     // NOTE: pendingWithdrawals excluded — balance already deducted from users.balance at request time
     // so it's already captured inside userBalances deduction (balance col was decremented)
     const totalLiability = userBalances + pendingComm + reinvestCred;
-    // Actual free cash = deposits received − withdrawals sent out − what's still owed to users
-    // pendingWithdrawals shown separately as "in-transit" (balance already deducted, not yet sent on-chain)
-    const realFreeCash  = totalDep - totalWith - totalLiability - pendingWithAmt;
+    // Actual free cash = deposits received − withdrawals sent out − what's still owed to users − admin expenses
+    const realFreeCash  = totalDep - totalWith - totalLiability - pendingWithAmt - totalExpenses;
 
     const summary = {
       totalUsers:        parseInt(tu.c),
@@ -2869,6 +2921,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
       totalLiability,
       realFreeCash,
       allTimeInvested: parseFloat(tallInvest.s),
+      totalExpenses,
     };
 
     // ── Build flag lookup maps ─────────────────────────────────────────────
