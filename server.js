@@ -2628,6 +2628,18 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
         db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='earn' AND status='completed'`),
         db.one(`SELECT COALESCE(SUM(pending_earn),0) as s FROM investments WHERE status='active'`),
         db.one(`SELECT COUNT(*) as c FROM investments WHERE status='completed'`),
+        // [LIABILITY] Total user balance (withdrawable)
+        db.one(`SELECT COALESCE(SUM(balance),0) as s FROM users`),
+        // [LIABILITY] Total pending commissions owed
+        db.one(`SELECT COALESCE(SUM(pending_commission),0) as s FROM users`),
+        // [LIABILITY] Total reinvest credit (refunded cancellations)
+        db.one(`SELECT COALESCE(SUM(reinvest_credit),0) as s FROM users`),
+        // [LIABILITY] Pending withdrawal requests (approved=not yet sent)
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE type='withdraw' AND status='pending'`),
+        // [LIABILITY] Total future ROI still owed on active investments
+        db.one(`SELECT COALESCE(SUM((days_total - days_done) * daily_earn),0) as s FROM investments WHERE status='active'`),
+        // [CAPITAL] Total ever invested — active + completed both
+        db.one(`SELECT COALESCE(SUM(amount),0) as s FROM investments`),
       ]),
 
       // 2. All active investors — single optimised query
@@ -2810,7 +2822,7 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     ]);
 
     // ── Build summary ──────────────────────────────────────────────────────
-    const [tu, tiv, td, tw, tai, tp, tpr, tc] = summaryRows;
+    const [tu, tiv, td, tw, tai, tp, tpr, tc, tbal, tcomm, tcredit, tpendwith, tfutureROI, tallInvest] = summaryRows;
     // Today's deposit/withdrawal totals — query directly for accuracy (avoids timezone mismatch)
     const [todayDepRow, todayWithRow] = await Promise.all([
       db.one(`SELECT COALESCE(SUM(amount),0) as s FROM transactions
@@ -2821,18 +2833,42 @@ app.get('/admin/invest-analytics', adminAuth, async (req, res) => {
     const todayDepAmt  = parseFloat(todayDepRow.s  || 0);
     const todayWithAmt = parseFloat(todayWithRow.s || 0);
 
+    const totalDep      = parseFloat(td.s);
+    const totalWith     = parseFloat(tw.s);
+    const userBalances  = parseFloat(tbal.s);
+    const pendingComm   = parseFloat(tcomm.s);
+    const reinvestCred  = parseFloat(tcredit.s);
+    const pendingWithAmt= parseFloat(tpendwith.s);
+    const futureROI     = parseFloat(tfutureROI.s);
+    // Total liability = what we owe users right now
+    // NOTE: pendingWithdrawals excluded — balance already deducted from users.balance at request time
+    // so it's already captured inside userBalances deduction (balance col was decremented)
+    const totalLiability = userBalances + pendingComm + reinvestCred;
+    // Actual free cash = deposits received − withdrawals sent out − what's still owed to users
+    // pendingWithdrawals shown separately as "in-transit" (balance already deducted, not yet sent on-chain)
+    const realFreeCash  = totalDep - totalWith - totalLiability - pendingWithAmt;
+
     const summary = {
       totalUsers:        parseInt(tu.c),
       totalInvestors:    parseInt(tiv.c),
-      totalDeposits:     parseFloat(td.s),
-      totalWithdrawals:  parseFloat(tw.s),
+      totalDeposits:     totalDep,
+      totalWithdrawals:  totalWith,
       activeInvestments: parseInt(tai.c),
       profitPaid:        parseFloat(tp.s),
       pendingROI:        parseFloat(tpr.s),
       completedCount:    parseInt(tc.c),
-      netFlow:           parseFloat(td.s) - parseFloat(tw.s),
+      netFlow:           totalDep - totalWith,
       todayDeposits:     todayDepAmt,
       todayWithdrawals:  todayWithAmt,
+      // NEW — liability breakdown
+      userBalances,
+      pendingCommissions: pendingComm,
+      reinvestCredit:     reinvestCred,
+      pendingWithdrawals: pendingWithAmt,
+      futureROI,
+      totalLiability,
+      realFreeCash,
+      allTimeInvested: parseFloat(tallInvest.s),
     };
 
     // ── Build flag lookup maps ─────────────────────────────────────────────
