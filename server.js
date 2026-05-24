@@ -3050,10 +3050,9 @@ app.get('/admin/mining-analytics', adminAuth, async (req, res) => {
           amount,
           COUNT(*)          AS plan_count,
           COALESCE(SUM(CASE WHEN status='active' THEN 1 ELSE 0 END),0) AS active_count,
-          COALESCE(SUM(daily_blk),0) AS total_daily_blk,
-          purchase_mode
+          COALESCE(SUM(daily_blk),0) AS total_daily_blk
         FROM mining_plans
-        GROUP BY amount, purchase_mode
+        GROUP BY amount
         ORDER BY amount DESC
       `),
 
