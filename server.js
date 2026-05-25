@@ -1463,7 +1463,7 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     const [investments, transactions, taskRows, referrals, plansRows, settingRows, activeRefRow, totalL1Row, activeL1Row, vipResult] = await Promise.all([
       withTimeout(db.all(`SELECT *, EXTRACT(EPOCH FROM (NOW() - last_collect)) as secs_since_collect
               FROM investments WHERE user_id=$1 AND status='active'`, [uid]), 5000, []),
-      withTimeout(db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`, [uid]), 5000, []),
+      withTimeout(db.all(`SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`, [uid]), 5000, []),
       withTimeout(db.all(`SELECT task_key FROM tasks WHERE user_id=$1 AND completed=1`, [uid]), 5000, []),
       withTimeout(db.all(`SELECT r.id, r.first_name, r.username, r.created_at, 0 as total_deposit
               FROM users r WHERE r.referred_by=$1 ORDER BY r.created_at DESC LIMIT 50`, [uid]), 5000, []),
