@@ -386,10 +386,11 @@ pool.on('error', (err) => {
 });
 
 const db = {
-  query: (text, params) => pool.query(text, params),
-  one:   async (text, params) => { const r = await pool.query(text, params); return r.rows[0] || null; },
-  all:   async (text, params) => { const r = await pool.query(text, params); return r.rows; },
-  run:   async (text, params) => { await pool.query(text, params); },
+  query:     (text, params) => pool.query(text, params),
+  one:       async (text, params) => { const r = await pool.query(text, params); return r.rows[0] || null; },
+  oneOrNone: async (text, params) => { const r = await pool.query(text, params); return r.rows[0] || null; },
+  all:       async (text, params) => { const r = await pool.query(text, params); return r.rows; },
+  run:       async (text, params) => { await pool.query(text, params); },
 };
 
 // ══════════════════════════════════════════
