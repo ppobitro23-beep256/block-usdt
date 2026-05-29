@@ -110,7 +110,7 @@ const FRAUD_MAX        = 15;                   // max failed attempts
 const BLOCK_DURATION   = 25 * 60 * 1000;       // 25 min block
 
 async function getFraudState(userId) {
-  const row = await db.one(`SELECT fraud_attempts, blocked_until FROM users WHERE id=$1`, [userId]);
+  const row = await db.oneOrNone(`SELECT fraud_attempts, blocked_until FROM users WHERE id=$1`, [userId]);
   if (!row) return { attempts: [], blockedUntil: null };
   let attempts = [];
   try { attempts = JSON.parse(row.fraud_attempts || '[]'); } catch(_) {}
@@ -917,7 +917,7 @@ process.on('uncaughtException', (err) => {
 });
 
 async function getSetting(key) {
-  const r = await db.one(`SELECT value FROM settings WHERE key=$1`, [key]);
+  const r = await db.oneOrNone(`SELECT value FROM settings WHERE key=$1`, [key]);
   return r ? r.value : null;
 }
 
@@ -1042,7 +1042,7 @@ async function getActiveReferralCount(userId) {
 // reqMaxLevels: hard cap for commission calc to limit DB queries.
 async function getUserVipStatus(userId, reqMaxLevels) {
   // ── Check manual override FIRST ──────────────────────────────────────
-  const overrideRow = await db.one(
+  const overrideRow = await db.oneOrNone(
     `SELECT manual_commission_enabled, manual_plan_tier, manual_vip_level,
             manual_override_expiry, manual_badge_label
      FROM users WHERE id=$1`, [userId]
@@ -1341,7 +1341,7 @@ app.post('/api/auth', authLimit, async (req, res) => {
     // Check pending ref
     let pendingRef = finalRef;
     if (!pendingRef) {
-      const pr = await db.one('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
+      const pr = await db.oneOrNone('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
       if (pr) {
         const prid = parseInt(String(pr.ref_code).replace('REF',''));
         if (prid && prid !== uid) pendingRef = prid;
@@ -1365,6 +1365,24 @@ app.post('/api/auth', authLimit, async (req, res) => {
     // Log referral save result
     if (pendingRef) {
       log('REF', `referred_by saved: uid=${uid} referrer=${pendingRef}`);
+    }
+
+    // [LATE-APPLY] User already exists but referred_by is NULL — bot may have saved pending_ref after first auth
+    // Check pending_refs BEFORE deleting — covers race condition on subsequent app opens
+    if (!pendingRef) {
+      try {
+        const lateCheck = await db.oneOrNone('SELECT referred_by FROM users WHERE id=$1', [uid]);
+        if (lateCheck && !lateCheck.referred_by) {
+          const latePr = await db.oneOrNone('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
+          if (latePr) {
+            const latePrid = parseInt(String(latePr.ref_code).replace('REF',''));
+            if (latePrid && latePrid !== uid) {
+              await db.run('UPDATE users SET referred_by=$1 WHERE id=$2 AND referred_by IS NULL', [latePrid, uid]);
+              log('REF', `Late-apply referred_by: uid=${uid} referrer=${latePrid}`);
+            }
+          }
+        }
+      } catch(e) { log('WARN', `Late-apply check failed: ${e.message}`); }
     }
 
     // Clean pending ref
@@ -1426,10 +1444,11 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
     // ── 3. Check pending ref ────────────────────────────
     let pendingRef = finalRef;
     if (!pendingRef) {
-      const pr = await db.one('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
+      const pr = await db.oneOrNone('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
       if (pr) {
         const prid = parseInt(String(pr.ref_code).replace('REF',''));
         if (prid && prid !== uid) pendingRef = prid;
+        log('REF', `Pending ref found for uid=${uid} referrer=${prid}`);
       }
     }
 
@@ -1444,6 +1463,25 @@ app.post('/api/bootstrap', authLimit, async (req, res) => {
         language=EXCLUDED.language, is_premium=EXCLUDED.is_premium,
         referred_by=CASE WHEN users.referred_by IS NULL AND $8::BIGINT IS NOT NULL THEN $8::BIGINT ELSE users.referred_by END
     `, [uid, u.first_name||'', u.last_name||'', u.username||'', u.language_code||'', u.is_premium?1:0, refCode, pendingRef]);
+
+    if (pendingRef) log('REF', `referred_by saved: uid=${uid} referrer=${pendingRef}`);
+
+    // [LATE-APPLY] User already exists but referred_by is NULL — covers race condition on subsequent app opens
+    if (!pendingRef) {
+      try {
+        const lateCheck = await db.oneOrNone('SELECT referred_by FROM users WHERE id=$1', [uid]);
+        if (lateCheck && !lateCheck.referred_by) {
+          const latePr = await db.oneOrNone('SELECT ref_code FROM pending_refs WHERE user_id=$1', [uid]);
+          if (latePr) {
+            const latePrid = parseInt(String(latePr.ref_code).replace('REF',''));
+            if (latePrid && latePrid !== uid) {
+              await db.run('UPDATE users SET referred_by=$1 WHERE id=$2 AND referred_by IS NULL', [latePrid, uid]);
+              log('REF', `Late-apply referred_by: uid=${uid} referrer=${latePrid}`);
+            }
+          }
+        }
+      } catch(e) { log('WARN', `Late-apply check failed: ${e.message}`); }
+    }
 
     await db.run('DELETE FROM pending_refs WHERE user_id=$1', [uid]).catch(()=>{});
 
@@ -1689,7 +1727,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
     if (!user) return res.status(404).json({error:'Not found'});
     if (user.is_banned) return res.status(403).json({error:'banned'});
 
-    const plan = await db.one(`SELECT * FROM plans WHERE id=$1 AND is_active=1`, [plan_id]);
+    const plan = await db.oneOrNone(`SELECT * FROM plans WHERE id=$1 AND is_active=1`, [plan_id]);
     if (!plan) return res.status(404).json({error:'Plan not found'});
     if (amount < plan.min_amt) return res.status(400).json({error:`Min $${plan.min_amt}`});
     if (amount > plan.max_amt) return res.status(400).json({error:`Max $${plan.max_amt}`});
@@ -1709,7 +1747,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
       const promoUnlock = await getSetting('promo_unlock');
       if (promoUnlock !== '1') {
         // Check paid unlock log
-        const paidUnlock = await db.one(
+        const paidUnlock = await db.oneOrNone(
           `SELECT id FROM plan_unlock_logs WHERE user_id=$1 AND plan_id=$2 AND unlock_type='paid'
            ORDER BY created_at DESC LIMIT 1`,
           [u.id, plan.id]
@@ -1805,7 +1843,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
       let currentId = u.id;
       const vipCache = new Map(); // per-invest cache: referrerId → vip object
       for (let lvl = 0; lvl < 7; lvl++) {
-        const row = await db.one(`SELECT referred_by, is_banned FROM users WHERE id=$1`, [currentId]);
+        const row = await db.oneOrNone(`SELECT referred_by, is_banned FROM users WHERE id=$1`, [currentId]);
         if (!row || !row.referred_by) break;
         const referrerId = row.referred_by;
 
@@ -1841,7 +1879,7 @@ app.post('/api/invest', userAuth, async (req, res) => {
         log('COMM', `L${lvl+1} ${refVip.name} ${pct*100}% $${comm} → user ${referrerId}`);
         currentId = referrerId;
       }
-    } catch(e) { console.log('Commission error:', e.message); }
+    } catch(e) { log('WARN', `Commission error: ${e.message}`); }
 
     res.json({success:true, daily_earn:daily});
   } catch(e) { log("ERROR", e.message); res.status(500).json({error:"Server error. Please try again."}); }
@@ -1899,7 +1937,7 @@ app.post('/api/withdraw/bind-address', userAuth, async (req, res) => {
     const cleanAddr = address.trim().toLowerCase();
 
     // ✅ UNIQUE CHECK: Address must not belong to another account
-    const existing = await db.one(
+    const existing = await db.oneOrNone(
       `SELECT id FROM users WHERE LOWER(withdraw_address)=$1 AND id!=$2`,
       [cleanAddr, u.id]
     );
@@ -1993,7 +2031,7 @@ app.post('/api/withdraw', userAuth, async (req, res) => {
     }
 
     // [NEW] One pending withdrawal per user
-    const existing = await db.one(
+    const existing = await db.oneOrNone(
       `SELECT id, created_at FROM transactions WHERE user_id=$1 AND type='withdraw' AND status='pending'`,
       [u.id]
     );
@@ -2033,7 +2071,7 @@ app.post('/api/collect-daily', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
     const {investment_id} = req.body;
-    const inv = await db.one(
+    const inv = await db.oneOrNone(
       `SELECT * FROM investments WHERE id=$1 AND user_id=$2 AND status='active'`,
       [investment_id, u.id]
     );
@@ -2090,7 +2128,7 @@ app.post('/api/task/complete', userAuth, async (req, res) => {
     const u = req.tgUser;
     const {task_key} = req.body; // reward from CLIENT ignored — always use server-side value
     // [SECURITY] Get reward from DB first, not from client
-    const taskCfg = await db.one(`SELECT * FROM tasks_config WHERE task_key=$1 AND is_active=1`, [task_key]);
+    const taskCfg = await db.oneOrNone(`SELECT * FROM tasks_config WHERE task_key=$1 AND is_active=1`, [task_key]);
     if (!taskCfg) return res.status(404).json({error:'Task not found'});
     const reward = parseFloat(taskCfg.reward) || 0;
 
@@ -2134,7 +2172,7 @@ app.post('/api/verify-task', userAuth, async (req, res) => {
     const u = req.tgUser;
     if (!u || !u.id) return res.status(400).json({error:'No user'});
     const { task_key } = req.body;
-    const taskCfg = await db.one('SELECT * FROM tasks_config WHERE task_key=$1 AND is_active=1', [task_key]);
+    const taskCfg = await db.oneOrNone('SELECT * FROM tasks_config WHERE task_key=$1 AND is_active=1', [task_key]);
     if (!taskCfg) return res.status(404).json({error:'Task not found'});
 
     // If task has a chat_id, verify via Telegram Bot API
@@ -2149,7 +2187,7 @@ app.post('/api/verify-task', userAuth, async (req, res) => {
           const isMember = ['member','administrator','creator'].includes(status);
           return res.json({ verified: isMember });
         }
-      } catch(e) { console.log('TG verify error:', e.message); }
+      } catch(e) { log('WARN', `TG verify error: ${e.message}`); }
     }
 
     // No chat_id set — just trust the user
@@ -2163,7 +2201,7 @@ app.get('/api/story-task/status', userAuth, async (req, res) => {
   try {
     const u    = req.tgUser;
     const today = new Date().toISOString().slice(0, 10);
-    const row  = await db.one(
+    const row  = await db.oneOrNone(
       `SELECT attempts, claimed FROM story_tasks WHERE user_id=$1 AND claim_date=$2`,
       [u.id, today]
     );
@@ -2182,7 +2220,7 @@ app.post('/api/story-task/claim', userAuth, async (req, res) => {
     const REWARD = 0.04;
 
     // [ORDER FIX] Check existing row BEFORE incrementing attempts
-    const existingRow = await db.one(
+    const existingRow = await db.oneOrNone(
       `SELECT attempts, claimed FROM story_tasks WHERE user_id=$1 AND claim_date=$2`,
       [u.id, today]
     );
@@ -3330,13 +3368,13 @@ app.post('/admin/deposit/approve', adminAuth, async (req, res) => {
     const {tx_id, admin_note} = req.body;
     if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
 
-    const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`, [tx_id]);
+    const tx = await db.oneOrNone(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
     if (parseFloat(tx.amount) <= 0) return res.status(400).json({error:'Invalid amount'});
 
     // [DOUBLE-CREDIT GUARD] If tx was already auto-credited (has txid + status approved in auto_deposits), block approval
     if (tx.txid) {
-      const alreadyAuto = await db.one(
+      const alreadyAuto = await db.oneOrNone(
         `SELECT id FROM auto_deposits WHERE tx_hash=$1 AND status='completed'`,
         [tx.txid]
       );
@@ -3365,7 +3403,7 @@ app.post('/admin/deposit/reject', adminAuth, async (req, res) => {
   try {
     const {tx_id, admin_note} = req.body;
     if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
-    const tx = await db.one(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`, [tx_id]);
+    const tx = await db.oneOrNone(`SELECT * FROM transactions WHERE id=$1 AND type='deposit'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
     if (tx.status !== 'pending') return res.status(400).json({error:'Already processed'});
     await db.run(`UPDATE transactions SET status='rejected', admin_note=$1 WHERE id=$2`, [admin_note||'Rejected by admin', tx_id]);
@@ -3378,7 +3416,7 @@ app.post('/admin/withdraw/approve', adminAuth, async (req, res) => {
   try {
     const {tx_id, admin_note, bsc_tx_hash} = req.body;
     if (!tx_id || isNaN(parseInt(tx_id))) return res.status(400).json({error:'Invalid tx_id'});
-    const tx = await db.one(`SELECT t.*, u.username, u.first_name FROM transactions t LEFT JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.type='withdraw'`, [tx_id]);
+    const tx = await db.oneOrNone(`SELECT t.*, u.username, u.first_name FROM transactions t LEFT JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.type='withdraw'`, [tx_id]);
     if (!tx) return res.status(404).json({error:'Not found'});
 
     // [ATOMIC] Only approve if still pending — rowCount=0 means already processed
@@ -3526,7 +3564,7 @@ app.post('/admin/plan/update-count', adminAuth, async (req, res) => {
 app.post('/api/mining/swap', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
-    const minRow  = await db.one(`SELECT value FROM settings WHERE key='token_min_swap'`);
+    const minRow  = await db.oneOrNone(`SELECT value FROM settings WHERE key='token_min_swap'`);
     const minSwap = parseFloat(minRow?.value || '10');
     const user    = await db.one(`SELECT block_tokens, balance FROM users WHERE id=$1`, [u.id]);
     const totalTokens = parseFloat(user.block_tokens || 0);
@@ -3578,7 +3616,7 @@ app.post('/api/mining/swap', userAuth, async (req, res) => {
 app.get('/api/spin/status', userAuth, async (req, res) => {
   try {
     const u = req.tgUser;
-    const lastSpin = await db.one(
+    const lastSpin = await db.oneOrNone(
       `SELECT spun_at FROM spin_logs WHERE user_id=$1 ORDER BY spun_at DESC LIMIT 1`,
       [u.id]
     );
@@ -3601,7 +3639,7 @@ app.post('/api/spin/claim', userAuth, async (req, res) => {
     const u = req.tgUser;
 
     // Cooldown check — 24h between spins
-    const lastSpin = await db.one(
+    const lastSpin = await db.oneOrNone(
       `SELECT spun_at FROM spin_logs WHERE user_id=$1 ORDER BY spun_at DESC LIMIT 1`,
       [u.id]
     );
@@ -3660,8 +3698,8 @@ app.get('/api/mining/info', userAuth, async (req, res) => {
                      block_tokens_total, mining_taps_today, mining_taps_date,
                      energy_reset_flag, spin_reset_flag, last_spin_date
               FROM users WHERE id=$1`, [u.id]),
-      db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
-      db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
+      db.oneOrNone(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
+      db.oneOrNone(`SELECT value FROM settings WHERE key='mining_day_mode'`),
       db.one(`SELECT spun_at FROM spin_logs WHERE user_id=$1 ORDER BY spun_at DESC LIMIT 1`, [u.id]).catch(() => null),
     ]);
 
@@ -3842,7 +3880,7 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
 
     // Distribute referral commissions — same logic as normal investment plans
     try {
-      const buyer = await db.one(`SELECT referred_by, is_active_ref, is_banned FROM users WHERE id=$1`, [u.id]);
+      const buyer = await db.oneOrNone(`SELECT referred_by, is_active_ref, is_banned FROM users WHERE id=$1`, [u.id]);
 
       // Mark as active referral on first mining plan purchase (same as investment)
       if (!buyer.is_active_ref && buyer.referred_by && buyer.id !== buyer.referred_by) {
@@ -3854,7 +3892,7 @@ app.post('/api/mining/boost/buy', userAuth, async (req, res) => {
       let currentId = u.id;
       const vipCache = new Map();
       for (let lvl = 0; lvl < 7; lvl++) {
-        const row = await db.one(`SELECT referred_by, is_banned FROM users WHERE id=$1`, [currentId]);
+        const row = await db.oneOrNone(`SELECT referred_by, is_banned FROM users WHERE id=$1`, [currentId]);
         if (!row || !row.referred_by) break;
         const referrerId = row.referred_by;
         if (row.is_banned) { currentId = referrerId; continue; }
@@ -3913,7 +3951,7 @@ app.post('/api/mining/earn', userAuth, async (req, res) => {
     const taps  = Math.min(parseInt(req.body?.taps) || 1, 100);
     const today = new Date().toISOString().slice(0, 10);
 
-    const maxTapsRow = await db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`);
+    const maxTapsRow = await db.oneOrNone(`SELECT value FROM settings WHERE key='max_taps_per_day'`);
     const maxTaps    = parseInt(maxTapsRow?.value || '100');
 
     const user = await db.one(
@@ -4050,7 +4088,7 @@ app.get('/admin/mining/stats', adminAuth, async (req, res) => {
                      COALESCE(SUM(block_tokens_today),0) as today_tokens
               FROM users`),
       db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`),
-      db.one(`SELECT value FROM settings WHERE key='blk_price'`),
+      db.oneOrNone(`SELECT value FROM settings WHERE key='blk_price'`),
       db.one(`SELECT value FROM settings WHERE key='max_taps_per_day'`),
     ]);
     const blkPrice = await getCurrentBlkPrice();
@@ -4125,7 +4163,7 @@ app.get('/admin/mining/users-detail', adminAuth, async (req, res) => {
     const limit  = 20;
     const offset = (page - 1) * limit;
     const blkPrice = await getCurrentBlkPrice();
-    const modeRow  = await db.one(`SELECT value FROM settings WHERE key='mining_day_mode'`);
+    const modeRow  = await db.oneOrNone(`SELECT value FROM settings WHERE key='mining_day_mode'`);
 
     const baseQ = `SELECT u.id, u.first_name, u.username, u.uid,
              COALESCE(u.block_tokens,0) as blk,
@@ -4635,7 +4673,7 @@ async function generateUniqueAmt(base) {
   for (let i = 0; i < 99; i++) {
     const dec  = (Math.floor(Math.random() * 99) + 1); // 1–99 cents (0.01–0.99)
     const uAmt = +(parseFloat(base) + dec / 100).toFixed(2);
-    const ex   = await db.one(
+    const ex   = await db.oneOrNone(
       `SELECT id FROM auto_deposits WHERE unique_amt=$1 AND status='pending' AND expires_at > NOW()`,
       [uAmt]
     );
@@ -4657,7 +4695,7 @@ app.post('/api/deposit/create', depositLimit, userAuth, async (req, res) => {
     if (amt < minDep) return res.status(400).json({error:`Minimum deposit: $${minDep}`});
 
     // [ANTI-FRAUD] Cancel any existing pending auto deposit for this user
-    const existing = await db.one(
+    const existing = await db.oneOrNone(
       `SELECT id FROM auto_deposits WHERE user_id=$1 AND dep_type='auto' AND status='pending' AND expires_at > NOW()`,
       [u.id]
     );
@@ -4688,7 +4726,7 @@ app.post('/api/deposit/create', depositLimit, userAuth, async (req, res) => {
 app.get('/api/deposit/status/:id', userAuth, async (req, res) => {
   try {
     const u   = req.tgUser;
-    const dep = await db.one(
+    const dep = await db.oneOrNone(
       `SELECT * FROM auto_deposits WHERE id=$1 AND user_id=$2`,
       [req.params.id, u.id]
     );
@@ -5487,7 +5525,49 @@ app.get('/admin/user/:id/address', adminAuth, async (req, res) => {
   } catch(e) { log('ERROR', e.message); res.status(500).json({error:'Server error. Please try again.'}); }
 });
 
-// ── Admin: Change user withdraw address ──
+// ── Admin: Set referred_by (fix missing referral) ──────────────────────────
+app.post('/admin/user/set-referrer', adminAuth, async (req, res) => {
+  try {
+    const { user_id, referrer_id } = req.body;
+    if (!user_id) return res.status(400).json({error:'user_id required'});
+    if (!referrer_id) return res.status(400).json({error:'referrer_id required'});
+
+    const uid = parseInt(user_id);
+    const rid = parseInt(referrer_id);
+    if (uid === rid) return res.status(400).json({error:'Cannot refer yourself'});
+
+    const user = await db.oneOrNone('SELECT id, first_name, username, referred_by FROM users WHERE id=$1', [uid]);
+    if (!user) return res.status(404).json({error:'User not found'});
+
+    const referrer = await db.oneOrNone('SELECT id, first_name, username FROM users WHERE id=$1', [rid]);
+    if (!referrer) return res.status(404).json({error:'Referrer not found'});
+
+    // Circular referral check — walk up referrer's upline chain, max 20 levels
+    // If we encounter user_id anywhere in the chain → circular loop → reject
+    let currentId = rid;
+    let depth = 0;
+    while (currentId && depth < 20) {
+      const row = await db.oneOrNone('SELECT referred_by FROM users WHERE id=$1', [currentId]);
+      if (!row || !row.referred_by) break;
+      if (parseInt(row.referred_by) === uid) {
+        return res.status(400).json({
+          error: `Circular referral detected — ${referrer.first_name || referrer.username} is already a downline of ${user.first_name || user.username}`
+        });
+      }
+      currentId = parseInt(row.referred_by);
+      depth++;
+    }
+
+    await db.run('UPDATE users SET referred_by=$1 WHERE id=$2', [rid, uid]);
+    log('ADMIN', `Set referred_by: user=${uid} (${user.username}) → referrer=${rid} (${referrer.username})`);
+
+    res.json({success:true, message:`${user.first_name || user.username} is now referred by ${referrer.first_name || referrer.username}`});
+  } catch(e) {
+    log('ERROR', 'set-referrer: ' + e.message);
+    res.status(500).json({error:'Server error'});
+  }
+});
+
 app.post('/admin/user/change-address', adminAuth, async (req, res) => {
   try {
     const { user_id, new_address } = req.body;
@@ -5504,7 +5584,7 @@ app.post('/admin/user/change-address', adminAuth, async (req, res) => {
     const { force_override } = req.body; // admin can pass force_override:true to bypass
 
     // Check if address already belongs to another user
-    const addrOwner = await db.one(
+    const addrOwner = await db.oneOrNone(
       `SELECT id, first_name, username FROM users WHERE LOWER(withdraw_address)=$1 AND id!=$2`,
       [normalizedNew, user_id]
     );
@@ -5636,7 +5716,7 @@ app.delete('/admin/broadcasts/:id', adminAuth, async (req, res) => {
 // POST send now (manual trigger)
 app.post('/admin/broadcasts/:id/send', adminAuth, async (req, res) => {
   try {
-    const bc = await db.one(`SELECT * FROM broadcasts WHERE id=$1`, [req.params.id]);
+    const bc = await db.oneOrNone(`SELECT * FROM broadcasts WHERE id=$1`, [req.params.id]);
     if (!bc) return res.status(404).json({error:'Not found'});
     if (bc.status === 'sending') return res.status(400).json({error:'Already sending'});
     if (bc.status === 'done') return res.status(400).json({error:'Already sent'});
@@ -5744,7 +5824,7 @@ app.get('/api/notice', userAuth, async (req, res) => {
     const now = new Date().toISOString();
 
     // Get active notice (scheduled and not expired)
-    const notice = await db.one(`
+    const notice = await db.oneOrNone(`
       SELECT * FROM notices
       WHERE is_active = TRUE
         AND (schedule_at IS NULL OR schedule_at <= NOW())
@@ -5755,13 +5835,13 @@ app.get('/api/notice', userAuth, async (req, res) => {
 
     // Check repeat mode
     if (notice.repeat_mode === 'once') {
-      const seen = await db.one(
+      const seen = await db.oneOrNone(
         `SELECT id FROM notice_stats WHERE notice_id=$1 AND user_id=$2 AND action='seen'`,
         [notice.id, u.id]
       );
       if (seen) return res.json({ notice: null }); // already seen once
     } else if (notice.repeat_mode === 'daily') {
-      const seen = await db.one(
+      const seen = await db.oneOrNone(
         `SELECT id FROM notice_stats WHERE notice_id=$1 AND user_id=$2 AND action='seen' AND created_at > NOW() - INTERVAL '24 hours'`,
         [notice.id, u.id]
       );
@@ -5892,7 +5972,7 @@ app.delete('/admin/notices/:id', adminAuth, async (req, res) => {
 app.patch('/admin/notices/:id/toggle', adminAuth, async (req, res) => {
   try {
     const id = req.params.id;
-    const notice = await db.one(`SELECT is_active FROM notices WHERE id=$1`, [id]);
+    const notice = await db.oneOrNone(`SELECT is_active FROM notices WHERE id=$1`, [id]);
     if (!notice) return res.status(404).json({error:'Not found'});
     const newState = !notice.is_active;
     if (newState) await db.run(`UPDATE notices SET is_active=FALSE`);
@@ -5973,7 +6053,7 @@ app.post('/admin/special/set', adminAuth, async (req, res) => {
 
     if (!user_id) return res.status(400).json({ error: 'user_id required' });
 
-    const user = await db.one(`SELECT id, first_name FROM users WHERE id=$1`, [user_id]);
+    const user = await db.oneOrNone(`SELECT id, first_name FROM users WHERE id=$1`, [user_id]);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     // Build expiry
@@ -6356,7 +6436,7 @@ app.post('/api/invest/paid-unlock', userAuth, async (req, res) => {
 
     const [user, plan] = await Promise.all([
       db.one(`SELECT * FROM users WHERE id=$1`, [u.id]),
-      db.one(`SELECT * FROM plans WHERE id=$1 AND is_active=1`, [plan_id])
+      db.oneOrNone(`SELECT * FROM plans WHERE id=$1 AND is_active=1`, [plan_id])
     ]);
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (!plan)  return res.status(404).json({ error: 'Plan not found' });
@@ -6493,7 +6573,7 @@ app.post('/admin/plans/toggle-unlock', adminAuth, async (req, res) => {
     if (!plan_id) return res.status(400).json({ error: 'Missing plan_id' });
 
     await db.run(`UPDATE plans SET manual_unlock=$1 WHERE id=$2`, [!!manual_unlock, plan_id]);
-    const plan = await db.one(`SELECT id, name, manual_unlock FROM plans WHERE id=$1`, [plan_id]);
+    const plan = await db.oneOrNone(`SELECT id, name, manual_unlock FROM plans WHERE id=$1`, [plan_id]);
 
     log('ADMIN_PLAN', `Plan ${plan.name} manual_unlock set to ${manual_unlock}`);
     await db.run(
