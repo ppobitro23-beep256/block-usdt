@@ -309,7 +309,7 @@ const corsConfig = {
     if (origin.endsWith('.telegram.org')) return cb(null, true);
     cb(new Error('CORS not allowed'));
   },
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'x-telegram-init-data', 'x-admin-secret', 'x-manager-pass', 'Accept'],
   credentials: false,
 };
@@ -820,6 +820,33 @@ async function setupDB() {
   await db.run(`CREATE INDEX IF NOT EXISTS idx_webhook_logs_tx   ON webhook_logs (tx_hash)`);
   await db.run(`CREATE INDEX IF NOT EXISTS idx_webhook_logs_user ON webhook_logs (user_id)`);
   await db.run(`CREATE INDEX IF NOT EXISTS idx_webhook_logs_time ON webhook_logs (created_at DESC)`);
+
+  // ── Top Holders Event System ─────────────────────────────────────────────
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS holder_events (
+      id             SERIAL PRIMARY KEY,
+      title          TEXT    NOT NULL DEFAULT 'Top Holders Event',
+      duration_days  INTEGER NOT NULL DEFAULT 30,
+      start_at       TIMESTAMP NOT NULL DEFAULT NOW(),
+      end_at         TIMESTAMP NOT NULL,
+      enabled        BOOLEAN DEFAULT TRUE,
+      reward_config  TEXT    DEFAULT NULL,
+      created_at     TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS holder_event_rewards (
+      id          SERIAL PRIMARY KEY,
+      event_id    INTEGER NOT NULL REFERENCES holder_events(id) ON DELETE CASCADE,
+      user_id     BIGINT  NOT NULL,
+      rank        INTEGER NOT NULL,
+      reward_usd  REAL    NOT NULL,
+      distributed BOOLEAN DEFAULT FALSE,
+      created_at  TIMESTAMP DEFAULT NOW(),
+      UNIQUE(event_id, user_id)
+    )
+  `);
+  await db.run(`CREATE INDEX IF NOT EXISTS idx_holder_rewards_event ON holder_event_rewards (event_id, rank)`);
 
   // Mark all pre-existing approved withdrawals as 'skipped' in proof logs
   // so fallback scanner never re-posts old withdrawals after deploy
@@ -6617,6 +6644,270 @@ app.get('/admin/plan-stats', adminAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════
+// ══════════════════════════════════════════
+// TOP HOLDERS EVENT SYSTEM
+// ══════════════════════════════════════════
+
+const DEFAULT_REWARD_CONFIG = [
+  { rank_from: 1,  rank_to: 1,  reward: 100 },
+  { rank_from: 2,  rank_to: 2,  reward: 75  },
+  { rank_from: 3,  rank_to: 3,  reward: 50  },
+  { rank_from: 4,  rank_to: 5,  reward: 30  },
+  { rank_from: 6,  rank_to: 10, reward: 20  },
+  { rank_from: 11, rank_to: 15, reward: 10  },
+  { rank_from: 16, rank_to: 20, reward: 5   },
+  { rank_from: 21, rank_to: 25, reward: 3   },
+  { rank_from: 26, rank_to: 30, reward: 1   },
+];
+
+function rewardForRank(rank, config) {
+  const cfg = config || DEFAULT_REWARD_CONFIG;
+  for (const tier of cfg) {
+    if (rank >= tier.rank_from && rank <= tier.rank_to) return tier.reward;
+  }
+  return 0;
+}
+
+async function getActiveEvent() {
+  try {
+    return await db.oneOrNone(
+      `SELECT * FROM holder_events WHERE enabled=TRUE AND end_at > NOW() ORDER BY id DESC LIMIT 1`
+    );
+  } catch(e) { return null; }
+}
+
+async function buildLeaderboard(eventId, limit) {
+  // Exclude admins — fetch admin user IDs from settings or env
+  // We use a simple approach: exclude users with is_admin flag or by ADMIN_TELEGRAM_IDS env
+  const adminIds = (process.env.ADMIN_TELEGRAM_IDS || process.env.ADMIN_TELEGRAM_ID || '')
+    .split(',').map(x => parseInt(x.trim())).filter(Boolean);
+
+  let excludeClause = adminIds.length
+    ? `AND u.id NOT IN (${adminIds.join(',')})` : '';
+
+  const rows = await db.all(`
+    SELECT
+      u.id,
+      COALESCE(u.username, u.first_name, 'User#' || u.id::text) AS display_name,
+      COALESCE(u.block_tokens, 0) AS tokens,
+      ROW_NUMBER() OVER (ORDER BY COALESCE(u.block_tokens,0) DESC) AS rank
+    FROM users u
+    WHERE COALESCE(u.block_tokens, 0) > 0
+    ${excludeClause}
+    ORDER BY tokens DESC
+    LIMIT ${limit || 50}
+  `);
+  return rows;
+}
+
+// GET /api/event/current — public (userAuth)
+app.get('/api/event/current', userAuth, async (req, res) => {
+  try {
+    const event = await getActiveEvent();
+    if (!event) return res.json({ active: false });
+
+    const config = event.reward_config ? JSON.parse(event.reward_config) : DEFAULT_REWARD_CONFIG;
+    const rows   = await buildLeaderboard(event.id, 50);
+    const total  = rows.length;
+
+    // Find requesting user's rank
+    const tgUser = req.tgUser;
+    if (!tgUser || !tgUser.id) return res.status(401).json({ error: 'Auth required' });
+    const dbUser = await db.oneOrNone(`SELECT id, block_tokens FROM users WHERE id=$1`, [tgUser.id]);
+    const myRow    = rows.find(r => parseInt(r.id) === parseInt(tgUser.id));
+    const myRank   = myRow ? parseInt(myRow.rank) : null;
+    const myTokens = myRow ? parseFloat(myRow.tokens) : parseFloat((dbUser && dbUser.block_tokens) || 0);
+
+    // Tokens needed for next rank
+    let tokensForNext = null;
+    if (myRank && myRank > 1) {
+      const above = rows.find(r => parseInt(r.rank) === myRank - 1);
+      if (above) tokensForNext = Math.max(0.01, parseFloat(above.tokens) - myTokens + 0.01);
+    }
+
+    // Enrich leaderboard with reward
+    const leaderboard = rows.slice(0, 30).map(r => ({
+      rank:       parseInt(r.rank),
+      display_name: r.display_name,
+      tokens:     parseFloat(r.tokens),
+      reward:     rewardForRank(parseInt(r.rank), config),
+    }));
+
+    res.json({
+      active:         true,
+      event_id:       event.id,
+      title:          event.title,
+      start_at:       event.start_at,
+      end_at:         event.end_at,
+      total_participants: total,
+      leaderboard,
+      my_rank:        myRank,
+      my_tokens:      myTokens,
+      tokens_for_next: tokensForNext,
+      reward_config:  config,
+      my_reward:      myRank ? rewardForRank(myRank, config) : 0,
+    });
+  } catch(e) {
+    log('EVENT_ERR', e.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── ADMIN Event Routes ─────────────────────────────────
+// GET /admin/events — list all events
+app.get('/admin/events', adminAuth, async (req, res) => {
+  try {
+    const events = await db.all(`SELECT * FROM holder_events ORDER BY id DESC LIMIT 20`);
+    res.json({ events });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /admin/events/create — create new event
+app.post('/admin/events/create', adminAuth, async (req, res) => {
+  try {
+    const { title, duration_days, reward_config } = req.body;
+    const days = parseInt(duration_days) || 30;
+    const cfg  = reward_config ? JSON.stringify(reward_config) : null;
+    const ev = await db.one(`
+      INSERT INTO holder_events (title, duration_days, start_at, end_at, reward_config)
+      VALUES ($1, $2, NOW(), NOW() + ($2::text || ' days')::interval, $3)
+      RETURNING *
+    `, [title || 'Top Holders Event', days, cfg]);
+    res.json({ success: true, event: ev });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /admin/events/:id/toggle — enable/disable
+app.patch('/admin/events/:id/toggle', adminAuth, async (req, res) => {
+  try {
+    const evId = parseInt(req.params.id);
+    const ev = await db.oneOrNone(
+      `UPDATE holder_events SET enabled = NOT enabled WHERE id=$1 RETURNING id, enabled`, [evId]
+    );
+    if (!ev) return res.status(404).json({ error: 'Event not found' });
+    res.json({ success: true, enabled: ev.enabled });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /admin/events/:id/rewards — update reward config
+app.patch('/admin/events/:id/rewards', adminAuth, async (req, res) => {
+  try {
+    const evId = parseInt(req.params.id);
+    const { reward_config } = req.body;
+    if (!Array.isArray(reward_config) || reward_config.length === 0) {
+      return res.status(400).json({ error: 'Invalid reward_config' });
+    }
+    await db.run(
+      `UPDATE holder_events SET reward_config=$1 WHERE id=$2`,
+      [JSON.stringify(reward_config), evId]
+    );
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /admin/events/:id — delete event
+app.delete('/admin/events/:id', adminAuth, async (req, res) => {
+  try {
+    await db.run(`DELETE FROM holder_events WHERE id=$1`, [parseInt(req.params.id)]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /admin/events/:id/leaderboard — full leaderboard for admin
+app.get('/admin/events/:id/leaderboard', adminAuth, async (req, res) => {
+  try {
+    const evId = parseInt(req.params.id);
+    const rows = await buildLeaderboard(evId, 100);
+    const ev   = await db.oneOrNone(`SELECT reward_config FROM holder_events WHERE id=$1`, [evId]);
+    const config = (ev && ev.reward_config) ? JSON.parse(ev.reward_config) : DEFAULT_REWARD_CONFIG;
+    const enriched = rows.map(r => ({
+      rank:    parseInt(r.rank),
+      id:      parseInt(r.id),
+      display_name: r.display_name,
+      tokens:  parseFloat(r.tokens),
+      reward:  rewardForRank(parseInt(r.rank), config),
+    }));
+    res.json({ leaderboard: enriched });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /admin/events/:id/distribute — mark rewards as distributed (credit balances)
+app.post('/admin/events/:id/distribute', adminAuth, async (req, res) => {
+  try {
+    const eventId = parseInt(req.params.id);
+    const ev = await db.oneOrNone(`SELECT * FROM holder_events WHERE id=$1`, [eventId]);
+    if (!ev) return res.status(404).json({ error: 'Event not found' });
+
+    // Guard: check if already distributed
+    const alreadyDist = await db.oneOrNone(
+      `SELECT 1 FROM holder_event_rewards WHERE event_id=$1 AND distributed=TRUE LIMIT 1`, [eventId]
+    );
+    if (alreadyDist) return res.status(400).json({ error: 'Rewards already distributed for this event' });
+
+    const config = ev.reward_config ? JSON.parse(ev.reward_config) : DEFAULT_REWARD_CONFIG;
+    const rows   = await buildLeaderboard(eventId, 100);
+
+    let distributed = 0;
+    // Use dedicated client for atomic transaction
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const row of rows) {
+        const rank   = parseInt(row.rank);
+        const reward = rewardForRank(rank, config);
+        if (reward <= 0) continue;
+
+        await client.query(
+          `UPDATE users SET balance = balance + $1 WHERE id = $2`,
+          [reward, row.id]
+        );
+        await client.query(
+          `INSERT INTO transactions (user_id, type, amount, status, note)
+           VALUES ($1, 'event_reward', $2, 'approved', $3)`,
+          [row.id, reward, `Top Holders Event #${eventId} — Rank #${rank}`]
+        );
+        const insertResult = await client.query(
+          `INSERT INTO holder_event_rewards (event_id, user_id, rank, reward_usd, distributed)
+           VALUES ($1, $2, $3, $4, TRUE)
+           ON CONFLICT (event_id, user_id) DO NOTHING
+           RETURNING id`,
+          [eventId, row.id, rank, reward]
+        );
+        if (insertResult.rows.length > 0) distributed++;
+      }
+      await client.query(`UPDATE holder_events SET enabled=FALSE WHERE id=$1`, [eventId]);
+      await client.query('COMMIT');
+    } catch(txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+    res.json({ success: true, distributed });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /admin/events/:id/export-csv — CSV export
+app.get('/admin/events/:id/export-csv', adminAuth, async (req, res) => {
+  try {
+    const eventId = parseInt(req.params.id);
+    if (isNaN(eventId)) return res.status(400).json({ error: 'Invalid event id' });
+    const ev = await db.oneOrNone(`SELECT reward_config FROM holder_events WHERE id=$1`, [eventId]);
+    const config = (ev && ev.reward_config) ? JSON.parse(ev.reward_config) : DEFAULT_REWARD_CONFIG;
+    const rows = await buildLeaderboard(eventId, 200);
+
+    let csv = 'Rank,User ID,Display Name,BLOCK Tokens,Reward USD\n';
+    for (const r of rows) {
+      const reward = rewardForRank(parseInt(r.rank), config);
+      const safeName = (r.display_name || "").replace(/"/g, "''");
+      csv += `${r.rank},${r.id},"${safeName}",${parseFloat(r.tokens).toFixed(4)},${reward}\n`;
+    }
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="event_${eventId}_leaderboard.csv"`);
+    res.send(csv);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // GLOBAL ERROR HANDLER
 // ══════════════════════════════════════════
 app.use((err, req, res, next) => {
