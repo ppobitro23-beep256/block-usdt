@@ -6770,8 +6770,8 @@ app.post('/admin/events/create', adminAuth, async (req, res) => {
     const days = parseInt(duration_days) || 30;
     const cfg  = reward_config ? JSON.stringify(reward_config) : null;
     const ev = await db.one(`
-      INSERT INTO holder_events (title, duration_days, start_at, end_at, reward_config)
-      VALUES ($1, $2, NOW(), NOW() + ($2::text || ' days')::interval, $3)
+      INSERT INTO holder_events (title, duration_days, start_at, end_at, reward_config, enabled)
+      VALUES ($1, $2, NOW(), NOW() + ($2::text || ' days')::interval, $3, TRUE)
       RETURNING *
     `, [title || 'Top Holders Event', days, cfg]);
     res.json({ success: true, event: ev });
@@ -6809,7 +6809,15 @@ app.patch('/admin/events/:id/rewards', adminAuth, async (req, res) => {
 // DELETE /admin/events/:id — delete event
 app.delete('/admin/events/:id', adminAuth, async (req, res) => {
   try {
-    await db.run(`DELETE FROM holder_events WHERE id=$1`, [parseInt(req.params.id)]);
+    const evId = parseInt(req.params.id);
+    // Block delete if rewards have already been distributed (audit trail protection)
+    const distributed = await db.oneOrNone(
+      `SELECT 1 FROM holder_event_rewards WHERE event_id=$1 AND distributed=TRUE LIMIT 1`, [evId]
+    );
+    if (distributed) {
+      return res.status(400).json({ error: 'Cannot delete: rewards already distributed for this event. Disable it instead.' });
+    }
+    await db.run(`DELETE FROM holder_events WHERE id=$1`, [evId]);
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -6858,15 +6866,7 @@ app.post('/admin/events/:id/distribute', adminAuth, async (req, res) => {
         const reward = rewardForRank(rank, config);
         if (reward <= 0) continue;
 
-        await client.query(
-          `UPDATE users SET balance = balance + $1 WHERE id = $2`,
-          [reward, row.id]
-        );
-        await client.query(
-          `INSERT INTO transactions (user_id, type, amount, status, note)
-           VALUES ($1, 'event_reward', $2, 'approved', $3)`,
-          [row.id, reward, `Top Holders Event #${eventId} — Rank #${rank}`]
-        );
+        // Insert reward record first — ON CONFLICT DO NOTHING prevents double credit
         const insertResult = await client.query(
           `INSERT INTO holder_event_rewards (event_id, user_id, rank, reward_usd, distributed)
            VALUES ($1, $2, $3, $4, TRUE)
@@ -6874,7 +6874,19 @@ app.post('/admin/events/:id/distribute', adminAuth, async (req, res) => {
            RETURNING id`,
           [eventId, row.id, rank, reward]
         );
-        if (insertResult.rows.length > 0) distributed++;
+        // Only credit balance and insert transaction if this is a NEW reward record
+        if (insertResult.rows.length > 0) {
+          await client.query(
+            `UPDATE users SET balance = balance + $1, total_earned = total_earned + $1 WHERE id = $2`,
+            [reward, row.id]
+          );
+          await client.query(
+            `INSERT INTO transactions (user_id, type, amount, status, note)
+             VALUES ($1, 'event_reward', $2, 'approved', $3)`,
+            [row.id, reward, `Top Holders Event #${eventId} — Rank #${rank}`]
+          );
+          distributed++;
+        }
       }
       await client.query(`UPDATE holder_events SET enabled=FALSE WHERE id=$1`, [eventId]);
       await client.query('COMMIT');
