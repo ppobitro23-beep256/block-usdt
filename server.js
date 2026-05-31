@@ -608,6 +608,7 @@ async function setupDB() {
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_earn_date TEXT DEFAULT ''`),
     db.run(`ALTER TABLE auto_deposits ADD COLUMN IF NOT EXISTS dep_type TEXT DEFAULT 'auto'`),
     db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP`),
+    db.run(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()`),
     db.run(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active_ref BOOLEAN DEFAULT FALSE`),
     db.run(`CREATE INDEX IF NOT EXISTS idx_auto_deposits_created ON auto_deposits(created_at)`),
     db.run(`CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(created_at)`),
@@ -6706,7 +6707,7 @@ app.get('/api/event/current', userAuth, async (req, res) => {
     const event = await getActiveEvent();
     if (!event) return res.json({ active: false });
 
-    const config = event.reward_config ? JSON.parse(event.reward_config) : DEFAULT_REWARD_CONFIG;
+    const config = event.reward_config ? (() => { try { return JSON.parse(event.reward_config); } catch(e) { return DEFAULT_REWARD_CONFIG; } })() : DEFAULT_REWARD_CONFIG;
     const rows   = await buildLeaderboard(event.id, 50);
     const total  = rows.length;
 
@@ -6819,7 +6820,7 @@ app.get('/admin/events/:id/leaderboard', adminAuth, async (req, res) => {
     const evId = parseInt(req.params.id);
     const rows = await buildLeaderboard(evId, 100);
     const ev   = await db.oneOrNone(`SELECT reward_config FROM holder_events WHERE id=$1`, [evId]);
-    const config = (ev && ev.reward_config) ? JSON.parse(ev.reward_config) : DEFAULT_REWARD_CONFIG;
+    const config = (ev && ev.reward_config) ? (() => { try { return JSON.parse(ev.reward_config); } catch(e) { return DEFAULT_REWARD_CONFIG; } })() : DEFAULT_REWARD_CONFIG;
     const enriched = rows.map(r => ({
       rank:    parseInt(r.rank),
       id:      parseInt(r.id),
@@ -6844,7 +6845,7 @@ app.post('/admin/events/:id/distribute', adminAuth, async (req, res) => {
     );
     if (alreadyDist) return res.status(400).json({ error: 'Rewards already distributed for this event' });
 
-    const config = ev.reward_config ? JSON.parse(ev.reward_config) : DEFAULT_REWARD_CONFIG;
+    const config = ev.reward_config ? (() => { try { return JSON.parse(ev.reward_config); } catch(e) { return DEFAULT_REWARD_CONFIG; } })() : DEFAULT_REWARD_CONFIG;
     const rows   = await buildLeaderboard(eventId, 100);
 
     let distributed = 0;
@@ -6893,7 +6894,7 @@ app.get('/admin/events/:id/export-csv', adminAuth, async (req, res) => {
     const eventId = parseInt(req.params.id);
     if (isNaN(eventId)) return res.status(400).json({ error: 'Invalid event id' });
     const ev = await db.oneOrNone(`SELECT reward_config FROM holder_events WHERE id=$1`, [eventId]);
-    const config = (ev && ev.reward_config) ? JSON.parse(ev.reward_config) : DEFAULT_REWARD_CONFIG;
+    const config = (ev && ev.reward_config) ? (() => { try { return JSON.parse(ev.reward_config); } catch(e) { return DEFAULT_REWARD_CONFIG; } })() : DEFAULT_REWARD_CONFIG;
     const rows = await buildLeaderboard(eventId, 200);
 
     let csv = 'Rank,User ID,Display Name,BLOCK Tokens,Reward USD\n';
