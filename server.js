@@ -6758,7 +6758,7 @@ app.get('/api/event/current', userAuth, async (req, res) => {
 // GET /admin/events — list all events
 app.get('/admin/events', adminAuth, async (req, res) => {
   try {
-    const events = await db.all(`SELECT * FROM holder_events ORDER BY id DESC LIMIT 20`);
+    const events = await db.all(`SELECT * FROM holder_events ORDER BY id DESC LIMIT 50`);
     res.json({ events });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -6782,6 +6782,12 @@ app.post('/admin/events/create', adminAuth, async (req, res) => {
 app.patch('/admin/events/:id/toggle', adminAuth, async (req, res) => {
   try {
     const evId = parseInt(req.params.id);
+    // Prevent re-enabling an event that has already ended
+    const check = await db.oneOrNone(`SELECT enabled, end_at FROM holder_events WHERE id=$1`, [evId]);
+    if (!check) return res.status(404).json({ error: 'Event not found' });
+    if (!check.enabled && new Date(check.end_at) < new Date()) {
+      return res.status(400).json({ error: 'Cannot re-enable an ended event. Create a new one instead.' });
+    }
     const ev = await db.oneOrNone(
       `UPDATE holder_events SET enabled = NOT enabled WHERE id=$1 RETURNING id, enabled`, [evId]
     );
