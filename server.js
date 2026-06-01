@@ -6709,7 +6709,12 @@ app.get('/api/event/current', userAuth, async (req, res) => {
 
     const config = event.reward_config ? (() => { try { return JSON.parse(event.reward_config); } catch(e) { return DEFAULT_REWARD_CONFIG; } })() : DEFAULT_REWARD_CONFIG;
     const rows   = await buildLeaderboard(event.id, 50);
-    const total  = rows.length;
+    // Total participants = ALL users with tokens > 0 (not limited by leaderboard LIMIT)
+    const adminIds = (process.env.ADMIN_TELEGRAM_IDS || process.env.ADMIN_TELEGRAM_ID || '')
+      .split(',').map(x => parseInt(x.trim())).filter(Boolean);
+    const excludeClause = adminIds.length ? `AND id NOT IN (${adminIds.join(',')})` : '';
+    const totalRow = await db.one(`SELECT COUNT(*) as c FROM users WHERE COALESCE(block_tokens,0) > 0 ${excludeClause}`);
+    const total = parseInt(totalRow.c);
 
     // Find requesting user's rank
     const tgUser = req.tgUser;
