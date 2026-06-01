@@ -6771,9 +6771,9 @@ app.post('/admin/events/create', adminAuth, async (req, res) => {
     const cfg  = reward_config ? JSON.stringify(reward_config) : null;
     const ev = await db.one(`
       INSERT INTO holder_events (title, duration_days, start_at, end_at, reward_config, enabled)
-      VALUES ($1, $2, NOW(), NOW() + ($2::text || ' days')::interval, $3, TRUE)
+      VALUES ($1, $2, NOW(), NOW() + ($3 || ' days')::interval, $4, TRUE)
       RETURNING *
-    `, [title || 'Top Holders Event', days, cfg]);
+    `, [title || 'Top Holders Event', days, String(days), cfg]);
     res.json({ success: true, event: ev });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
